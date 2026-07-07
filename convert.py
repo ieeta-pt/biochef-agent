@@ -11,9 +11,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-REGISTRY_URL = os.getenv("REGISTRY_URL", "localhost:5000")
-REGISTRY_USERNAME = os.getenv("REGISTRY_USERNAME", "")
-REGISTRY_PASSWORD = os.getenv("REGISTRY_PASSWORD", "")
+REGISTRY_URL = os.getenv("REGISTRY_URL", "registry.biochef.app")
+REGISTRY_USERNAME = os.getenv("REGISTRY_USERNAME", " ")
+REGISTRY_PASSWORD = os.getenv("REGISTRY_PASSWORD", " ")
 REGISTRY_INSECURE = os.getenv("REGISTRY_INSECURE", "false").lower() == "true"
 ORAS_AUTH_BACKEND = os.getenv("ORAS_AUTH_BACKEND", "token")
 
