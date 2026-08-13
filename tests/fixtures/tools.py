@@ -30,4 +30,27 @@ BUNDLES = {
         },
         "parameters": [{"name": "mode", "type": "string", "flag": "-m"}],
     },
+    # Several arguments, so that their ORDER is observable. Every other bundle
+    # here has at most one of each, which is why a round trip that reordered
+    # them went unnoticed until the whole catalogue was swept -- see
+    # test_argument_order_survives_the_round_trip.
+    "multi.args": {
+        "id": "multi.args",
+        "name": "multi",
+        "bin": "multi",
+        "io": {
+            "inputs": [
+                {"name": "alpha", "types": ["TEXT"], "mode": "file", "flag": "-a"},
+                {"name": "zulu", "types": ["TEXT"], "mode": "file"},
+            ],
+            "outputs": [{"name": "out", "types": ["TEXT"], "mode": "file", "flag": "-o"}],
+        },
+        # Deliberately not in alphabetical order: sorting anywhere in the
+        # pipeline would rearrange these into z, m, a and change the command.
+        "parameters": [
+            {"name": "zeta", "type": "string", "flag": "-z"},
+            {"name": "mu", "type": "string", "flag": "-u"},
+            {"name": "alpha_p", "type": "string", "flag": "-p"},
+        ],
+    },
 }

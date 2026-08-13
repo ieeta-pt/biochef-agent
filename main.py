@@ -33,9 +33,13 @@ async def convert(
         with open(f.filename, "wb") as buffer:
             buffer.write(await f.read())
 
-    # Parse workflow
+    # Parse workflow. With BIOCHEF_WRITE_INTERMEDIATE set, the document is
+    # written to intermediate.json beside the Snakefile and read back through
+    # the schema first, so what follows is a function of a validated file
+    # rather than of the request body. Off by default; the two paths are
+    # asserted byte-identical in tests/test_intermediate_roundtrip.py.
     workflow_dict = json.loads(biochef_workflow)
-    workflow = parse_biochef_workflow(workflow_dict)
+    workflow = through_intermediate(parse_biochef_workflow(workflow_dict))
 
     # Convert workflow to Snakemake and run
     snakemake = convert_to_snakemake(workflow)
