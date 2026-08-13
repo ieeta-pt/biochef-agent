@@ -70,11 +70,24 @@ class IO(BaseModel):
     mode: Optional[IOMode] = None
     """How the tool reads or writes it."""
 
-    hardcoded_file: str = ""
+    hardcoded_file: Optional[str] = None
     """Some tools always write to a fixed name; it is copied to `file` after."""
 
-    flag: str = ""
-    """Some tools take the path behind a flag rather than positionally."""
+    flag: Optional[str] = None
+    """Some tools take the path behind a flag rather than positionally.
+
+    `None` and `""` are deliberately kept apart, and this is the one place the
+    model is more precise than the code it replaces rather than merely equal to
+    it. A recipe that omits `flag` and a recipe that sets `flag: ""` mean
+    different things to the frontend, and both occur: 300 io entries in the
+    catalogue omit the key, and one -- `samtools.markdup.outputs.out` -- sets it
+    empty on purpose.
+
+    The emitter only ever tests it for truth, so nothing downstream changes.
+    But typing this as `str = ""` would have collapsed the two at parse time and
+    published that collapse as a contract, which is exactly the distinction #34
+    has to be able to make when it is settled.
+    """
 
 
 class Param(BaseModel):
@@ -84,7 +97,8 @@ class Param(BaseModel):
 
     name: str = ""
     value: ParamValue = ""
-    flag: str = ""
+    flag: Optional[str] = None
+    """`None` when the recipe declares no flag, for the same reason as `IO.flag`."""
 
 
 class Node(BaseModel):

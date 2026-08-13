@@ -10,14 +10,28 @@
           "type": "string"
         },
         "flag": {
-          "default": "",
-          "title": "Flag",
-          "type": "string"
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Flag"
         },
         "hardcoded_file": {
-          "default": "",
-          "title": "Hardcoded File",
-          "type": "string"
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hardcoded File"
         },
         "mode": {
           "anyOf": [
@@ -88,9 +102,16 @@
       "description": "A parameter the client enabled, with the value it chose.",
       "properties": {
         "flag": {
-          "default": "",
-          "title": "Flag",
-          "type": "string"
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Flag"
         },
         "name": {
           "default": "",

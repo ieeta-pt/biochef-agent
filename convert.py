@@ -113,16 +113,17 @@ def parse_biochef_workflow(biochef_workflow):
             _name = f"{source}-{source_handle}"
 
             def build_io(info):
-                # Named rather than positional, and defaulted with `or ""`,
-                # because a recipe that omits "filename" or "flag" made .get
-                # return None and the dataclass stored it. Both were only ever
-                # tested for truth, so None and "" behaved alike -- but the
-                # model declares them as strings and rejects None outright.
+                # Named rather than positional. `.get` returning None where a
+                # recipe omits the key is kept as None rather than flattened to
+                # "": the two mean different things to the frontend and both
+                # occur in the catalogue, so the model records which one the
+                # recipe actually said. Nothing downstream can tell the
+                # difference -- the emitter only tests these for truth.
                 return IO(
                     file=_name,
                     mode=IOMode(info.get("mode")),
-                    hardcoded_file=info.get("filename") or "",
-                    flag=info.get("flag") or "",
+                    hardcoded_file=info.get("filename"),
+                    flag=info.get("flag"),
                 )
 
             is_input_connection = node_id == target
@@ -144,7 +145,7 @@ def parse_biochef_workflow(biochef_workflow):
             new_param: Param = Param(
                 name=param_key,
                 value=param["value"],
-                flag=param_info.get("flag") or "",
+                flag=param_info.get("flag"),
             )
 
             new_node.parameters[param_key] = new_param

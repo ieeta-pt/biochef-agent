@@ -106,15 +106,29 @@ def test_an_invalid_mode_is_rejected():
         )
 
 
-def test_none_is_not_accepted_where_a_string_is_declared():
-    """Why build_io defaults with `or ""`.
+def test_an_absent_flag_and_an_empty_flag_stay_distinct():
+    """The one place the model is more precise than what it replaces.
 
-    A recipe that omits "filename" made .get return None, which the dataclass
-    stored happily. The model rejects it, so the parse has to be explicit about
-    the empty case.
+    A recipe that omits `flag` and one that sets `flag: ""` mean different
+    things to the frontend, and both occur: 300 io entries in the catalogue
+    omit the key and one, samtools.markdup.outputs.out, sets it empty. Typing
+    the field as `str = ""` would collapse them at parse time and publish that
+    collapse as a contract -- and #34 is precisely the question of what the two
+    should mean.
+
+    Nothing downstream can tell them apart today, which is what makes keeping
+    them distinct free: the emitter only tests the field for truth.
     """
-    with pytest.raises(pydantic.ValidationError):
-        IO(file="x", mode=IOMode.FILE, hardcoded_file=None)
+    absent = IO(file="x", mode=IOMode.FILE, flag=None)
+    empty = IO(file="x", mode=IOMode.FILE, flag="")
+
+    assert absent != empty
+    assert Workflow.from_json(
+        Workflow(nodes=[Node(inputs={"a": absent, "b": empty})]).to_json()
+    ).nodes[0].inputs == {"a": absent, "b": empty}
+
+    # ... and both are falsy, which is the only thing the emitter asks.
+    assert not absent.flag and not empty.flag
 
 
 def test_the_checked_in_contract_matches_the_models():
