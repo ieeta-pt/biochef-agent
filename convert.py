@@ -231,7 +231,22 @@ def convert_to_snakemake(workflow: Workflow):
         for param_name, param in node.parameters.items():
             if param.flag:
                 cmd.append(sh_literal(param.flag))
-            cmd.append(sh_literal(param.value))
+            # An empty value has to stay absent rather than become an empty
+            # argument. It contributed nothing before by accident: " ".join put
+            # "" between two spaces and the shell collapsed the gap away. But
+            # shlex.quote("") is '', which is a real argument -- and 100 of the
+            # 176 catalogue operations declare flag-type parameters whose value
+            # is empty, so quoting them turned "-c" into "-c ''" and handed a
+            # tool an argument it never used to receive. Measured, not guessed:
+            # the catalogue sweep for this change caught it.
+            #
+            # Emitting only the flag is also what the frontend does for these,
+            # but making that the rule needs the parameter's declared type,
+            # which the model does not carry yet. Skipping the empty value
+            # reproduces today's behaviour exactly and keeps this change about
+            # quoting and nothing else.
+            if param.value != "":
+                cmd.append(sh_literal(param.value))
 
         # Arguments with no flag are held back and appended after every flagged
         # one. A bare filename ahead of a flag makes a getopt-style parser stop

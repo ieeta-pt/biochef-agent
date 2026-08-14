@@ -153,6 +153,22 @@ def test_no_payload_escapes_its_argument(payload):
     )
 
 
+def test_an_empty_value_stays_absent_rather_than_becoming_an_empty_argument():
+    """The regression the catalogue sweep caught, and unit tests could not.
+
+    An empty value used to vanish by accident: " ".join put "" between two
+    spaces and the shell collapsed the gap. shlex.quote("") is '' -- a real
+    argument. 100 of the 176 catalogue operations declare flag-type parameters
+    with an empty value, so quoting naively turned "-c" into "-c ''" and passed
+    every one of them an argument it never received before.
+    """
+    command = shell_block(convert.convert_to_snakemake(
+        convert.parse_biochef_workflow(workflow_with(""))))
+
+    assert command == "./edlib-aligner -m {input.i_0:q} > {output.o_0:q}"
+    assert "''" not in command
+
+
 def test_registry_supplied_strings_are_quoted_too(monkeypatch):
     """#42. These come from bundle.json, and the client chooses which repo is
     pulled, so they are no more trustworthy than a parameter value."""
