@@ -3,6 +3,13 @@
 Written before any change, so that the refactor in this PR can be shown to
 preserve behaviour rather than merely claimed to. Every expectation here was
 recorded from the current implementation, including the ones that look wrong.
+
+Two expectations gained `:q` when the shell quoting went in (#35). That is the
+one deliberate change to emitted text since these were recorded: the field
+reference is now quoted by Snakemake at expansion, so a path containing a space
+stays one argument. The argv the tool receives is unchanged for every name in
+the catalogue -- see tests/test_shell_quoting.py, which checks that against a
+real snakemake run rather than against the emitted string.
 """
 
 import pytest
@@ -47,7 +54,7 @@ def test_positional_input_with_flagged_output():
     sm = convert.convert_to_snakemake(
         convert.parse_biochef_workflow(workflow("tn93.distance", "in", "out"))
     )
-    assert shell_line(sm) == "./tn93 -o {output.o_0} {input.i_0}"
+    assert shell_line(sm) == "./tn93 -o {output.o_0:q} {input.i_0:q}"
     assert 'o_0="tn93.distance-1-out",' in sm
     assert 'rule all:' in sm
 
@@ -56,7 +63,7 @@ def test_stdout_output_is_redirected_last():
     sm = convert.convert_to_snakemake(
         convert.parse_biochef_workflow(workflow("edlib.align", "queries", "out"))
     )
-    assert shell_line(sm) == "./edlib-aligner {input.i_0} > {output.o_0}"
+    assert shell_line(sm) == "./edlib-aligner {input.i_0:q} > {output.o_0:q}"
 
 
 def test_enabled_parameter_reaches_the_command():
