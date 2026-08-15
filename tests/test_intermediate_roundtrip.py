@@ -11,6 +11,7 @@ makes the feature flag safe to turn on.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -59,8 +60,8 @@ def test_the_snakefile_is_the_same_through_disk(label, editor_export, tmp_path):
     document = convert.parse_biochef_workflow(editor_export)
     direct = convert.convert_to_snakemake(document)
 
-    path = convert.write_intermediate(document, str(tmp_path / "intermediate.json"))
-    from_disk = convert.convert_to_snakemake(convert.read_intermediate(path))
+    convert.write_intermediate(document, str(tmp_path))
+    from_disk = convert.convert_to_snakemake(convert.read_intermediate(str(tmp_path)))
 
     assert from_disk == direct, f"{label}: regenerating from disk changed the Snakefile"
 
@@ -68,7 +69,7 @@ def test_the_snakefile_is_the_same_through_disk(label, editor_export, tmp_path):
 @pytest.mark.parametrize("label,editor_export", CASES, ids=[c[0] for c in CASES])
 def test_the_document_on_disk_validates(label, editor_export, tmp_path):
     document = convert.parse_biochef_workflow(editor_export)
-    path = convert.write_intermediate(document, str(tmp_path / "intermediate.json"))
+    path = convert.write_intermediate(document, str(tmp_path))
 
     raw = json.loads(open(path).read())
     assert raw["schemaVersion"] == SCHEMA_VERSION
@@ -123,6 +124,41 @@ def test_argument_order_survives_the_round_trip():
     assert shell.index("-z Z") < shell.index("-u M") < shell.index("-p A")
 
 
+def test_a_run_has_to_say_where_its_document_goes():
+    """There is deliberately no default directory.
+
+    A relative default resolves against the process's working directory, which
+    every request in flight shares. That was invisible while the handler chdir'd
+    into a run directory; once it stops (#40), a default would put every
+    concurrent run's document at the same path and one run could generate its
+    Snakefile from another's validated document.
+
+    Requiring the argument is what stops that being reintroduced by forgetting,
+    rather than only being right at the single call site that exists today.
+    """
+    with pytest.raises(TypeError):
+        convert.through_intermediate(convert.parse_biochef_workflow(CASES[0][1]))
+
+    import inspect
+    for fn in (convert.write_intermediate, convert.read_intermediate,
+               convert.through_intermediate):
+        directory = inspect.signature(fn).parameters["directory"]
+        assert directory.default is inspect.Parameter.empty, \
+            f"{fn.__name__} must not default its directory"
+
+
+def test_the_document_goes_in_the_directory_it_was_given(tmp_path):
+    document = convert.parse_biochef_workflow(CASES[0][1])
+    elsewhere = tmp_path / "somewhere-else"
+    elsewhere.mkdir()
+
+    written = convert.write_intermediate(document, str(elsewhere))
+
+    assert Path(written).parent == elsewhere
+    assert (elsewhere / convert.INTERMEDIATE_FILENAME).exists()
+    assert not (tmp_path / convert.INTERMEDIATE_FILENAME).exists()
+
+
 def test_the_flag_is_off_by_default():
     """New functionality lands behind a feature flag, per the roadmap conventions."""
     assert convert.WRITE_INTERMEDIATE is False
@@ -133,7 +169,7 @@ def test_with_the_flag_off_nothing_is_written(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
     document = convert.parse_biochef_workflow(CASES[0][1])
-    assert convert.through_intermediate(document) is document
+    assert convert.through_intermediate(document, str(tmp_path)) is document
     assert list(tmp_path.iterdir()) == []
 
 
@@ -142,7 +178,7 @@ def test_with_the_flag_on_the_document_is_written_and_reread(tmp_path, monkeypat
     monkeypatch.chdir(tmp_path)
 
     document = convert.parse_biochef_workflow(CASES[0][1])
-    result = convert.through_intermediate(document)
+    result = convert.through_intermediate(document, str(tmp_path))
 
     written = tmp_path / convert.INTERMEDIATE_FILENAME
     assert written.exists(), "the flag was on but no document was written"
@@ -164,4 +200,4 @@ def test_a_corrupt_document_is_refused_rather_than_half_read(tmp_path):
                     '"inputs": {"a": {"mode": "not-a-mode"}}}]}')
 
     with pytest.raises(pydantic.ValidationError):
-        convert.read_intermediate(str(path))
+        convert.read_intermediate(str(tmp_path))
