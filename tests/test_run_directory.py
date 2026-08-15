@@ -216,6 +216,37 @@ def test_a_whole_run_works_end_to_end(tmp_path, monkeypatch):
     assert not any(runs.iterdir()) if runs.exists() else True
 
 
+def test_two_nodes_sharing_a_binary_are_placed_once(tmp_path, monkeypatch):
+    """The most ordinary pipeline in the catalogue.
+
+    80 of the 176 operations share an executable with another -- all 15 samtools
+    operations, all 20 seqtk ones -- so "samtools sort" into "samtools index" is
+    two nodes naming one binary. Placing per node made the second fail O_EXCL and
+    the request 500. No test in the original change used more than one tool node,
+    which is why it got through.
+    """
+    cache = tmp_path / "cache" / "samtools"
+    cache.mkdir(parents=True)
+    (cache / "samtools").write_text("#!/bin/sh\n")
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+
+    class Node:
+        def __init__(self, node_id, binary):
+            self.id, self.bin = node_id, binary
+
+    class Flow:
+        def __init__(self, nodes):
+            self.nodes = nodes
+
+    ws = make_workspace(str(tmp_path))
+    try:
+        convert.materialise_tools(
+            Flow([Node("samtools-1", "samtools"), Node("samtools-2", "samtools")]), ws)
+        assert (Path(ws.path) / "samtools").exists()
+    finally:
+        ws.cleanup()
+
+
 def test_run_snakemake_is_given_the_directory_explicitly(tmp_path, monkeypatch):
     """The argv is the whole point: -s and -d instead of moving the process."""
     ws = make_workspace(str(tmp_path))

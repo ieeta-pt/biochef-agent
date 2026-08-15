@@ -136,11 +136,24 @@ def materialise_tools(workflow, ws):
     Separate from fetch_tool so the cache is pulled once and every run still
     gets its own copy. Done before the uploads, so that an upload named after a
     binary is refused by O_EXCL rather than silently replacing it.
+
+    Once per BINARY, not once per node. Several operations routinely share one
+    executable -- 80 of the 176 in the catalogue do, including all 15 samtools
+    operations and all 20 seqtk ones -- so a workflow as ordinary as
+    "samtools sort" into "samtools index" has two nodes naming the same binary.
+    Placing it per node made the second one fail O_EXCL with FileExistsError and
+    the whole request 500. The old fetch_tool hid this behind its memo, which
+    returned early and skipped the copy; splitting the cache out lost that and
+    nothing replaced it.
     """
+    placed = set()
     for node in workflow.nodes:
         name = check_name(node.bin)
+        if name in placed:
+            continue
         source = os.path.join(TOOL_CACHE, check_name(node.id.split("-")[0]), name)
         ws.place_executable(source, name)
+        placed.add(name)
 
 
 def get_node_data(node_id, node_list):
