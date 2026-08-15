@@ -1,9 +1,10 @@
-"""What an uploaded filename can do today (#39).
+"""An uploaded filename is refused unless it is a plain file name (#39).
 
-Recorded before anything is changed. These tests exercise the real /convert
-handler and assert the CURRENT behaviour, so they pass against the unfixed
-service and are the evidence that #39 is a live defect rather than a reading of
-the code.
+The commit before this one recorded what happened previously: `../ESCAPED.txt`
+wrote outside the working directory with HTTP 200, an absolute path ignored the
+working directory entirely, and both landed even when the request carried
+nothing that could be parsed as a workflow -- because the upload loop runs
+before `json.loads`. Each test here is the closed form of one of those.
 
 Self-contained on purpose. `convert.py` builds an ORAS client and calls
 `login()` at import time, so importing `main` reaches the registry; the stub
@@ -44,6 +45,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
+from workspace import SAFE_NAME, UnsafeName, check_name
 
 
 @pytest.fixture
@@ -66,40 +68,94 @@ def post(client, filename, content=b"payload", workflow=b"{}"):
     )
 
 
-def test_a_relative_name_escapes_the_working_directory(client, tmp_path):
-    """#39, the form the issue leads with."""
-    target = tmp_path / "ESCAPED.txt"
-    post(client, "../ESCAPED.txt")
-
-    assert target.exists(), "the upload no longer escapes tmp/"
-    assert target.read_bytes() == b"payload"
+# --------------------------------------------------------------------------
+# the rule
 
 
-def test_an_absolute_name_ignores_the_working_directory_entirely(client, tmp_path):
-    """os.chdir("tmp") is not a boundary against an absolute path."""
+REFUSED = [
+    ("../ESCAPED.txt", "parent traversal"),
+    ("../../ESCAPED.txt", "further up"),
+    ("/etc/PWNED", "absolute, which cwd never constrained"),
+    ("sub/../../x", "traversal hidden mid-path"),
+    ("sub/x", "a subdirectory is still more than one component"),
+    ("..", "the parent itself"),
+    (".", "the directory itself"),
+    ("", "empty, which resolves to the directory"),
+    (".hidden", "a dotfile"),
+    ("-rf", "reads as an option to whatever receives it"),
+    ("evil-out\n", "a newline, which would add a line to the Snakefile"),
+    ("a" * 129, "longer than any generated name"),
+    ("café-in", "outside the generated character set"),
+    (None, "starlette types filename as str | None"),
+]
+
+
+@pytest.mark.parametrize("name,why", REFUSED, ids=[r[1] for r in REFUSED])
+def test_a_name_that_is_not_a_plain_file_name_is_refused(name, why):
+    with pytest.raises(UnsafeName):
+        check_name(name)
+
+
+def test_the_names_the_converter_generates_are_accepted():
+    """The rule has to admit everything the system actually produces.
+
+    A node id is "{operation.id}-{timestamp}" and a slot is
+    f"{source}-{source_handle}", so these are the real shapes.
+    """
+    for name in ["input-1-out", "tn93.distance-1-out", "Snakefile",
+                 "gto.fasta.extract-1730000000000-out", "intermediate.json"]:
+        assert check_name(name) == name
+
+
+def test_the_anchors_reject_a_trailing_newline():
+    r"""Why \A and \Z rather than ^ and $.
+
+    With re.match, `$` also matches just before a trailing newline, so the
+    obvious spelling of this pattern would accept "evil-out\n" -- and a newline
+    is the one character that would let a name write an extra line into the
+    generated Snakefile.
+    """
+    import re
+    caret_dollar = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+    assert caret_dollar.match("evil-out\n"), "this is the trap being avoided"
+    assert not SAFE_NAME.match("evil-out\n")
+
+
+# --------------------------------------------------------------------------
+# through the handler
+
+
+def test_a_relative_name_no_longer_escapes(client, tmp_path):
+    response = post(client, "../ESCAPED.txt")
+
+    assert response.status_code == 400
+    assert not (tmp_path / "ESCAPED.txt").exists()
+
+
+def test_an_absolute_name_no_longer_escapes(client, tmp_path):
     target = tmp_path / "elsewhere" / "ABSOLUTE.txt"
     target.parent.mkdir()
-    post(client, str(target))
 
-    assert target.exists()
-    assert target.read_bytes() == b"payload"
+    response = post(client, str(target))
+
+    assert response.status_code == 400
+    assert not target.exists()
 
 
-def test_the_write_happens_before_the_workflow_is_even_parsed(client, tmp_path):
-    """The reason this needs no valid workflow, no registry and no snakemake.
-
-    The upload loop is at main.py:32-34 and json.loads is at main.py:37, so a
-    request carrying nothing that could be a workflow still lands its file.
-    """
+def test_nothing_is_written_even_though_the_check_precedes_the_parse(client, tmp_path):
+    """The ordering that made this reachable without a valid workflow is still
+    there -- #40 moves the parse -- so the name check has to stand on its own."""
     target = tmp_path / "elsewhere" / "NO_WORKFLOW.txt"
     target.parent.mkdir()
+
     response = post(client, str(target), workflow=b"this is not json at all")
 
-    assert response.status_code == 500, "the request is expected to fail"
-    assert target.exists(), "and to have written the file anyway"
+    assert response.status_code == 400, "the name is rejected before the body is parsed"
+    assert not target.exists()
 
 
-def test_a_plain_name_is_written_inside_the_working_directory(client, tmp_path):
-    """The case that must keep working after the fix."""
+def test_a_plain_name_still_works(client, tmp_path):
+    """The case that must keep working: the fix cannot be "reject everything"."""
     post(client, "input-1-out")
-    assert (tmp_path / "tmp" / "input-1-out").exists()
+    assert (tmp_path / "tmp" / "input-1-out").read_bytes() == b"payload"
