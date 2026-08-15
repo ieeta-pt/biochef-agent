@@ -48,19 +48,25 @@ import main
 from workspace import SAFE_NAME, UnsafeName, check_name
 
 
+EMPTY_WORKFLOW = b'{"nodes": [], "edges": []}'
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    """Run the handler somewhere disposable.
+    """Drive the handler with its runs rooted under tmp_path.
 
-    The handler chdirs into ./tmp of wherever the process happens to be, so the
-    test has to move the process rather than pass a path. That is itself the
-    subject of a separate issue (#40); here it is only scaffolding.
+    The workspace is created under BIOCHEF_RUN_ROOT, so pointing that at
+    tmp_path means a name that escaped would land somewhere this test can see.
+    snakemake is stubbed out: these tests are about names, and invoking a real
+    workflow engine to check one would make them slow and conditional.
     """
+    monkeypatch.setattr(main, "RUN_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setattr(main, "run_snakemake", lambda ws, *a, **k: (0, "", ""))
     monkeypatch.chdir(tmp_path)
     return TestClient(main.app, raise_server_exceptions=False)
 
 
-def post(client, filename, content=b"payload", workflow=b"{}"):
+def post(client, filename, content=b"payload", workflow=EMPTY_WORKFLOW):
     return client.post(
         "/convert",
         data={"biochef_workflow": workflow},
@@ -130,7 +136,7 @@ def test_a_relative_name_no_longer_escapes(client, tmp_path):
     response = post(client, "../ESCAPED.txt")
 
     assert response.status_code == 400
-    assert not (tmp_path / "ESCAPED.txt").exists()
+    assert not list(tmp_path.rglob("ESCAPED.txt"))
 
 
 def test_an_absolute_name_no_longer_escapes(client, tmp_path):
@@ -143,19 +149,41 @@ def test_an_absolute_name_no_longer_escapes(client, tmp_path):
     assert not target.exists()
 
 
-def test_nothing_is_written_even_though_the_check_precedes_the_parse(client, tmp_path):
-    """The ordering that made this reachable without a valid workflow is still
-    there -- #40 moves the parse -- so the name check has to stand on its own."""
-    target = tmp_path / "elsewhere" / "NO_WORKFLOW.txt"
-    target.parent.mkdir()
+def test_a_malformed_body_is_refused_before_anything_is_written(client, tmp_path):
+    """The parse now runs first (#40), so a request that is not a workflow never
+    reaches the upload loop at all. The name check still stands on its own --
+    see the table above -- but the ordering means it is no longer the only
+    thing between a request and a write."""
+    response = post(client, "input-1-out", workflow=b"this is not json at all")
 
-    response = post(client, str(target), workflow=b"this is not json at all")
-
-    assert response.status_code == 400, "the name is rejected before the body is parsed"
-    assert not target.exists()
+    assert response.status_code >= 400
+    assert not list(tmp_path.rglob("input-1-out")), "nothing was written"
 
 
-def test_a_plain_name_still_works(client, tmp_path):
+def test_a_plain_name_still_works(client, tmp_path, monkeypatch):
     """The case that must keep working: the fix cannot be "reject everything"."""
-    post(client, "input-1-out")
-    assert (tmp_path / "tmp" / "input-1-out").read_bytes() == b"payload"
+    kept = []
+    real = main.make_workspace
+    monkeypatch.setattr(main, "make_workspace",
+                        lambda root=None: kept.append(real(root)) or kept[-1])
+    monkeypatch.setattr(main, "KEEP_WORKSPACE", True)
+
+    response = post(client, "input-1-out")
+
+    assert response.status_code == 200, response.text
+    assert (Path(kept[0].path) / "input-1-out").read_bytes() == b"payload"
+    kept[0].cleanup()
+
+
+def test_an_upload_cannot_shadow_a_file_the_run_already_made(client, tmp_path):
+    """O_EXCL. Sending the same name twice is refused rather than overwriting,
+    which is also what stops an upload landing on a tool binary."""
+    response = client.post(
+        "/convert",
+        data={"biochef_workflow": EMPTY_WORKFLOW},
+        files=[("files", ("same-name", b"first", "text/plain")),
+               ("files", ("same-name", b"second", "text/plain"))],
+    )
+
+    assert response.status_code == 400
+    assert "sent twice" in response.text
