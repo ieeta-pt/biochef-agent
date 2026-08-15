@@ -24,7 +24,23 @@ if "oras" not in sys.modules:
     sys.modules["oras"] = oras
     sys.modules["oras.client"] = client
 
-if "fastapi" not in sys.modules:
+# FastAPI is a pinned dependency, so the real one is normally present and is
+# what should be used -- convert.py only needs FastAPI() to construct. The stub
+# is a fallback for an environment without it.
+#
+# The condition has to be "can it be imported", not "is it in sys.modules".
+# Guarding on sys.modules installs the stub whenever this conftest is imported
+# before anything has touched fastapi -- which is always, because conftest runs
+# first -- and the stub is a plain module rather than a package, so any test
+# doing `from fastapi.testclient import TestClient` then fails with
+# "No module named 'fastapi.testclient'; 'fastapi' is not a package".
+#
+# That is not hypothetical: tests added later for the upload handler need a
+# TestClient, and with the sys.modules guard the whole suite stopped collecting
+# -- including the tests that had nothing to do with FastAPI.
+try:
+    import fastapi  # noqa: F401
+except ImportError:
     fastapi = types.ModuleType("fastapi")
 
     class _App:
