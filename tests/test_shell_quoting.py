@@ -16,6 +16,7 @@ statement anyone cares about. Reading the emitted string and judging it "looks
 quoted" is exactly how this class of bug survives review.
 """
 
+import ast
 import json
 import os
 import shutil
@@ -46,6 +47,12 @@ PAYLOADS = [
                                    # shell metacharacters would catch
     "' ; touch PWNED_QUOTE ; '",   # closes the quote the escaping adds
     "{input.i_0}",                 # reads another rule's field if left undoubled
+    # The two that a shell-only model misses entirely, because the reader that
+    # decodes them is Python, and it runs before the shell exists.
+    r"x\x27; touch PWNED_HEXESC; \x27",   # Python turns \x27 into a real quote
+    'a""" + str(__import__("os").system("touch PWNED_PYCODE")) + """b',
+    "back\\slash",                 # survives both readers or is mangled by one
+    "café",                        # non-ASCII, which json.dumps escapes as \\uXXXX
 ]
 
 
@@ -68,24 +75,28 @@ def workflow_with(value, tool="edlib.align", in_handle="queries", out_handle="ou
     }
 
 
-def shell_line(text):
-    return [l.strip() for l in text.splitlines() if l.strip().startswith("./")][0]
-
-
 def shell_block(text):
-    """The whole command, which is not always one line.
+    """The command the shell will actually receive.
 
-    A value containing a newline stays one shell word -- shlex.quote wraps it in
-    single quotes and the quotes span the newline -- but the emitted command
-    then covers two lines. Taking only the first line, as shell_line does, would
-    read that as a truncated command and call a correct result a failure. It is
-    worth the extra helper: the newline payload is the one a reader is most
-    likely to assume is broken.
+    The body is emitted as a Python string literal, so recovering it means
+    decoding that literal -- which is also the point of the test. json.loads
+    rather than ast.literal_eval, so this asserts the literal really is
+    JSON-shaped and reads it back through a different parser than wrote it.
+
+    Anchored on the "shell:" line rather than on a leading quote: the input:
+    and output: sections are quoted too, and matching those instead is a
+    plausible way to write a test that passes while checking nothing.
     """
     lines = text.splitlines()
-    opens = [i for i, l in enumerate(lines) if l.strip() == '"""']
-    body = lines[opens[0] + 1:opens[1]]
-    return "\n".join(body)[8:] if body else ""
+    for i, line in enumerate(lines):
+        if line.strip() == "shell:":
+            return json.loads(lines[i + 1].strip())
+    raise AssertionError(f"no shell body found in:\n{text}")
+
+
+# The command is a single literal now, so there is no separate notion of a
+# "line" within it.
+shell_line = shell_block
 
 
 # --------------------------------------------------------------------------
@@ -167,6 +178,46 @@ def test_an_empty_value_stays_absent_rather_than_becoming_an_empty_argument():
 
     assert command == "./edlib-aligner -m {input.i_0:q} > {output.o_0:q}"
     assert "''" not in command
+
+
+@pytest.mark.parametrize("payload", PAYLOADS)
+def test_python_and_json_decode_the_body_identically(payload):
+    """The reader a shell-only model forgets.
+
+    Snakemake parses a rule's `shell:` argument as Python, so the body has a
+    Python reader ahead of the shell. In a triple-quoted block that meant a
+    value containing `\\x27` was turned into a real quote by Python *after*
+    shlex.quote had finished, and a value containing three quotes ended the
+    literal so the rest ran as code.
+
+    The property that makes it safe is that the emitted literal decodes to
+    exactly the text that was assembled, under the Python parser that will
+    actually read it. Checked against ast.literal_eval rather than only
+    json.loads, so this is Python's own answer and not the writer's.
+
+    Note the whole Snakefile is deliberately not compiled: it is Snakemake's
+    DSL, and `rule all:` is not valid Python. Only the body is.
+    """
+    sm = convert.convert_to_snakemake(
+        convert.parse_biochef_workflow(workflow_with(payload)))
+
+    lines = sm.splitlines()
+    literal = lines[[l.strip() for l in lines].index("shell:") + 1].strip()
+
+    assert ast.literal_eval(literal) == json.loads(literal)
+    assert ast.literal_eval(literal) == (
+        f"./edlib-aligner -m {convert.sh_literal(payload)} "
+        f"{{input.i_0:q}} > {{output.o_0:q}}"
+    )
+
+
+def test_the_shell_body_is_one_python_string_literal():
+    sm = convert.convert_to_snakemake(
+        convert.parse_biochef_workflow(workflow_with('a""" and b')))
+
+    assert '"""' not in sm, "a triple-quoted block is what made this exploitable"
+    body = shell_block(sm)
+    assert body == './edlib-aligner -m \'a""" and b\' {input.i_0:q} > {output.o_0:q}'
 
 
 def test_registry_supplied_strings_are_quoted_too(monkeypatch):

@@ -12,6 +12,8 @@ the catalogue -- see tests/test_shell_quoting.py, which checks that against a
 real snakemake run rather than against the emitted string.
 """
 
+import json
+
 import pytest
 
 import convert
@@ -47,7 +49,17 @@ def workflow(tool_id, in_handle, out_handle, params=None):
 
 
 def shell_line(text):
-    return [l.strip() for l in text.splitlines() if l.strip().startswith("./")][0]
+    """The shell body, decoded from the Python string literal it is emitted as.
+
+    It used to be recoverable by looking for a line starting with "./", because
+    the body sat raw inside a triple-quoted block. It is a single literal now --
+    that is what stops a value being read as Python (#35).
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "shell:":
+            return json.loads(lines[i + 1].strip())
+    raise AssertionError(f"no shell body found in:\n{text}")
 
 
 def test_positional_input_with_flagged_output():

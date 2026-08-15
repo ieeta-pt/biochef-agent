@@ -289,7 +289,7 @@ def convert_to_snakemake(workflow: Workflow):
                     trailing.append(sh_field(f"output.{output_var}"))
                 if output.hardcoded_file and not output.flag:
                     extra_cms.append(
-                        f"        cp {sh_literal(output.hardcoded_file)} "
+                        f"cp {sh_literal(output.hardcoded_file)} "
                         f"{sh_field(f'output.{output_var}')}"
                     )
             i += 1
@@ -303,12 +303,29 @@ def convert_to_snakemake(workflow: Workflow):
         # reads no better either way.
         command_line = " ".join(cmd)
 
+        # A Python string literal, not a triple-quoted block.
+        #
+        # There is one more reader than the shell and Snakemake's formatter, and
+        # it is the outermost one: a Snakefile IS Python source, so Python parses
+        # this literal before anything else sees it. In a """...""" block that
+        # meant two escapes:
+        #
+        #   a value containing a backslash escape was decoded by Python AFTER
+        #   shlex.quote had finished, so "x\x27; touch PWNED; \x27" became a real
+        #   quote and broke out of the shell quoting;
+        #
+        #   a value containing three double quotes ended the literal, and the
+        #   rest of it ran as Python at parse time -- arbitrary code on the agent
+        #   host, before any tool started, with the run still reporting success.
+        #
+        # json.dumps emits a literal in which neither is expressible: every
+        # backslash and quote it produces is already escaped for Python, and the
+        # value it decodes to is exactly the text that was assembled. The brace
+        # doubling done by sh_literal survives untouched, so Snakemake's
+        # formatter still reads what it should.
+        shell_body = "\n".join([command_line] + extra_cms)
         result.append("    shell:")
-        result.append('        """')
-        result.append(f"        {command_line}")
-        for command in extra_cms:
-            result.append(command)
-        result.append('        """')
+        result.append(f"        {py_string(shell_body)}")
 
     return "\n".join(result)
 
