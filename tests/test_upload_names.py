@@ -175,6 +175,25 @@ def test_a_plain_name_still_works(client, tmp_path, monkeypatch):
     kept[0].cleanup()
 
 
+@pytest.mark.parametrize("name", ["Snakefile", "SNAKEFILE", "snakefile"])
+def test_an_upload_occupying_the_snakefile_slot_is_a_bad_request(name, client, tmp_path):
+    """400, not 500.
+
+    "Snakefile" is a perfectly legal single path component, so the shape rule
+    passes it and O_EXCL then refuses the generated write. That refusal is
+    correct -- the attacker's file is never executed, and run_snakemake is never
+    reached -- but without the mapping it surfaced as an unhandled exception for
+    what is a bad request.
+
+    The case variants matter on macOS: APFS is case-insensitive by default, so
+    "SNAKEFILE" occupies the same slot.
+    """
+    response = post(client, name)
+
+    assert response.status_code == 400, response.text
+    assert "Snakefile" in response.text
+
+
 def test_an_upload_cannot_shadow_a_file_the_run_already_made(client, tmp_path):
     """O_EXCL. Sending the same name twice is refused rather than overwriting,
     which is also what stops an upload landing on a tool binary."""

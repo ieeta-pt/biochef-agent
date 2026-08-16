@@ -92,7 +92,18 @@ async def convert(
 
         # Convert workflow to Snakemake and run
         snakemake = convert_to_snakemake(workflow)
-        ws.write_bytes("Snakefile", snakemake.encode())
+        # Same mapping as the upload loop. An upload named "Snakefile" -- or,
+        # on a case-insensitive filesystem, "SNAKEFILE" -- occupies this slot
+        # first, and O_EXCL then refuses the generated write. That is the right
+        # refusal, but without this it surfaced as an unhandled 500 for what is
+        # a bad request.
+        try:
+            ws.write_bytes("Snakefile", snakemake.encode())
+        except FileExistsError:
+            raise HTTPException(
+                status_code=400,
+                detail="an upload occupies a name this run needs: 'Snakefile'",
+            )
 
         # Off the event loop: communicate() blocks, and running it inline would
         # mean the service never has two runs in flight to keep apart.

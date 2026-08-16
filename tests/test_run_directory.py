@@ -43,6 +43,7 @@ import os
 import shutil
 import signal
 import subprocess
+import threading
 import time
 
 import pytest
@@ -50,7 +51,7 @@ from fastapi.testclient import TestClient
 
 import convert
 import main
-from workspace import make_workspace
+from workspace import UnsafeName, make_workspace
 
 
 @pytest.fixture
@@ -123,32 +124,126 @@ def test_the_workspace_is_private(tmp_path):
 # the timeout, which is only correct if it kills the group
 
 
-def test_a_timeout_kills_the_whole_process_group(tmp_path):
-    """Killing only snakemake leaves the tool running and then blocks forever.
+def test_a_timeout_kills_the_whole_process_group(tmp_path, monkeypatch):
+    """Drives main.run_snakemake itself.
 
-    That is what subprocess.run(timeout=N) does internally, so this is worth an
-    explicit test: without start_new_session and killpg, adding a timeout makes
-    the service worse rather than better.
+    An earlier version of this test re-implemented Popen/getpgid/killpg inline
+    and asserted about its own local copy, so it passed against a run_snakemake
+    gutted to `return 0, "", ""` and did not notice killpg being replaced by
+    process.kill(). A test that never calls the function it names is worse than
+    no test, because the argument for group-killing sits right next to it and a
+    reader takes the test as evidence.
+
+    The run is on a thread with a bounded join: the failure mode being guarded
+    against is a hang, and called directly a regression would hang the suite
+    instead of failing it.
     """
     script = tmp_path / "slow.sh"
-    script.write_text("#!/bin/sh\nsleep 300 &\nwait\n")
+    script.write_text("#!/bin/sh\nsleep 300 &\necho $! > grandchild.pid\nwait\n")
     script.chmod(0o755)
 
-    started = time.time()
-    process = subprocess.Popen([str(script)], stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, start_new_session=True)
-    pgid = os.getpgid(process.pid)
+    real_popen = subprocess.Popen
+
+    def fake_popen(argv, **kwargs):
+        # Substitute ONLY the snakemake invocation. `main.subprocess` is the
+        # subprocess module itself, so patching Popen through it is global --
+        # an earlier version of this test replaced every Popen in the process,
+        # which meant subprocess.run(["kill", ...]) further down launched the
+        # slow helper instead of kill. It then reported a surviving grandchild
+        # that was really a second helper it had just started itself, and left
+        # `sleep 300` running until the suite timed out five minutes later.
+        if argv and "snakemake" in str(argv[0]):
+            return real_popen([str(script)], **kwargs)
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(main.subprocess, "Popen", fake_popen)
+
+    ws = make_workspace(str(tmp_path))
+    result = {}
+
+    def run():
+        result["value"] = main.run_snakemake(ws, timeout_s=1)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(15)
+
     try:
-        process.communicate(timeout=1)
-        pytest.fail("the helper should not have finished")
-    except subprocess.TimeoutExpired:
-        os.killpg(pgid, signal.SIGKILL)
-        process.communicate(timeout=5)
+        assert not thread.is_alive(), "run_snakemake never returned -- it hung"
+        assert result["value"][0] == -signal.SIGKILL
 
-    assert time.time() - started < 5, "communicate did not return promptly"
+        pid_file = Path(ws.path) / "grandchild.pid"
+        assert pid_file.exists(), "the helper never spawned its grandchild"
+        grandchild = int(pid_file.read_text().strip())
 
-    leftover = subprocess.run(["pgrep", "-g", str(pgid)], capture_output=True)
-    assert leftover.returncode != 0, "something in the group survived"
+        # os.kill rather than shelling out, so this cannot be affected by the
+        # Popen patch above at all.
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                os.kill(grandchild, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("the grandchild outlived the kill")
+    finally:
+        ws.cleanup()
+
+
+def test_a_symlinked_slot_is_refused_on_read(tmp_path):
+    """O_NOFOLLOW, which is what closes #41.
+
+    Without it the suite stayed green: a tool that replaces its own output with
+    a symlink had the target's contents base64'd into the response with HTTP 200.
+    """
+    secret = tmp_path / "SECRET"
+    secret.write_bytes(b"private-key-material")
+
+    ws = make_workspace(str(tmp_path))
+    try:
+        os.symlink(str(secret), os.path.join(ws.path, "tool-out"))
+        with pytest.raises(UnsafeName, match="symbolic link"):
+            ws.open_read("tool-out")
+    finally:
+        ws.cleanup()
+
+
+def test_a_symlinked_slot_is_refused_on_a_non_exclusive_write(tmp_path):
+    """The write path without O_EXCL in front of it.
+
+    /convert never passes exclusive=False, so O_EXCL normally refuses a
+    symlinked slot before O_NOFOLLOW is reached -- which means the exclusive
+    path cannot show whether O_NOFOLLOW is present at all. This one can.
+    """
+    victim = tmp_path / "VICTIM"
+    victim.write_bytes(b"do-not-clobber")
+
+    ws = make_workspace(str(tmp_path))
+    try:
+        os.symlink(str(victim), os.path.join(ws.path, "slot"))
+        with pytest.raises((UnsafeName, OSError)):
+            ws.write_bytes("slot", b"clobbered", exclusive=False)
+        assert victim.read_bytes() == b"do-not-clobber"
+    finally:
+        ws.cleanup()
+
+
+def test_every_open_goes_through_the_held_descriptor(tmp_path):
+    """The descriptor is opened once and pinned.
+
+    Re-deriving it from the path on each call survives the rest of the suite,
+    even though the class docstring says it is held precisely to stop the
+    directory being swapped mid-run. Structural rather than behavioural because
+    the race needs local filesystem access, so this is cheap insurance.
+    """
+    import inspect
+
+    source = inspect.getsource(main.make_workspace.__module__ and type(
+        make_workspace(str(tmp_path))))
+    assert "dir_fd=self._fd" in source, "_open must use the held descriptor"
+    assert "realpath" not in source.split("def _open")[1].split("def ")[0], \
+        "_open must not re-resolve the path"
 
 
 SNAKEMAKE = shutil.which("snakemake")
