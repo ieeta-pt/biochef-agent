@@ -5,18 +5,24 @@ them -- `convert.py` builds `f"{source}-{source_handle}"` -- so a name arriving
 on an upload is a claim about which of those it is, and the only sensible
 question is whether it is one.
 
-This module answers the narrow half of that: whether a name is a single, plain
-path component at all. Checking it against the specific set the workflow
-declares is the other half and belongs with the run directory work (#40), where
-the declared set is available. The two are independent, and each catches
-something the other cannot:
+This module answers the narrow half of that: whether an UPLOADED name is a
+single, plain path component at all. Checking it against the specific set the
+workflow declares is the other half and belongs with the run directory work
+(#40), where the declared set is available. A name like "samtools" is a
+perfectly good single component, so the shape rule passes it, and only the
+declared set would catch that it collides with a tool binary.
 
-  a name like "samtools" is a perfectly good single component, so the shape rule
-  passes it -- but it may collide with a tool binary, which only the declared set
-  would catch;
+What this does NOT do, and an earlier version of this docstring wrongly claimed
+it did: it does not protect against a hostile node id. The converter builds
+generated names as f"{source}-{source_handle}" from client-supplied edge JSON
+and writes them into the Snakefile itself. Nothing here sees them -- check_name
+is applied to uploads, and to a generated name only when it is read back, which
+is after snakemake has already run. A node id is a separate hole, closed by
+giving the Snakefile's own string literals the same treatment (the quoting PR),
+not by this rule.
 
-  a name derived from a hostile node id can traverse while still being a name
-  the workflow declares, which only the shape rule catches.
+Stated plainly because the wrong version of it read as though a run were
+contained against hostile workflow JSON, and it is not.
 """
 
 import re
