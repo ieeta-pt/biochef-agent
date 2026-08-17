@@ -158,10 +158,15 @@ jobs:
         # The check that has repeatedly caught what the unit tests could not:
         # sorting the document's keys reordered arguments for 85 of 176
         # operations, and quoting the empty string added an argument to 100 of
-        # them, while every targeted test stayed green. Those were found by
-        # sweeping the whole catalogue, so the sweep runs here.
+        # them, while every targeted test stayed green.
         #
-        # Compared against a checked-in baseline rather than requiring zero
-        # failures, because some are known and tracked. A PR that fixes them
-        # updates the baseline, and the diff says so.
+        # It snapshots the OUTPUT -- a hash of each generated Snakefile -- and
+        # not merely whether conversion threw. That distinction is the whole
+        # value: the first version of this script checked only for exceptions,
+        # and both regressions above were verified to pass straight through it,
+        # because neither raises. With hashing, reordering parameters is caught
+        # as 85 operations changed and an added empty argument as 127.
+        #
+        # A PR that deliberately changes emitted output regenerates the baseline
+        # and the diff then states exactly which operations changed.
         run: python .github/scripts/catalogue_smoke.py .recipes ci/catalogue-baseline.json

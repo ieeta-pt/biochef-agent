@@ -1,13 +1,24 @@
-"""Drive every operation in the catalogue through the converter.
+"""Drive every operation in the catalogue through the converter and snapshot it.
 
-Compared against a checked-in baseline of operations that are known not to
-convert, rather than requiring zero failures. Two reasons: some failures are
-tracked in issues and fixing them is separate work, and a baseline makes the
-diff of a PR that fixes one say exactly which one.
+Records, per operation, either the error it raises or a hash of the Snakefile it
+produces, and compares that against a checked-in baseline.
 
-The check is two-sided on purpose. A new failure is a regression. A failure
-that has been fixed but left in the baseline is also an error, because a stale
-baseline quietly lowers the bar every time it is not updated.
+Hashing the OUTPUT rather than only catching exceptions is the whole point, and
+an earlier version of this script got it wrong. Checking "did it throw" catches
+nothing about a change in what is emitted -- and the two regressions this job
+exists to catch are both of that kind: serialising the intermediate document
+with sorted keys reordered arguments for 85 of 176 operations, and quoting the
+empty string added an argument to 100 of them. Neither raises. Both were
+verified to sail straight through the exceptions-only version.
+
+The check is three-sided. A new failure is a regression; an operation whose
+output changed is a regression unless the baseline says so; and an entry that is
+stale -- listed as failing but now converting -- is an error too, because a
+stale baseline quietly lowers the bar every time it is not updated.
+
+A PR that deliberately changes emitted output updates the baseline, and the diff
+then states exactly which operations changed and how many. That is the point: it
+makes an output change a reviewable fact rather than an invisible one.
 
 Usage: catalogue_smoke.py <path-to-biochef-recipes> <path-to-baseline.json>
 """
@@ -94,35 +105,56 @@ def main(recipes_root, baseline_path):
     if not catalogue:
         sys.exit(f"no operations found under {recipes_root} -- wrong path?")
 
-    failures = {}
+    import hashlib
+
+    observed = {}
     for operation_id, operation in sorted(catalogue.items()):
         convert.tools.clear()
         convert.fetch_tool = lambda tool_id, repo, _o=operation: _o
         try:
-            convert.convert_to_snakemake(
+            snakefile = convert.convert_to_snakemake(
                 convert.parse_biochef_workflow(editor_export(operation)))
         except Exception as error:
-            failures[operation_id] = f"{type(error).__name__}: {error}"
+            observed[operation_id] = f"error: {type(error).__name__}: {error}"
+        else:
+            digest = hashlib.sha256(snakefile.encode()).hexdigest()[:16]
+            observed[operation_id] = f"sha256: {digest}"
 
-    print(f"operations: {len(catalogue)}  converted: {len(catalogue) - len(failures)}"
-          f"  failed: {len(failures)}")
+    failed = sum(1 for v in observed.values() if v.startswith("error:"))
+    print(f"operations: {len(catalogue)}  converted: {len(catalogue) - failed}"
+          f"  failed: {failed}")
 
     baseline = {}
     if os.path.exists(baseline_path):
-        baseline = json.load(open(baseline_path)).get("known_failures", {})
+        baseline = json.load(open(baseline_path)).get("operations", {})
 
-    new = sorted(set(failures) - set(baseline))
-    fixed = sorted(set(baseline) - set(failures))
+    if not baseline:
+        print("no baseline: writing one would be the next step")
+        for operation_id, value in sorted(observed.items()):
+            print(f"  {operation_id}: {value}")
+        sys.exit("no baseline to compare against")
 
-    for operation_id in new:
-        print(f"  NEW FAILURE  {operation_id}: {failures[operation_id]}")
-    for operation_id in fixed:
-        print(f"  NOW PASSES   {operation_id} -- remove it from the baseline")
+    missing = sorted(set(baseline) - set(observed))
+    added = sorted(set(observed) - set(baseline))
+    changed = sorted(k for k in set(observed) & set(baseline)
+                     if observed[k] != baseline[k])
 
-    if new:
-        sys.exit(f"{len(new)} operation(s) stopped converting")
-    if fixed:
-        sys.exit(f"{len(fixed)} operation(s) now convert; the baseline is stale")
+    for operation_id in added:
+        print(f"  NEW OPERATION  {operation_id}: {observed[operation_id]}"
+              f" -- add it to the baseline")
+    for operation_id in missing:
+        print(f"  GONE           {operation_id} -- remove it from the baseline")
+    for operation_id in changed:
+        print(f"  CHANGED        {operation_id}")
+        print(f"      was {baseline[operation_id]}")
+        print(f"      now {observed[operation_id]}")
+
+    if changed:
+        sys.exit(f"{len(changed)} operation(s) convert differently than the baseline. "
+                 f"If that is intended, regenerate the baseline and the diff will say so.")
+    if added or missing:
+        sys.exit(f"the baseline does not match the catalogue "
+                 f"({len(added)} added, {len(missing)} gone)")
 
     print("catalogue matches the baseline")
 
