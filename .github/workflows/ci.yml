@@ -1,0 +1,167 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# A superseded run tells nobody anything, and these jobs install ~90 pinned
+# packages three times over.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The floor. run.sh enforces the same number at runtime, and the two must not
+  # drift: this matrix is the only thing that proves the floor is real.
+  FLOOR: "3.11"
+
+jobs:
+  suite:
+    name: tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor, because it is the version most likely to break silently,
+        # and the newest, because it is what development happens on. Adding a
+        # version here is the same decision as changing the floor in run.sh.
+        python: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install the pinned requirements
+        # Not "pip install pytest". Installing exactly what is pinned is what
+        # catches a pin that no longer resolves on a supported interpreter --
+        # which is how the floor was wrong before anyone noticed.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check the installed set is self-consistent
+        run: pip check
+
+      - name: Every module parses on this interpreter
+        # Cheap, and it fails on the version that matters rather than only
+        # where a test happens to import the module. A PEP 701 f-string made
+        # convert.py unimportable below 3.12 for months without this.
+        run: |
+          python -m compileall -q $(git ls-files '*.py') && echo "all modules compile"
+
+      - name: Run the suite
+        # -p no:cacheprovider: a stale .pytest_cache in a restored pip cache
+        # must not influence collection.
+        # --strict-markers: a typo'd marker is an error, not a silently
+        # unregistered one, so a skipif that never fires cannot hide.
+        run: |
+          pytest tests/ -v --strict-markers -p no:cacheprovider \
+                 --junitxml=results-${{ matrix.python }}.xml
+
+      - name: Refuse a vacuous pass
+        # The failure mode this whole file exists to prevent. A green tick that
+        # means "nothing ran" is worse than a red one, because it is believed.
+        #
+        # Three ways a suite can be green while testing nothing: it collected
+        # zero tests; every test was skipped; or a skipif guard silently
+        # disabled the ones that matter (snakemake missing, say). All three are
+        # errors here.
+        if: always()
+        run: |
+          python - <<'PY'
+          import glob, sys, xml.etree.ElementTree as ET
+
+          files = glob.glob("results-*.xml")
+          if not files:
+              sys.exit("no junit report: pytest did not run")
+
+          tree = ET.parse(files[0])
+          # `find(...) or root` would be wrong: an Element with no children is
+          # falsy, so a <testsuite> containing zero testcases -- exactly the
+          # case this guard exists to catch -- would fall through to the root
+          # and read the wrong counts.
+          found = tree.getroot().find("testsuite")
+          suite = tree.getroot() if found is None else found
+          total = int(suite.get("tests", 0))
+          skipped = int(suite.get("skipped", 0))
+          errors = int(suite.get("errors", 0))
+          failures = int(suite.get("failures", 0))
+          ran = total - skipped
+
+          print(f"collected={total} ran={ran} skipped={skipped} "
+                f"failures={failures} errors={errors}")
+
+          if total == 0:
+              sys.exit("collected zero tests")
+          if ran == 0:
+              sys.exit("every collected test was skipped")
+
+          # A skip is a failure here, deliberately. Everything the suite needs
+          # is in requirements.txt -- snakemake included -- so a test that
+          # skips in CI is one whose guard is wrong, or a dependency that did
+          # not install. Both are worth a red tick. The integration tests are
+          # guarded on `shutil.which("snakemake")` so they degrade on a
+          # developer's machine; that guard must never fire here.
+          #
+          # If a skip ever becomes legitimate, add its reason to ALLOWED with a
+          # comment saying why, so the exception is a decision and not a drift.
+          ALLOWED = set()
+
+          unexpected = []
+          for case in suite.iter("testcase"):
+              skip = case.find("skipped")
+              if skip is None:
+                  continue
+              reason = skip.get("message", "")
+              line = f"{case.get('classname')}::{case.get('name')} -- {reason}"
+              print(f"  SKIPPED {line}")
+              if not any(a in reason for a in ALLOWED):
+                  unexpected.append(line)
+
+          if unexpected:
+              sys.exit(f"{len(unexpected)} test(s) skipped in CI, where nothing should")
+          print("suite is not vacuous")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-py${{ matrix.python }}
+          path: results-${{ matrix.python }}.xml
+
+  catalogue:
+    name: catalogue converts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ieeta-pt/biochef-recipes
+          path: .recipes
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      - name: Convert every operation in the catalogue
+        # The check that has repeatedly caught what the unit tests could not:
+        # sorting the document's keys reordered arguments for 85 of 176
+        # operations, and quoting the empty string added an argument to 100 of
+        # them, while every targeted test stayed green. Those were found by
+        # sweeping the whole catalogue, so the sweep runs here.
+        #
+        # Compared against a checked-in baseline rather than requiring zero
+        # failures, because some are known and tracked. A PR that fixes them
+        # updates the baseline, and the diff says so.
+        run: python .github/scripts/catalogue_smoke.py .recipes ci/catalogue-baseline.json
