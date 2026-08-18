@@ -130,6 +130,25 @@ def fetch_tool(tool_id, repo):
     return bundle
 
 
+def expected_uploads(workflow):
+    """The files the client has to supply, derived from the workflow itself.
+
+    Every intermediate file is named for the edge that carries it, so the set a
+    run consumes and the set it produces are both known before anything runs.
+    What is consumed but not produced by any node is what has to arrive as an
+    upload; everything else the run creates for itself.
+
+    This is the second of the two gates described in workspace.py. check_name
+    decides whether a name is a usable file name at all; this decides whether it
+    is one this run has any business receiving. Each catches what the other
+    cannot -- "samtools" is a perfectly good file name, and an output slot is a
+    name the workflow does declare.
+    """
+    produced = {name for node in workflow.nodes for name in node.outputs}
+    consumed = {name for node in workflow.nodes for name in node.inputs}
+    return consumed - produced
+
+
 def materialise_tools(workflow, ws):
     """Put a copy of each tool's binary into this run's workspace.
 

@@ -41,14 +41,39 @@ if "oras" not in sys.modules:
     sys.modules["oras"] = oras
     sys.modules["oras.client"] = client_mod
 
+import json
+import os
+
 import pytest
 from fastapi.testclient import TestClient
 
+import convert
 import main
 from workspace import SAFE_NAME, UnsafeName, check_name
 
 
-EMPTY_WORKFLOW = b'{"nodes": [], "edges": []}'
+BUNDLE = {"id": "t", "name": "t", "bin": "t",
+          "io": {"inputs": [{"name": "in", "types": ["T"], "mode": "file"},
+                     {"name": "second", "types": ["T"], "mode": "file"}],
+                 "outputs": [{"name": "out", "types": ["T"], "mode": "stdout"}]},
+          "parameters": []}
+
+# One declared input, so exactly one upload name is legitimate: "input-1-out".
+# An empty workflow expects no uploads at all, which now makes every upload a
+# 400 -- correct, but useless for testing the name rule itself.
+ONE_INPUT_WORKFLOW = json.dumps({
+    "nodes": [
+        {"id": "input-1", "type": "inputWorkflowNode",
+         "data": {"outputs": {"out": {"kind": "text", "data": "x"}}}},
+        {"id": "t-1", "type": "workflowNode",
+         "data": {"label": "t", "repo": "r", "paramValues": {}, "outputs": {}}},
+        {"id": "output-1", "type": "outputWorkflowNode", "data": {}},
+    ],
+    "edges": [
+        {"source": "input-1", "sourceHandle": "out", "target": "t-1", "targetHandle": "in"},
+        {"source": "t-1", "sourceHandle": "out", "target": "output-1", "targetHandle": "in"},
+    ],
+}).encode()
 
 
 @pytest.fixture
@@ -61,12 +86,22 @@ def client(tmp_path, monkeypatch):
     workflow engine to check one would make them slow and conditional.
     """
     monkeypatch.setattr(main, "RUN_ROOT", str(tmp_path / "runs"))
-    monkeypatch.setattr(main, "run_snakemake", lambda ws, *a, **k: (0, "", ""))
+    monkeypatch.setattr(convert, "fetch_tool", lambda tool_id, repo: BUNDLE)
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+    os.makedirs(tmp_path / "cache" / "t", exist_ok=True)
+    (tmp_path / "cache" / "t" / "t").write_text("#!/bin/sh\n")
+    convert.tools.clear()
+
+    def fake_run(ws, *a, **k):
+        ws.write_bytes("t-1-out", b"PRODUCED")
+        return (0, "", "")
+
+    monkeypatch.setattr(main, "run_snakemake", fake_run)
     monkeypatch.chdir(tmp_path)
     return TestClient(main.app, raise_server_exceptions=False)
 
 
-def post(client, filename, content=b"payload", workflow=EMPTY_WORKFLOW):
+def post(client, filename, content=b"payload", workflow=ONE_INPUT_WORKFLOW):
     return client.post(
         "/convert",
         data={"biochef_workflow": workflow},
@@ -176,33 +211,64 @@ def test_a_plain_name_still_works(client, tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("name", ["Snakefile", "SNAKEFILE", "snakefile"])
-def test_an_upload_occupying_the_snakefile_slot_is_a_bad_request(name, client, tmp_path):
-    """400, not 500.
+def test_an_upload_named_for_a_file_the_run_creates_is_refused(name, client, tmp_path):
+    """Refused as "not an input", earlier than O_EXCL would have caught it.
 
     "Snakefile" is a perfectly legal single path component, so the shape rule
-    passes it and O_EXCL then refuses the generated write. That refusal is
-    correct -- the attacker's file is never executed, and run_snakemake is never
-    reached -- but without the mapping it surfaced as an unhandled exception for
-    what is a bad request.
+    passes it. What refuses it is the workflow: the run declares which files it
+    consumes, and this is not one of them. That gate fires before anything is
+    written, so the generated Snakefile never has to contend for its own slot.
 
-    The case variants matter on macOS: APFS is case-insensitive by default, so
-    "SNAKEFILE" occupies the same slot.
+    Case variants matter on macOS, where APFS is case-insensitive by default and
+    they would occupy the same slot.
     """
     response = post(client, name)
 
     assert response.status_code == 400, response.text
-    assert "Snakefile" in response.text
+    assert "is not an input" in response.text
 
 
-def test_an_upload_cannot_shadow_a_file_the_run_already_made(client, tmp_path):
-    """O_EXCL. Sending the same name twice is refused rather than overwriting,
-    which is also what stops an upload landing on a tool binary."""
+def test_the_same_input_sent_twice_is_refused(client, tmp_path):
+    """O_EXCL, reached with a name the workflow does declare.
+
+    Sending a legitimate input twice is the only way to reach the exclusive-open
+    refusal now: anything the run does not expect is turned away by the
+    declared-set gate first.
+    """
     response = client.post(
         "/convert",
-        data={"biochef_workflow": EMPTY_WORKFLOW},
-        files=[("files", ("same-name", b"first", "text/plain")),
-               ("files", ("same-name", b"second", "text/plain"))],
+        data={"biochef_workflow": ONE_INPUT_WORKFLOW},
+        files=[("files", ("input-1-out", b"first", "text/plain")),
+               ("files", ("input-1-out", b"second", "text/plain"))],
     )
 
     assert response.status_code == 400
     assert "sent twice" in response.text
+
+
+def test_a_declared_input_that_never_arrives_is_refused(client, tmp_path):
+    """The other half of the declared-set gate.
+
+    A run whose input never arrived used to proceed, generate a Snakefile, and
+    fail inside snakemake looking for a file nobody sent. The workflow says what
+    it needs, so the request can be refused naming what is missing.
+
+    Two declared inputs, one uploaded.
+    """
+    two_inputs = json.loads(ONE_INPUT_WORKFLOW)
+    two_inputs["nodes"].append(
+        {"id": "input-2", "type": "inputWorkflowNode",
+         "data": {"outputs": {"out": {"kind": "text", "data": "y"}}}})
+    two_inputs["edges"].append(
+        {"source": "input-2", "sourceHandle": "out",
+         "target": "t-1", "targetHandle": "second"})
+
+    response = client.post(
+        "/convert",
+        data={"biochef_workflow": json.dumps(two_inputs)},
+        files=[("files", ("input-1-out", b"x", "text/plain"))],
+    )
+
+    assert response.status_code == 400, response.text
+    assert "missing inputs" in response.text
+    assert "input-2-out" in response.text

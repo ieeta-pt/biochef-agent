@@ -46,7 +46,25 @@ import convert
 import main
 
 BUNDLE = {"id": "tool", "name": "tool", "bin": "tool",
-          "io": {"inputs": [], "outputs": []}, "parameters": []}
+          "io": {"inputs": [{"name": "in", "types": ["T"], "mode": "file"}],
+                 "outputs": [{"name": "out", "types": ["T"], "mode": "stdout"}]},
+          "parameters": []}
+
+# The handler now refuses an upload the workflow does not declare, so a test
+# that posts a file needs a workflow that asks for one.
+WORKFLOW = json.dumps({
+    "nodes": [
+        {"id": "input-1", "type": "inputWorkflowNode",
+         "data": {"outputs": {"out": {"kind": "text", "data": "x"}}}},
+        {"id": "tool-1", "type": "workflowNode",
+         "data": {"label": "tool", "repo": "r", "paramValues": {}, "outputs": {}}},
+        {"id": "output-1", "type": "outputWorkflowNode", "data": {}},
+    ],
+    "edges": [
+        {"source": "input-1", "sourceHandle": "out", "target": "tool-1", "targetHandle": "in"},
+        {"source": "tool-1", "sourceHandle": "out", "target": "output-1", "targetHandle": "in"},
+    ],
+})
 
 
 class FakeRegistry:
@@ -155,16 +173,10 @@ def test_a_failed_run_is_reported_as_execution_failed(tmp_path, monkeypatch):
                         lambda ws, *a, **k: (1, "", "the tool said no"))
     monkeypatch.chdir(tmp_path)
 
-    workflow = {
-        "nodes": [{"id": "tool-1", "type": "workflowNode",
-                   "data": {"label": "tool", "repo": "r",
-                            "paramValues": {}, "outputs": {}}}],
-        "edges": [],
-    }
     client = TestClient(main.app, raise_server_exceptions=False)
     response = client.post(
         "/convert",
-        data={"biochef_workflow": json.dumps(workflow)},
+        data={"biochef_workflow": WORKFLOW},
         files=[("files", ("input-1-out", b"x", "text/plain"))],
     )
 
@@ -194,10 +206,7 @@ def test_a_failed_run_still_removes_its_workspace(tmp_path, monkeypatch):
     client = TestClient(main.app, raise_server_exceptions=False)
     client.post(
         "/convert",
-        data={"biochef_workflow": json.dumps(
-            {"nodes": [{"id": "tool-1", "type": "workflowNode",
-                        "data": {"label": "tool", "repo": "r",
-                                 "paramValues": {}, "outputs": {}}}], "edges": []})},
+        data={"biochef_workflow": WORKFLOW},
         files=[("files", ("input-1-out", b"x", "text/plain"))],
     )
 

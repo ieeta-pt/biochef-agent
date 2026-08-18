@@ -76,19 +76,43 @@ async def convert(
         # refused by O_EXCL rather than quietly replacing what will be executed.
         materialise_tools(workflow, ws)
 
-        # Save uploaded files. The name is checked rather than trusted:
-        # starlette passes the multipart filename through verbatim. The write
-        # goes through the workspace's directory descriptor, so even a name that
-        # slipped past the check could not land outside it.
+        # Save uploaded files, against the set the workflow says it needs.
+        #
+        # The name is checked for shape -- starlette passes the multipart
+        # filename through verbatim -- and then for whether this run has any
+        # business receiving it. The second gate is what stops an upload
+        # occupying a slot the run means to produce: snakemake sees the output
+        # already present and up to date, skips the rule that would have made
+        # it, and the client's bytes are returned as that tool's output. The
+        # tool never ran, and nothing in the response says so.
+        #
+        # O_EXCL cannot catch that on its own, because at upload time the
+        # output does not exist yet.
+        expected = expected_uploads(workflow)
+        seen = set()
         for f in files:
+            name = check_name(f.filename)
+            if name not in expected:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"upload {name!r} is not an input of this workflow; "
+                           f"it expects {sorted(expected)}",
+                )
             try:
-                ws.write_bytes(check_name(f.filename), await f.read())
+                ws.write_bytes(name, await f.read())
             except FileExistsError:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"upload {f.filename!r} was sent twice, or shadows a "
+                    detail=f"upload {name!r} was sent twice, or shadows a "
                            f"file this run already created",
                 )
+            seen.add(name)
+
+        if expected - seen:
+            raise HTTPException(
+                status_code=400,
+                detail=f"missing inputs: {sorted(expected - seen)}",
+            )
 
         # Convert workflow to Snakemake and run
         snakemake = convert_to_snakemake(workflow)

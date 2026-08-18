@@ -86,6 +86,9 @@ class Workspace:
     def __init__(self, path: str):
         self.path = os.path.realpath(path)
         self._fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY)
+        # Which directory this is, independent of what the path says later.
+        info = os.fstat(self._fd)
+        self._identity = (info.st_dev, info.st_ino)
 
     def _open(self, name: str, flags: int, mode: int = 0o600) -> int:
         check_name(name)
@@ -148,11 +151,32 @@ class Workspace:
         return os.path.join(self.path, name)
 
     def cleanup(self) -> None:
+        """Remove the workspace, but only if the path still refers to it.
+
+        rmtree takes a path, and a path is a lookup rather than a handle. If the
+        directory has been moved or replaced since it was opened -- which for a
+        run means something with the agent's own privileges did it -- the path
+        now names a different directory, and deleting it would destroy whatever
+        happens to be there instead.
+
+        The descriptor is held precisely so the run's identity does not depend
+        on the path, so cleanup uses it: compare what the path resolves to now
+        against the inode opened at construction, and decline if they differ.
+        Declining leaks a directory; deleting the wrong one is worse.
+        """
+        try:
+            current = os.stat(self.path)
+            same = (current.st_dev, current.st_ino) == self._identity
+        except OSError:
+            same = False
+
         try:
             os.close(self._fd)
         except OSError:
             pass
-        shutil.rmtree(self.path, ignore_errors=True)
+
+        if same:
+            shutil.rmtree(self.path, ignore_errors=True)
 
 
 def make_workspace(root: str = None) -> Workspace:

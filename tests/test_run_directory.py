@@ -209,6 +209,44 @@ def test_a_symlinked_slot_is_refused_on_read(tmp_path):
         ws.cleanup()
 
 
+def test_cleanup_declines_when_the_path_no_longer_names_the_workspace(tmp_path):
+    """rmtree takes a path, and a path is a lookup rather than a handle.
+
+    If the directory is moved or replaced after it was opened, the path names
+    something else, and deleting it would destroy whatever is there instead. The
+    descriptor is held so the run's identity does not depend on the path, so
+    cleanup compares the two and declines if they differ.
+
+    Leaking a directory is the right failure here. Deleting the wrong one is not.
+    """
+    ws = make_workspace(str(tmp_path))
+    original = ws.path
+
+    moved = str(tmp_path / "moved-away")
+    os.rename(original, moved)
+    impostor = Path(original)
+    impostor.mkdir()
+    (impostor / "someone-elses-data").write_bytes(b"do not delete")
+
+    ws.cleanup()
+
+    assert (impostor / "someone-elses-data").exists(), \
+        "cleanup deleted a directory that was not its workspace"
+    shutil.rmtree(moved, ignore_errors=True)
+    shutil.rmtree(str(impostor), ignore_errors=True)
+
+
+def test_cleanup_removes_its_own_workspace(tmp_path):
+    """The identity check must not stop cleanup doing its job."""
+    ws = make_workspace(str(tmp_path))
+    ws.write_bytes("something", b"x")
+    path = ws.path
+
+    ws.cleanup()
+
+    assert not os.path.exists(path)
+
+
 def test_a_hardlinked_slot_is_refused(tmp_path):
     """The same exfiltration as #41, by hard link rather than symbolic link.
 
