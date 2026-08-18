@@ -2,3 +2,18 @@ __pycache__/
 .snakemake/
 tmp/
 .env
+
+# Created by run.sh on first start.
+venv/
+
+# Where pulled tool bundles are cached between runs.
+tool-cache/
+
+# A run's generated workflow and its validated document. They belong to the run
+# that produced them, not to the repository.
+Snakefile
+intermediate.json
+
+# Test and CI artifacts.
+.coverage
+results-*.xml
