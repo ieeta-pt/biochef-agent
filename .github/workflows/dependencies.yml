@@ -1,0 +1,67 @@
+name: dependencies
+
+# Deliberately separate from any workflow that runs tests.
+#
+# These checks need nothing but the repository, so they can live on the default
+# branch and apply to every pull request immediately -- including branches that
+# do not carry a test suite yet. A workflow that runs tests has to live wherever
+# the tests do, which makes it arrive later and cover less.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: deps-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  install:
+    name: pinned install (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is the floor this branch actually supports, not a preference:
+        # convert.py contains an f-string that nests the same quote, which is
+        # PEP 701 and therefore 3.12+. Anything below fails to parse. That is
+        # the sort of thing this job exists to state out loud rather than leave
+        # for someone to discover at import time.
+        python: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install exactly what is pinned
+        # Not a subset, and not the latest of anything. The point is to find a
+        # pin that no longer resolves on a supported interpreter before someone
+        # finds it while trying to run the service.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check the installed set is self-consistent
+        # pip will happily install a set whose own declared requirements
+        # conflict. This is the only thing that says so.
+        run: pip check
+
+      - name: Every module parses on this interpreter
+        # -f because compileall SKIPS a file that already has an up-to-date
+        # .pyc, and a skipped file is reported as a pass. A fresh checkout has
+        # no __pycache__ today, but a check whose correctness depends on the
+        # tree being clean is one restored cache away from being decorative.
+        run: |
+          python -m compileall -q -f $(git ls-files '*.py')
+          echo "all modules parse on $(python --version)"
+
+      - name: Report what was installed
+        # So a failure caused by a transitive dependency moving is diagnosable
+        # from the log alone, without re-running anything.
+        if: always()
+        run: pip list --format=freeze
