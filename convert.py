@@ -127,37 +127,54 @@ def parse_biochef_workflow(biochef_workflow):
         new_node: Node = Node(id=node_id, bin=tool_info["bin"])
 
         connections = [e for e in edge_list if node_id in (e["target"], e["source"])]
-        for connection in connections:
-            source, source_handle, target, target_handle = (
-                connection["source"], connection.get("sourceHandle"),
-                connection["target"], connection.get("targetHandle"),
+
+        def build_io(info, file_name):
+            # `.get` returning None where a recipe omits the key is kept as None
+            # rather than flattened to "": the two mean different things to the
+            # frontend and both occur in the catalogue, so the model records
+            # which one the recipe actually said.
+            return IO(
+                file=file_name,
+                mode=IOMode(info.get("mode")),
+                hardcoded_file=info.get("filename"),
+                flag=info.get("flag"),
             )
 
-            _name = f"{source}-{source_handle}"
+        # Inputs, in the order the recipe declares them and keyed by which
+        # declared input each one fills.
+        #
+        # Both were previously taken from the edges: the dict was keyed by
+        # f"{source}-{source_handle}" and built by walking the edge list. Two
+        # things went wrong. Order followed however the client happened to list
+        # its edges rather than what the tool expects (#31). And one source
+        # feeding two inputs of the same tool produced the same key twice, so
+        # the second overwrote the first and the tool was invoked an argument
+        # short with nothing saying so (#32).
+        #
+        # The file name is unchanged -- it is still f"{source}-{source_handle}",
+        # because that is the file the upstream node writes. Only the key and
+        # the order change.
+        incoming = [e for e in connections if e["target"] == node_id]
+        for input_info in tool_info["io"]["inputs"]:
+            handle = input_info["name"]
+            connection = next(
+                (e for e in incoming if e.get("targetHandle") == handle), None)
+            if connection is None:
+                continue  # a declared input nothing is wired to
+            file_name = f"{connection['source']}-{connection.get('sourceHandle')}"
+            new_node.inputs[handle] = build_io(input_info, file_name)
 
-            def build_io(info):
-                # Named rather than positional. `.get` returning None where a
-                # recipe omits the key is kept as None rather than flattened to
-                # "": the two mean different things to the frontend and both
-                # occur in the catalogue, so the model records which one the
-                # recipe actually said. Nothing downstream can tell the
-                # difference -- the emitter only tests these for truth.
-                return IO(
-                    file=_name,
-                    mode=IOMode(info.get("mode")),
-                    hardcoded_file=info.get("filename"),
-                    flag=info.get("flag"),
-                )
-
-            is_input_connection = node_id == target
-            if is_input_connection:
-                input_info = next(
-                    i for i in tool_info["io"]["inputs"] if i["name"] == target_handle)
-                new_node.inputs[_name] = build_io(input_info)
-            else:
-                output_info = next(
-                    i for i in tool_info["io"]["outputs"] if i["name"] == source_handle)
-                new_node.outputs[_name] = build_io(output_info)
+        # Outputs keep their file-derived key. Nothing reads it as an identity
+        # -- main.py splits the handle back off it -- and changing it would be a
+        # second, unrelated break of the same contract.
+        for connection in connections:
+            if connection["target"] == node_id:
+                continue
+            source_handle = connection.get("sourceHandle")
+            file_name = f"{connection['source']}-{source_handle}"
+            output_info = next(
+                i for i in tool_info["io"]["outputs"] if i["name"] == source_handle)
+            new_node.outputs[file_name] = build_io(output_info, file_name)
 
         # Walk the recipe, not the request. paramValues is a JSON object, so
         # its order is whatever the client serialised -- the same workflow sent

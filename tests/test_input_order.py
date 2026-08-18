@@ -65,30 +65,52 @@ def edge(source, target_handle):
             "target": "t-1", "targetHandle": target_handle}
 
 
-def test_input_order_follows_the_edges_not_the_declaration():
-    """#31. The same graph, with the edges listed the other way round, is a
-    different command."""
+def test_input_order_comes_from_the_recipe_whatever_the_edges_say():
+    """#31. The same graph, edges listed either way round, is one command."""
     _, _, declared = emit([edge("a", "first"), edge("b", "second")])
     _, _, reversed_ = emit([edge("b", "second"), edge("a", "first")])
 
-    assert declared != reversed_, "order no longer follows edge order"
+    assert declared == reversed_
+    # and it is the DECLARED order: "first" is declared first, and "a" fills it
     assert declared == ['i_0="a-out",', 'i_1="b-out",']
-    assert reversed_ == ['i_0="b-out",', 'i_1="a-out",']
 
 
-def test_one_source_feeding_two_inputs_loses_one():
-    """#32. Both connections key on the same file name, so the second
-    overwrites the first and the tool is invoked with one argument short."""
-    node, shell, _ = emit([edge("a", "first"), edge("a", "second")], sources=("a",))
+def test_one_source_can_feed_two_inputs():
+    """#32. Two edges from one source into two declared inputs used to key on
+    the same file name, so the second overwrote the first and the tool was
+    invoked an argument short."""
+    node, shell, bindings = emit([edge("a", "first"), edge("a", "second")],
+                                 sources=("a",))
 
-    assert len(node.inputs) == 1, "the collision no longer happens"
-    assert list(node.inputs) == ["a-out"]
-    assert shell.count("{input.i_") == 1, "only one input reached the command"
+    assert len(node.inputs) == 2, "one of the two inputs was dropped"
+    assert list(node.inputs) == ["first", "second"]
+    assert bindings == ['i_0="a-out",', 'i_1="a-out",']
+    assert shell.count("{input.i_") == 2
 
 
-def test_inputs_are_keyed_by_the_file_not_by_the_declared_input():
-    """Which is the decision both issues follow from."""
+def test_inputs_are_keyed_by_the_declared_input_they_fill():
+    """The decision both fixes follow from.
+
+    The file name is unchanged -- still f"{source}-{source_handle}", because
+    that is what the upstream node writes. Only the key and the order changed.
+    """
     node, _, _ = emit([edge("a", "first"), edge("b", "second")])
 
-    assert sorted(node.inputs) == ["a-out", "b-out"]
-    assert "first" not in node.inputs and "second" not in node.inputs
+    assert list(node.inputs) == ["first", "second"]
+    assert node.inputs["first"].file == "a-out"
+    assert node.inputs["second"].file == "b-out"
+
+
+def test_a_declared_input_nothing_is_wired_to_is_skipped():
+    node, _, bindings = emit([edge("a", "second")], sources=("a",))
+
+    assert list(node.inputs) == ["second"]
+    assert bindings == ['i_0="a-out",']
+
+
+def test_outputs_keep_their_file_derived_key():
+    """Unchanged on purpose: main.py splits the handle back off it, and
+    re-keying them would be a second, unrelated break of the same contract."""
+    node, _, _ = emit([edge("a", "first")], sources=("a",))
+
+    assert list(node.outputs) == ["t-1-out"]
