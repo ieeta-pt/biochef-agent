@@ -1,12 +1,30 @@
 # biochef-agent
 
-Runs a BioChef workflow natively, for tools that cannot run in the browser.
+An execution endpoint that takes a BioChef workflow — or individual steps of one
+— to where the data and the compute already are: a Trusted Research Environment,
+an HPC cluster, an institutional server.
 
-The editor builds a workflow as a graph of tool invocations. Most of them run as
-WebAssembly in the page. This service is the escape hatch for the ones that do
-not: it takes the same workflow description, fetches the tools from the
-registry, generates a [Snakemake](https://snakemake.github.io/) workflow, runs
-it, and returns the outputs.
+The editor builds a workflow as a graph of tool invocations, and much of it runs
+as WebAssembly in the page. That works while the data is something the browser
+may hold. Often it is not. Controlled-access data cannot leave the environment
+that governs it, a cohort can be too large to ship, and some steps need
+resources no tab has. In each case the answer is the same: send the computation
+to the data rather than the data to the computation.
+
+This service is the far end of that dispatch. It takes the same workflow
+description the editor produces, fetches the tools from the registry, generates
+a [Snakemake](https://snakemake.github.io/) workflow, runs it where it is
+deployed, and returns the results.
+
+The direction of travel is federated. The roadmap works towards GA4GH
+interoperability — resolving DRS identifiers across sites, streaming htsget
+slices as inputs, validating Passport visas to decide what a caller may run and
+read, exposing the agent itself as a WES endpoint, and dispatching heavy steps
+of a DAG to an institutional TES — and then towards silo mode, where an agent
+runs against data that never leaves its site at all, under a policy declaring
+what is eligible and what privacy budget an analysis may spend.
+
+None of that is built yet. What exists today is the single endpoint below.
 
 ## The contract
 
@@ -81,9 +99,14 @@ Configuration is by environment variable, and `example.env` lists them:
 ## Before deploying this
 
 **It is not ready to be exposed.** There is no authentication of any kind, and
-several open issues describe defects that are reachable by anyone who can reach
-the port. The most significant are tracked in the issue tracker; read them
-before putting this anywhere a stranger can send it a request.
+several open issues describe defects reachable by anyone who can reach the port.
+The most significant are tracked in the issue tracker; read them before putting
+this anywhere a stranger can send it a request.
+
+That matters more here than the sentence usually implies. The environments this
+is aimed at are the ones where it would do the most damage: an agent inside a
+TRE sits next to data that is there precisely because it may not leave. Deciding
+what a caller may run and read is C2 and F3, and neither exists yet.
 
 Development is organised as numbered workstreams (A–G) in the issues: the
 converter and its intermediate model, asynchronous runs, authentication and
