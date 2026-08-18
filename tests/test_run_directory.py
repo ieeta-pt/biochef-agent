@@ -209,6 +209,44 @@ def test_a_symlinked_slot_is_refused_on_read(tmp_path):
         ws.cleanup()
 
 
+def test_a_hardlinked_slot_is_refused(tmp_path):
+    """The same exfiltration as #41, by hard link rather than symbolic link.
+
+    O_NOFOLLOW does not stop this: a hard link is not a symlink, it is another
+    name for the same inode and indistinguishable from the original. Without the
+    link-count check, a tool could link a file from outside the run into its own
+    output slot and the agent would read it and base64 it into the response.
+
+    That is the case the threat model has to get right. The tool binary is the
+    untrusted party here -- it is arbitrary code pulled from a registry, running
+    against whatever the deployment can see -- so "the attacker already runs code
+    on the host" describes the ordinary situation rather than an escalation. In
+    an environment where the agent sits next to data that may not leave, the
+    response body is the way out.
+    """
+    outside = tmp_path / "not-for-export"
+    outside.write_bytes(b"controlled data")
+
+    ws = make_workspace(str(tmp_path))
+    try:
+        os.link(str(outside), os.path.join(ws.path, "tool-out"))
+        with pytest.raises(UnsafeName, match="another name"):
+            ws.open_read("tool-out")
+    finally:
+        ws.cleanup()
+
+
+def test_a_file_the_workspace_made_itself_is_readable(tmp_path):
+    """The link-count check must not refuse ordinary output."""
+    ws = make_workspace(str(tmp_path))
+    try:
+        ws.write_bytes("genuine", b"produced by the run")
+        with ws.open_read("genuine") as handle:
+            assert handle.read() == b"produced by the run"
+    finally:
+        ws.cleanup()
+
+
 def test_a_symlinked_slot_is_refused_on_a_non_exclusive_write(tmp_path):
     """The write path without O_EXCL in front of it.
 

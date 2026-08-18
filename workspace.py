@@ -90,8 +90,8 @@ class Workspace:
     def _open(self, name: str, flags: int, mode: int = 0o600) -> int:
         check_name(name)
         try:
-            return os.open(name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, mode,
-                           dir_fd=self._fd)
+            fd = os.open(name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, mode,
+                         dir_fd=self._fd)
         except OSError as e:
             if e.errno == errno.ELOOP:
                 # A slot that is a symlink. On the read path this is the
@@ -99,6 +99,23 @@ class Workspace:
                 # read and returned to the client.
                 raise UnsafeName(f"{name!r} is a symbolic link") from None
             raise
+
+        # And the same attack by hard link, which O_NOFOLLOW does not stop
+        # because a hard link is not a symbolic link -- it is another name for
+        # the same inode, indistinguishable from the original.
+        #
+        # A file this workspace created has exactly one link. Anything with more
+        # was linked from somewhere else, which for a slot the agent is about to
+        # read means the contents of a file outside the run would be returned to
+        # the caller.
+        try:
+            if os.fstat(fd).st_nlink > 1:
+                os.close(fd)
+                raise UnsafeName(f"{name!r} has another name outside this run")
+        except OSError:
+            os.close(fd)
+            raise
+        return fd
 
     def open_write(self, name: str, *, exclusive: bool = True):
         """Open a slot for writing.
