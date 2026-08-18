@@ -52,8 +52,13 @@ jobs:
         # Cheap, and it fails on the version that matters rather than only
         # where a test happens to import the module. A PEP 701 f-string made
         # convert.py unimportable below 3.12 for months without this.
+        #
+        # -f because compileall SKIPS any file with an up-to-date .pyc, and a
+        # skipped file is a pass. A fresh checkout has no __pycache__ so it does
+        # not bite here today, but a check whose correctness depends on the tree
+        # being clean is one restored cache away from being decorative.
         run: |
-          python -m compileall -q $(git ls-files '*.py') && echo "all modules compile"
+          python -m compileall -q -f $(git ls-files '*.py') && echo "all modules compile"
 
       - name: Run the suite
         # -p no:cacheprovider: a stale .pytest_cache in a restored pip cache
