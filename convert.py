@@ -159,16 +159,29 @@ def parse_biochef_workflow(biochef_workflow):
                     i for i in tool_info["io"]["outputs"] if i["name"] == source_handle)
                 new_node.outputs[_name] = build_io(output_info)
 
-        for param_key, param in node["data"]["paramValues"].items():
-            if param.get("enabled") != True:
+        # Walk the recipe, not the request. paramValues is a JSON object, so
+        # its order is whatever the client serialised -- the same workflow sent
+        # twice with different key order produced two different commands (#44).
+        # The recipe's parameter list is the one thing that says what order the
+        # tool expects, and it is what the frontend walks
+        # (RecipePanel.js:584).
+        #
+        # A parameter the recipe does not declare is now ignored rather than
+        # raising StopIteration from inside the parse. It cannot be emitted --
+        # there is no flag or type for it -- and a request carrying one is not a
+        # reason to fail with an exception that names nothing.
+        supplied = node["data"]["paramValues"]
+        for param_info in tool_info["parameters"]:
+            param_key = param_info["name"]
+            param = supplied.get(param_key)
+            if param is None or param.get("enabled") != True:
                 continue
-            param_info = next(
-                p for p in tool_info["parameters"] if p["name"] == param_key)
 
             new_param: Param = Param(
                 name=param_key,
                 value=param["value"],
                 flag=param_info.get("flag"),
+                type=param_info.get("type"),
             )
 
             new_node.parameters[param_key] = new_param
@@ -252,22 +265,29 @@ def convert_to_snakemake(workflow: Workflow):
         for param_name, param in node.parameters.items():
             if param.flag:
                 cmd.append(sh_literal(param.flag))
-            # An empty value has to stay absent rather than become an empty
-            # argument. It contributed nothing before by accident: " ".join put
-            # "" between two spaces and the shell collapsed the gap away. But
-            # shlex.quote("") is '', which is a real argument -- and 100 of the
-            # 176 catalogue operations declare flag-type parameters whose value
-            # is empty, so quoting them turned "-c" into "-c ''" and handed a
-            # tool an argument it never used to receive. Measured, not guessed:
-            # the catalogue sweep for this change caught it.
-            #
-            # Emitting only the flag is also what the frontend does for these,
-            # but making that the rule needs the parameter's declared type,
-            # which the model does not carry yet. Skipping the empty value
-            # reproduces today's behaviour exactly and keeps this change about
-            # quoting and nothing else.
-            if param.value != "":
-                cmd.append(sh_literal(param.value))
+
+            if param.type == "flag":
+                # A flag parameter is its flag. It has no value, and emitting
+                # one would hand the tool an argument it does not take -- which
+                # is what the frontend has always done (RecipePanel.js:590) and
+                # what the model can now express. 469 of the catalogue's 1107
+                # parameters are this type.
+                continue
+
+            # An empty value stays absent rather than becoming an empty
+            # argument: shlex.quote("") is '', which is a real argument the tool
+            # never used to receive.
+            if param.value == "":
+                continue
+
+            # In declared position, flagged or not. An unflagged value is NOT
+            # held back the way an unflagged file is: every one of them in the
+            # catalogue is a hidden subcommand declared first -- "consensus" in
+            # `bcftools consensus -c ...` -- and moving it after the flags
+            # breaks the invocation. #49 argued the opposite from the getopt
+            # rule that applies to filenames; it does not apply here, and the
+            # frontend has always emitted these in place.
+            cmd.append(sh_literal(param.value))
 
         # Arguments with no flag are held back and appended after every flagged
         # one. A bare filename ahead of a flag makes a getopt-style parser stop
