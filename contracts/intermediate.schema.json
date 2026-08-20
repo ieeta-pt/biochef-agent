@@ -118,6 +118,18 @@
           "title": "Name",
           "type": "string"
         },
+        "type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Type"
+        },
         "value": {
           "anyOf": [
             {
@@ -144,7 +156,7 @@
   "$id": "https://biochef.app/schemas/intermediate/v1.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
-  "description": "The validated document the Agent writes as intermediate.json and reads back to generate the Snakefile. Schema version 1.0.0.",
+  "description": "The validated document the Agent writes as intermediate.json and reads back to generate the Snakefile. Schema version 1.1.0.",
   "properties": {
     "nodes": {
       "items": {
@@ -154,7 +166,7 @@
       "type": "array"
     },
     "schemaVersion": {
-      "default": "1.0.0",
+      "default": "1.1.0",
       "title": "Schemaversion",
       "type": "string"
     }

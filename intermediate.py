@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
 """Semantic version of the document shape, not of the Agent.
 
 Bump the minor for a backwards-compatible addition (a new optional field), the
@@ -99,6 +99,18 @@ class Param(BaseModel):
     value: ParamValue = ""
     flag: Optional[str] = None
     """`None` when the recipe declares no flag, for the same reason as `IO.flag`."""
+
+    type: Optional[str] = None
+    """What the recipe says this parameter is: flag, string, integer or float.
+
+    Carried because the emitter cannot otherwise tell a flag from a value. The
+    frontend branches on it -- a `flag` parameter contributes only its flag,
+    never a value -- and without it here the agent has nothing to branch on.
+
+    `Optional` rather than required so a document written before this field
+    existed still validates. A missing type means "not declared", which the
+    emitter treats as an ordinary value.
+    """
 
 
 class Node(BaseModel):
