@@ -191,12 +191,49 @@ def parse_biochef_workflow(biochef_workflow):
         for param_info in tool_info["parameters"]:
             param_key = param_info["name"]
             param = supplied.get(param_key)
-            if param is None or param.get("enabled") != True:
-                continue
+            enabled = param is not None and param.get("enabled") == True
+
+            # A required parameter is resolved from the recipe rather than
+            # depending on the client to volunteer it (#33).
+            #
+            # Deciding purely on the client's `enabled` flag meant a subcommand
+            # survived only because RecipePanel.js initialises required
+            # parameters as enabled. Any client that does not replicate that
+            # produced `./samtools {input}` -- not samtools doing the wrong
+            # thing, samtools with no subcommand at all. 65 of the catalogue's
+            # 73 hidden parameters are subcommand selectors.
+            #
+            # Only where the recipe declares a default. The other 29 required
+            # parameters are visible ones a user genuinely has to supply --
+            # sed's script, tr's set1 -- and there is nothing to fall back on;
+            # inventing a value for those would be worse than omitting them.
+            if not enabled:
+                if not param_info.get("required"):
+                    continue
+                if param_info.get("type") == "flag":
+                    # A required flag needs no default: its presence IS the
+                    # value, and the emitter drops the value for this type
+                    # anyway. Requiring a default here would have skipped
+                    # samtools fixmate's -m, which the recipe declares required
+                    # and gives nothing to fall back on because there is nothing
+                    # to fall back to.
+                    value = ""
+                elif param_info.get("default") is None:
+                    continue
+                else:
+                    value = param_info["default"]
+            else:
+                value = param["value"]
+                # An enabled required parameter with nothing in it falls back to
+                # the recipe too, so a client that sends the key but leaves the
+                # value empty is no worse off than one that omits it entirely.
+                if value == "" and param_info.get("required") \
+                        and param_info.get("default") is not None:
+                    value = param_info["default"]
 
             new_param: Param = Param(
                 name=param_key,
-                value=param["value"],
+                value=value,
                 flag=param_info.get("flag"),
                 type=param_info.get("type"),
             )
