@@ -44,28 +44,49 @@ tests/test_intermediate_roundtrip.py, which is what makes turning it on safe.
 INTERMEDIATE_FILENAME = "intermediate.json"
 
 
-def write_intermediate(workflow: Workflow, path: str = INTERMEDIATE_FILENAME) -> str:
+def intermediate_path(directory: str) -> str:
+    """Where this run's document lives.
+
+    A run has to say where. There is deliberately no default: a relative one
+    would be resolved against whatever the process's working directory happened
+    to be, and that is shared by every request in flight. While the handler
+    chdir'd into a run directory that was invisibly fine; the moment it stops
+    doing so -- which is what #40 is -- a default would silently put every
+    concurrent run's document at the same path, and one run could then generate
+    its Snakefile from another run's validated document.
+
+    Removing the default is what makes that impossible to reintroduce by
+    forgetting, rather than only fixed at the one call site that exists today.
+    """
+    return os.path.join(directory, INTERMEDIATE_FILENAME)
+
+
+def write_intermediate(workflow: Workflow, directory: str) -> str:
+    path = intermediate_path(directory)
     with open(path, "w") as f:
         f.write(workflow.to_json())
     return path
 
 
-def read_intermediate(path: str = INTERMEDIATE_FILENAME) -> Workflow:
+def read_intermediate(directory: str) -> Workflow:
     """Read the document back, validating it on the way in.
 
     A document that does not match the schema raises here rather than producing
     a nonsense Snakefile further downstream.
     """
-    with open(path) as f:
+    with open(intermediate_path(directory)) as f:
         return Workflow.from_json(f.read())
 
 
-def through_intermediate(workflow: Workflow) -> Workflow:
-    """Round trip the document through disk when the flag is on, else pass it through."""
+def through_intermediate(workflow: Workflow, directory: str) -> Workflow:
+    """Round trip the document through this run's directory when the flag is on.
+
+    `directory` is required for the reason given on intermediate_path.
+    """
     if not WRITE_INTERMEDIATE:
         return workflow
-    write_intermediate(workflow)
-    return read_intermediate()
+    write_intermediate(workflow, directory)
+    return read_intermediate(directory)
 
 
 tools = {}

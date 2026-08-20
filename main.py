@@ -38,8 +38,13 @@ async def convert(
     # the schema first, so what follows is a function of a validated file
     # rather than of the request body. Off by default; the two paths are
     # asserted byte-identical in tests/test_intermediate_roundtrip.py.
+    #
+    # The directory is passed rather than defaulted. Right now it is the one
+    # this handler chdir'd into, so "." is that directory; once a run gets a
+    # directory of its own (#40) this becomes the workspace path, and the
+    # document stops being shared by everything in flight.
     workflow_dict = json.loads(biochef_workflow)
-    workflow = through_intermediate(parse_biochef_workflow(workflow_dict))
+    workflow = through_intermediate(parse_biochef_workflow(workflow_dict), ".")
 
     # Convert workflow to Snakemake and run
     snakemake = convert_to_snakemake(workflow)
