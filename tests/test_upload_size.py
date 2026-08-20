@@ -162,19 +162,113 @@ def test_a_stream_within_the_limit_reaches_the_application():
     assert drained["bytes"] == 1024
 
 
-def test_a_body_within_the_limit_is_untouched():
+def _status_for(total_bytes, limit):
+    """Drive the middleware with one body of `total_bytes` against `limit`."""
+    import asyncio
     from bodylimit import BodySizeLimitMiddleware
 
-    app = BodySizeLimitMiddleware(main.app, max_bytes=8 * 1024 * 1024)
-    client = TestClient(app, raise_server_exceptions=False)
+    async def stub(scope, receive, send):
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                break
+            if not message.get("more_body"):
+                break
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
 
-    response = client.post(
-        "/convert",
-        data={"biochef_workflow": "not json"},
-        files=[("files", ("input-1-out", b"x" * 4096, "application/octet-stream"))],
-    )
+    def run(headers, chunks):
+        app = BodySizeLimitMiddleware(stub, max_bytes=limit)
+        pending = list(chunks)
+        sent = []
 
-    assert response.status_code != 413
+        async def receive():
+            return pending.pop(0) if pending else {"type": "http.disconnect"}
+
+        async def send(message):
+            sent.append(message)
+
+        asyncio.new_event_loop().run_until_complete(
+            app({"type": "http", "method": "POST", "path": "/x",
+                 "headers": headers, "query_string": b""}, receive, send))
+        return next(m for m in sent if m["type"] == "http.response.start")["status"]
+
+    body = [{"type": "http.request", "body": b"z" * total_bytes, "more_body": False}]
+    declared = run([(b"content-length", str(total_bytes).encode())], body)
+    streamed = run([], body)
+    return declared, streamed
+
+
+def test_the_limit_is_inclusive_and_both_paths_agree():
+    """Pin the boundary. Without this, `>` -> `>=` survives the whole suite.
+
+    Checked by mutation: flipping either comparison to `>=` was caught by no
+    other test in this file. An off-by-one here is not academic -- it decides
+    whether a body of exactly the configured size is served or refused, and if
+    the two paths disagree the same request succeeds or fails depending on
+    whether the client happened to send a Content-Length.
+    """
+    assert _status_for(1023, 1024) == (200, 200)
+    assert _status_for(1024, 1024) == (200, 200), "at exactly the limit must pass"
+    assert _status_for(1025, 1024) == (413, 413), "one byte over must be refused"
+
+
+def test_a_body_within_the_limit_reaches_the_application_intact():
+    """Replaces an assertion of `status_code != 413`, which proved nothing.
+
+    That assertion was satisfied by any status at all, including one produced
+    after the middleware had truncated the body -- it caught none of the eight
+    mutations tried against this module. What matters is that the whole body
+    arrives, so this counts the bytes the application actually received.
+    """
+    import asyncio
+    from bodylimit import BodySizeLimitMiddleware
+
+    seen = {"bytes": 0}
+
+    async def stub(scope, receive, send):
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                break
+            seen["bytes"] += len(message.get("body", b""))
+            if not message.get("more_body"):
+                break
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    app = BodySizeLimitMiddleware(stub, max_bytes=8 * 1024 * 1024)
+    pending = [{"type": "http.request", "body": b"x" * 4096, "more_body": True},
+               {"type": "http.request", "body": b"x" * 4096, "more_body": False}]
+    sent = []
+
+    async def receive():
+        return pending.pop(0) if pending else {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.new_event_loop().run_until_complete(
+        app({"type": "http", "method": "POST", "path": "/x",
+             "headers": [], "query_string": b""}, receive, send))
+
+    assert next(m for m in sent
+                if m["type"] == "http.response.start")["status"] == 200
+    assert seen["bytes"] == 8192, f"the body was truncated to {seen['bytes']}"
+
+
+def test_an_unusable_limit_is_refused_at_startup(monkeypatch):
+    """A typo should name itself, not surface as an int() error."""
+    from bodylimit import _limit_from_env
+
+    for bad in ("512MB", "", "not a number"):
+        with pytest.raises(ValueError, match="BIOCHEF_MAX_UPLOAD_BYTES"):
+            _limit_from_env(bad)
+    for bad in ("0", "-1"):
+        with pytest.raises(ValueError, match="must be positive"):
+            _limit_from_env(bad)
+
+    assert _limit_from_env("  4096  ") == 4096
 
 
 def test_the_default_limit_is_a_real_number():

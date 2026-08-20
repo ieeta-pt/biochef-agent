@@ -23,7 +23,35 @@ import os
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 
-MAX_UPLOAD_BYTES = int(os.getenv("BIOCHEF_MAX_UPLOAD_BYTES", str(512 * 1024 * 1024)))
+def _limit_from_env(raw):
+    """Read the limit, and refuse to start on a value that is not one.
+
+    int() alone gives "invalid literal for int() with base 10: \'512MB\'", which
+    names neither the variable at fault nor the units expected. A service that
+    will not start is the right outcome -- guessing at 512MB would be worse --
+    but the operator should be told what to fix.
+
+    A non-positive limit is refused for the same reason. It is technically
+    fail-closed, but it means every request is answered 413 with nothing saying
+    why, which is a worse failure than not starting at all.
+    """
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"BIOCHEF_MAX_UPLOAD_BYTES must be a whole number of bytes, "
+            f"got {raw!r}. Suffixes like 'MB' are not accepted; "
+            f"512 MiB is 536870912."
+        ) from None
+    if value <= 0:
+        raise ValueError(
+            f"BIOCHEF_MAX_UPLOAD_BYTES must be positive, got {value}. "
+            f"A limit of {value} refuses every request."
+        )
+    return value
+
+
+MAX_UPLOAD_BYTES = _limit_from_env(os.getenv("BIOCHEF_MAX_UPLOAD_BYTES", str(512 * 1024 * 1024)))
 """Default 512 MiB.
 
 Chosen to be larger than any single input the catalogue's tools plausibly take
