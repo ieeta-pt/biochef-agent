@@ -154,6 +154,12 @@ jobs:
           print("suite is not vacuous")
           PY
 
+      - name: Report what was installed
+        # So a failure caused by a transitive dependency moving is diagnosable
+        # from the log alone, without re-running anything.
+        if: always()
+        run: pip list --format=freeze
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
