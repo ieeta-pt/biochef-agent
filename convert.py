@@ -182,17 +182,30 @@ def convert_to_snakemake(workflow: Workflow):
                 cmd.append(param.flag)
             cmd.append(param.value)
 
+        # Arguments with no flag are held back and appended after every flagged
+        # one. A bare filename ahead of a flag makes a getopt-style parser stop
+        # scanning, so the flags that follow are never seen: tn93 given
+        # "in.fa -o out.txt" prints its usage and exits 1, while
+        # "-o out.txt in.fa" runs. The frontend orders them the same way.
+        trailing = []
+        # Redirections are kept apart from the arguments and written last. The
+        # shell accepts them anywhere, but "tool > out.txt in.fa" reads as
+        # though the input were part of the redirect.
+        redirects = []
+
         result.append("    input:")
         i = 0
         for input_name, input in node.inputs.items():
             input_var = f"i_{i}"
             result.append(f"        {input_var}=\"{input.file}\",")
             if input.mode == IOMode.STDIN:
-                cmd.append("<")
-                cmd.append(f"{{input.{input_var}}}")
+                redirects.append(f"< {{input.{input_var}}}")
             elif input.mode == IOMode.FILE:
-                if input.flag: cmd.append(f"{input.flag}")
-                cmd.append(f"{{input.{input_var}}}")
+                if input.flag:
+                    cmd.append(f"{input.flag}")
+                    cmd.append(f"{{input.{input_var}}}")
+                else:
+                    trailing.append(f"{{input.{input_var}}}")
             i += 1
 
         result.append("    output:")
@@ -201,14 +214,19 @@ def convert_to_snakemake(workflow: Workflow):
             output_var = f"o_{i}"
             result.append(f"        {output_var}=\"{output.file}\",")
             if output.mode == IOMode.STDOUT:
-                cmd.append(">")
-                cmd.append(f"{{output.{output_var}}}")
+                redirects.append(f"> {{output.{output_var}}}")
             elif output.mode == IOMode.FILE:
-                if output.flag: cmd.append(f"{output.flag}")
-                cmd.append(f"{{output.{output_var}}}")
+                if output.flag:
+                    cmd.append(f"{output.flag}")
+                    cmd.append(f"{{output.{output_var}}}")
+                else:
+                    trailing.append(f"{{output.{output_var}}}")
                 if output.hardcoded_file and not output.flag:
                     extra_cms.append(f"        cp {output.hardcoded_file} {{output.{output_var}}}")
             i += 1
+
+        cmd.extend(trailing)
+        cmd.extend(redirects)
 
         result.append(f"    shell:")
         result.append(f"        \"\"\"")
