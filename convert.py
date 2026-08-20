@@ -173,7 +173,10 @@ def convert_to_snakemake(workflow: Workflow):
 
     for node in workflow.nodes:
         # print(node)
-        result.append(f"rule {node.id.replace(".", "_").replace("-", "_")}:")
+        # Snakemake rule names must be Python identifiers, and a node id is
+        # "{operation.id}-{timestamp}", so both separators have to go.
+        rule_name = node.id.replace(".", "_").replace("-", "_")
+        result.append(f"rule {rule_name}:")
         cmd = [f"./{node.bin}"]
         extra_cms = []
 
@@ -228,12 +231,18 @@ def convert_to_snakemake(workflow: Workflow):
         cmd.extend(trailing)
         cmd.extend(redirects)
 
-        result.append(f"    shell:")
-        result.append(f"        \"\"\"")
-        result.append(f"        {" ".join(cmd)}")
+        # Assembled outside the f-string. Nesting the same quote inside one is
+        # only legal from Python 3.12 (PEP 701), and relying on that here made
+        # the whole module fail to import on 3.11 and earlier -- for a line that
+        # reads no better either way.
+        command_line = " ".join(cmd)
+
+        result.append("    shell:")
+        result.append('        """')
+        result.append(f"        {command_line}")
         for command in extra_cms:
             result.append(command)
-        result.append(f"        \"\"\"")
+        result.append('        """')
 
     return "\n".join(result)
 
