@@ -1,0 +1,164 @@
+{
+  "$defs": {
+    "IO": {
+      "additionalProperties": false,
+      "description": "One end of an edge, as the tool that owns it expects to see it.",
+      "properties": {
+        "file": {
+          "default": "",
+          "title": "File",
+          "type": "string"
+        },
+        "flag": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Flag"
+        },
+        "hardcoded_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hardcoded File"
+        },
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IOMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "IO",
+      "type": "object"
+    },
+    "IOMode": {
+      "description": "How a tool receives an input or emits an output.\n\nInherits `str` so a member serialises as its own value and a document round\ntrips through JSON without a custom encoder -- the specific thing the\ndataclasses could not do.",
+      "enum": [
+        "stdin",
+        "stdout",
+        "file"
+      ],
+      "title": "IOMode",
+      "type": "string"
+    },
+    "Node": {
+      "additionalProperties": false,
+      "description": "One tool invocation: what it runs, what it consumes, what it produces.",
+      "properties": {
+        "bin": {
+          "default": "",
+          "title": "Bin",
+          "type": "string"
+        },
+        "id": {
+          "default": "",
+          "title": "Id",
+          "type": "string"
+        },
+        "inputs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/IO"
+          },
+          "title": "Inputs",
+          "type": "object"
+        },
+        "outputs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/IO"
+          },
+          "title": "Outputs",
+          "type": "object"
+        },
+        "parameters": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Param"
+          },
+          "title": "Parameters",
+          "type": "object"
+        }
+      },
+      "title": "Node",
+      "type": "object"
+    },
+    "Param": {
+      "additionalProperties": false,
+      "description": "A parameter the client enabled, with the value it chose.",
+      "properties": {
+        "flag": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Flag"
+        },
+        "name": {
+          "default": "",
+          "title": "Name",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "default": "",
+          "title": "Value"
+        }
+      },
+      "title": "Param",
+      "type": "object"
+    }
+  },
+  "$id": "https://biochef.app/schemas/intermediate/v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The validated document the Agent writes as intermediate.json and reads back to generate the Snakefile. Schema version 1.0.0.",
+  "properties": {
+    "nodes": {
+      "items": {
+        "$ref": "#/$defs/Node"
+      },
+      "title": "Nodes",
+      "type": "array"
+    },
+    "schemaVersion": {
+      "default": "1.0.0",
+      "title": "Schemaversion",
+      "type": "string"
+    }
+  },
+  "title": "BioChef Agent intermediate workflow document",
+  "type": "object"
+}
