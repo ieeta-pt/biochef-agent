@@ -26,7 +26,12 @@ jobs:
         # The floor, because it is the version most likely to break silently,
         # and the newest, because it is what development happens on. Adding a
         # version here is the same decision as changing the floor in run.sh.
-        python: ["3.11", "3.12", "3.13"]
+        # 3.12 is the floor THIS branch supports: convert.py here still has
+        # the f-string that nests the same quote, which is PEP 701 and so 3.12+.
+        # The PR that removes it is also the PR that declares 3.11 in run.sh,
+        # and it adds 3.11 here. Matrix and declared floor move together, or the
+        # matrix asserts support the code does not have.
+        python: ["3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v4
@@ -65,7 +70,18 @@ jobs:
         # must not influence collection.
         # --strict-markers: a typo'd marker is an error, not a silently
         # unregistered one, so a skipif that never fires cannot hide.
+        #
+        # A tree with no tests/ directory is a real state on this branch -- the
+        # suite arrives with a later PR -- and is reported rather than failed.
+        # That is NOT the same as a suite that ran and tested nothing, which the
+        # next step still rejects. The distinction is the whole point: "there is
+        # no suite here yet" is a fact, "the suite passed" when it did not run
+        # is a lie.
         run: |
+          if [ ! -d tests ]; then
+            echo "no test suite in this tree yet" | tee no-suite.marker
+            exit 0
+          fi
           pytest tests/ -v --strict-markers -p no:cacheprovider \
                  --junitxml=results-${{ matrix.python }}.xml
 
@@ -80,7 +96,11 @@ jobs:
         if: always()
         run: |
           python - <<'PY'
-          import glob, sys, xml.etree.ElementTree as ET
+          import glob, os, sys, xml.etree.ElementTree as ET
+
+          if os.path.exists("no-suite.marker"):
+              print("no suite in this tree; nothing to be vacuous about")
+              sys.exit(0)
 
           files = glob.glob("results-*.xml")
           if not files:
@@ -174,4 +194,5 @@ jobs:
         #
         # A PR that deliberately changes emitted output regenerates the baseline
         # and the diff then states exactly which operations changed.
-        run: python .github/scripts/catalogue_smoke.py .recipes ci/catalogue-baseline.json
+        run: |
+          python .github/scripts/catalogue_smoke.py .recipes ci/catalogue-baseline.json
