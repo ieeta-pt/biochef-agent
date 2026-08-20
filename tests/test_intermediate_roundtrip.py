@@ -118,7 +118,8 @@ def test_argument_order_survives_the_round_trip():
 
     # And state the order positively, so the test says what it is protecting
     # rather than only that two things match.
-    shell = [l.strip() for l in direct.splitlines() if l.strip().startswith("./")][0]
+    lines = direct.splitlines()
+    shell = json.loads(lines[[l.strip() for l in lines].index("shell:") + 1].strip())
     assert shell.index("-z Z") < shell.index("-u M") < shell.index("-p A")
 
 
