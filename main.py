@@ -12,6 +12,7 @@ import base64
 
 from workspace import UnsafeName, check_name, make_workspace
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
+from runner import SubprocessRunner, get_runner
 
 app = FastAPI()
 
@@ -32,34 +33,22 @@ RUN_TIMEOUT_S = int(os.getenv("BIOCHEF_RUN_TIMEOUT", "900"))
 KEEP_WORKSPACE = os.getenv("BIOCHEF_KEEP_WORKSPACE", "false").lower() == "true"
 
 
+RUNNER = get_runner(os.getenv("BIOCHEF_RUNNER", SubprocessRunner.name))
+"""How this deployment executes a workflow.
+
+Resolved at import so a deployment that names a runner it does not have fails to
+start, rather than accepting work and failing every submission.
+"""
+
+
 def run_snakemake(ws, timeout_s=RUN_TIMEOUT_S):
-    """Run the workflow in its own directory, without moving this process.
+    """Execute the workflow with the configured runner.
 
-    -s and -d give snakemake the Snakefile and the working directory
-    explicitly, which is what makes a per-run directory possible: relative paths
-    in the rules resolve under -d, and the shell blocks run with that as their
-    cwd, so the emitter's ./{bin} convention is unchanged.
-
-    start_new_session puts snakemake and everything it spawns in one process
-    group, and the timeout kills the GROUP. Killing only the child leaves the
-    tool running and then blocks forever on the pipes the orphan still holds --
-    measured at 7s and counting, against 2s for the group. The pgid is captured
-    before the first wait, because after the child is reaped getpgid raises.
+    Kept as a function, rather than calling RUNNER.run at the call site, so that
+    the timeout default lives in one place and the handler does not have to know
+    which provider it got.
     """
-    process = subprocess.Popen(
-        ["snakemake", "--cores", "4", "-s", os.path.join(ws.path, "Snakefile"),
-         "-d", ws.path],
-        cwd=ws.path, start_new_session=True,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    )
-    pgid = os.getpgid(process.pid)
-    try:
-        out, err = process.communicate(timeout=timeout_s)
-        return process.returncode, out, err
-    except subprocess.TimeoutExpired:
-        os.killpg(pgid, signal.SIGKILL)
-        out, err = process.communicate()
-        return -signal.SIGKILL, out or "", err or ""
+    return RUNNER.run(ws, timeout_s)
 
 
 class BiochefWorkflow(BaseModel):

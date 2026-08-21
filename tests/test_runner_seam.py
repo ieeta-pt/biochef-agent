@@ -1,18 +1,19 @@
-"""How a workflow gets executed today, and what it would take to change it (#15).
+"""The seam that lets a workflow be executed some other way (#15).
 
-Recorded before anything changes. E2 asks for "a second Runner provider", which
-presumes a first one. There is no provider, and no seam: there is a module-level
-function that the handler calls by name.
+E2 asks for a second Runner provider. This pins the first one and, more
+importantly, pins what a second one gets for free.
 
-The consequence is visible in the suite itself. Three test files substitute
-execution by monkeypatching `main.run_snakemake`, because reaching into a module
-global is the only way to do it. That works for a test, which owns the process
-and puts it back afterwards. It is not a mechanism a deployment can use to say
-"run these steps in a container", which is what E2 needs.
+The version before this had the timeout, the process-group kill and the choice
+of command as one function. A container provider needs the first two and
+replaces only the third, and there was no way to say so. Now `run` is written
+once on the base class and a provider supplies `command`, so a second provider
+cannot quietly lose the group-kill -- which is the part that was hard to get
+right and the part whose absence is invisible until a tool is left running.
 """
 
 import inspect
 import os
+import signal
 import sys
 import types
 from pathlib import Path
@@ -39,65 +40,110 @@ if "oras" not in sys.modules:
     sys.modules["oras"] = oras
     sys.modules["oras.client"] = client_mod
 
+import pytest
+
 import main
+from runner import PROVIDERS, Runner, RunResult, SubprocessRunner, get_runner
 
 
-def test_execution_is_a_module_level_function_not_a_provider():
-    """No interface, no implementations, nothing to select between."""
-    assert inspect.isfunction(main.run_snakemake)
-    assert not Path(REPO_ROOT / "runner.py").exists()
+class _Workspace:
+    """Just enough workspace for a runner: a path to work in."""
+
+    def __init__(self, path):
+        self.path = str(path)
 
 
-def test_the_handler_names_the_function_directly():
-    """So there is no point at which a different strategy could be supplied."""
-    source = inspect.getsource(main.convert)
-    assert "run_snakemake" in source
-    assert "runner" not in source.lower()
+# --------------------------------------------------------------------------
+# the seam exists and is selectable
 
 
-def test_nothing_selects_how_a_workflow_runs():
-    """Every other knob is configurable; how it executes is not.
+def test_a_provider_is_chosen_by_name():
+    assert isinstance(get_runner("subprocess"), SubprocessRunner)
+    assert "subprocess" in PROVIDERS
 
-    BIOCHEF_RUN_ROOT, BIOCHEF_RUN_TIMEOUT, BIOCHEF_KEEP_WORKSPACE and
-    BIOCHEF_MAX_UPLOAD_BYTES are all read from the environment. There is no
-    equivalent for the one thing E2 needs to vary.
+
+def test_an_unknown_runner_is_refused_with_the_options_named():
+    """At startup, not on the first request.
+
+    A deployment that asked for a runner it does not have should not accept work
+    and then fail every submission.
     """
-    settings = Path(REPO_ROOT / "main.py").read_text()
-    assert "BIOCHEF_RUN_ROOT" in settings
-    assert "BIOCHEF_RUN_TIMEOUT" in settings
-    assert "BIOCHEF_RUNNER" not in settings
+    with pytest.raises(ValueError) as exc:
+        get_runner("kubernetes")
+    assert "BIOCHEF_RUNNER" in str(exc.value)
+    assert "subprocess" in str(exc.value), "the message must say what IS available"
 
 
-def test_substituting_execution_today_means_patching_a_module_global():
-    """Which is what the suite already does.
+def test_the_service_resolves_a_runner_and_defaults_to_subprocess():
+    assert isinstance(main.RUNNER, SubprocessRunner)
+    assert "BIOCHEF_RUNNER" in Path(REPO_ROOT / "main.py").read_text()
 
-    Named here so the count is a fact rather than an impression, and so this
-    test starts failing if a seam appears and they stop needing to.
 
-    test_run_directory.py is deliberately not in this list: it calls
-    main.run_snakemake for real rather than replacing it, which is the whole
-    point of that test.
+# --------------------------------------------------------------------------
+# behaviour preserved: the subprocess provider launches what it always did
+
+
+def test_the_subprocess_command_is_unchanged(tmp_path):
+    """Pinned exactly, because E2's acceptance is that both runners agree.
+
+    If this argv drifts, "identical outputs" stops being a comparison between
+    two ways of running the same thing.
     """
-    needle = 'setattr(main, "run_' + 'snakemake"'   # split so this file is not a hit
-    patchers = [
-        p for p in sorted(Path(REPO_ROOT / "tests").glob("test_*.py"))
-        if p.name != Path(__file__).name and needle in p.read_text()
+    ws = _Workspace(tmp_path)
+    assert SubprocessRunner().command(ws) == [
+        "snakemake", "--cores", "4",
+        "-s", os.path.join(str(tmp_path), "Snakefile"),
+        "-d", str(tmp_path),
     ]
-    assert [p.name for p in patchers] == [
-        "test_tool_cache.py",
-        "test_upload_names.py",
-    ], [p.name for p in patchers]
 
 
-def test_the_subprocess_strategy_is_hardcoded_into_the_function():
-    """Popen, the process group and the timeout are all one body of code.
+# --------------------------------------------------------------------------
+# what a SECOND provider inherits -- the actual point of the seam
 
-    A container provider needs the timeout and the group-kill and does not want
-    this Popen. Today they cannot be separated, because they are the same
-    function.
+
+class _SleepRunner(Runner):
+    """A provider that supplies nothing but a command, as a container one would."""
+
+    name = "sleep-for-test"
+
+    def command(self, ws):
+        return ["sh", "-c", "sleep 300"]
+
+
+def test_a_new_provider_inherits_the_timeout_without_writing_one(tmp_path):
+    """Supplying only `command` is enough to get the timeout.
+
+    No readiness race here, unlike the process-group test: whether the child
+    starts quickly or slowly, communicate() times out either way and the kill
+    still follows.
     """
-    source = inspect.getsource(main.run_snakemake)
-    assert "subprocess.Popen" in source
-    assert "snakemake" in source
-    assert "start_new_session=True" in source
-    assert "os.killpg" in source
+    result = _SleepRunner().run(_Workspace(tmp_path), timeout_s=2)
+    assert result.returncode == -signal.SIGKILL
+    assert isinstance(result, RunResult)
+
+
+def test_no_provider_reimplements_the_kill(tmp_path):
+    """The policy lives in one place, so it cannot be lost by a second provider.
+
+    Structural rather than behavioural on purpose: the behaviour is covered for
+    the subprocess provider by the process-group test, and it is the same code.
+    What this pins is that it stays the same code.
+    """
+    for name, provider in PROVIDERS.items():
+        assert "run" not in vars(provider), (
+            f"{name} overrides run(), so it no longer shares the timeout and "
+            f"the group-kill with every other provider"
+        )
+    base = inspect.getsource(Runner.run)
+    assert "os.killpg" in base
+    assert "start_new_session=True" in base
+
+
+def test_the_command_is_the_only_thing_a_provider_must_supply():
+    """A bare provider is an error at the point of use, not a silent no-op."""
+
+    class _Bare(Runner):
+        name = "bare"
+
+    with pytest.raises(NotImplementedError):
+        _Bare().command(_Workspace("/tmp"))
