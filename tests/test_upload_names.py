@@ -41,26 +41,67 @@ if "oras" not in sys.modules:
     sys.modules["oras"] = oras
     sys.modules["oras.client"] = client_mod
 
+import json
+import os
+
 import pytest
 from fastapi.testclient import TestClient
 
+import convert
 import main
 from workspace import SAFE_NAME, UnsafeName, check_name
 
 
+BUNDLE = {"id": "t", "name": "t", "bin": "t",
+          "io": {"inputs": [{"name": "in", "types": ["T"], "mode": "file"},
+                     {"name": "second", "types": ["T"], "mode": "file"}],
+                 "outputs": [{"name": "out", "types": ["T"], "mode": "stdout"}]},
+          "parameters": []}
+
+# One declared input, so exactly one upload name is legitimate: "input-1-out".
+# An empty workflow expects no uploads at all, which now makes every upload a
+# 400 -- correct, but useless for testing the name rule itself.
+ONE_INPUT_WORKFLOW = json.dumps({
+    "nodes": [
+        {"id": "input-1", "type": "inputWorkflowNode",
+         "data": {"outputs": {"out": {"kind": "text", "data": "x"}}}},
+        {"id": "t-1", "type": "workflowNode",
+         "data": {"label": "t", "repo": "r", "paramValues": {}, "outputs": {}}},
+        {"id": "output-1", "type": "outputWorkflowNode", "data": {}},
+    ],
+    "edges": [
+        {"source": "input-1", "sourceHandle": "out", "target": "t-1", "targetHandle": "in"},
+        {"source": "t-1", "sourceHandle": "out", "target": "output-1", "targetHandle": "in"},
+    ],
+}).encode()
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    """Run the handler somewhere disposable.
+    """Drive the handler with its runs rooted under tmp_path.
 
-    The handler chdirs into ./tmp of wherever the process happens to be, so the
-    test has to move the process rather than pass a path. That is itself the
-    subject of a separate issue (#40); here it is only scaffolding.
+    The workspace is created under BIOCHEF_RUN_ROOT, so pointing that at
+    tmp_path means a name that escaped would land somewhere this test can see.
+    snakemake is stubbed out: these tests are about names, and invoking a real
+    workflow engine to check one would make them slow and conditional.
     """
+    monkeypatch.setattr(main, "RUN_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setattr(convert, "fetch_tool", lambda tool_id, repo: BUNDLE)
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+    os.makedirs(tmp_path / "cache" / "t", exist_ok=True)
+    (tmp_path / "cache" / "t" / "t").write_text("#!/bin/sh\n")
+    convert.tools.clear()
+
+    def fake_run(ws, *a, **k):
+        ws.write_bytes("t-1-out", b"PRODUCED")
+        return (0, "", "")
+
+    monkeypatch.setattr(main, "run_snakemake", fake_run)
     monkeypatch.chdir(tmp_path)
     return TestClient(main.app, raise_server_exceptions=False)
 
 
-def post(client, filename, content=b"payload", workflow=b"{}"):
+def post(client, filename, content=b"payload", workflow=ONE_INPUT_WORKFLOW):
     return client.post(
         "/convert",
         data={"biochef_workflow": workflow},
@@ -130,7 +171,7 @@ def test_a_relative_name_no_longer_escapes(client, tmp_path):
     response = post(client, "../ESCAPED.txt")
 
     assert response.status_code == 400
-    assert not (tmp_path / "ESCAPED.txt").exists()
+    assert not list(tmp_path.rglob("ESCAPED.txt"))
 
 
 def test_an_absolute_name_no_longer_escapes(client, tmp_path):
@@ -143,19 +184,91 @@ def test_an_absolute_name_no_longer_escapes(client, tmp_path):
     assert not target.exists()
 
 
-def test_nothing_is_written_even_though_the_check_precedes_the_parse(client, tmp_path):
-    """The ordering that made this reachable without a valid workflow is still
-    there -- #40 moves the parse -- so the name check has to stand on its own."""
-    target = tmp_path / "elsewhere" / "NO_WORKFLOW.txt"
-    target.parent.mkdir()
+def test_a_malformed_body_is_refused_before_anything_is_written(client, tmp_path):
+    """The parse now runs first (#40), so a request that is not a workflow never
+    reaches the upload loop at all. The name check still stands on its own --
+    see the table above -- but the ordering means it is no longer the only
+    thing between a request and a write."""
+    response = post(client, "input-1-out", workflow=b"this is not json at all")
 
-    response = post(client, str(target), workflow=b"this is not json at all")
-
-    assert response.status_code == 400, "the name is rejected before the body is parsed"
-    assert not target.exists()
+    assert response.status_code >= 400
+    assert not list(tmp_path.rglob("input-1-out")), "nothing was written"
 
 
-def test_a_plain_name_still_works(client, tmp_path):
+def test_a_plain_name_still_works(client, tmp_path, monkeypatch):
     """The case that must keep working: the fix cannot be "reject everything"."""
-    post(client, "input-1-out")
-    assert (tmp_path / "tmp" / "input-1-out").read_bytes() == b"payload"
+    kept = []
+    real = main.make_workspace
+    monkeypatch.setattr(main, "make_workspace",
+                        lambda root=None: kept.append(real(root)) or kept[-1])
+    monkeypatch.setattr(main, "KEEP_WORKSPACE", True)
+
+    response = post(client, "input-1-out")
+
+    assert response.status_code == 200, response.text
+    assert (Path(kept[0].path) / "input-1-out").read_bytes() == b"payload"
+    kept[0].cleanup()
+
+
+@pytest.mark.parametrize("name", ["Snakefile", "SNAKEFILE", "snakefile"])
+def test_an_upload_named_for_a_file_the_run_creates_is_refused(name, client, tmp_path):
+    """Refused as "not an input", earlier than O_EXCL would have caught it.
+
+    "Snakefile" is a perfectly legal single path component, so the shape rule
+    passes it. What refuses it is the workflow: the run declares which files it
+    consumes, and this is not one of them. That gate fires before anything is
+    written, so the generated Snakefile never has to contend for its own slot.
+
+    Case variants matter on macOS, where APFS is case-insensitive by default and
+    they would occupy the same slot.
+    """
+    response = post(client, name)
+
+    assert response.status_code == 400, response.text
+    assert "is not an input" in response.text
+
+
+def test_the_same_input_sent_twice_is_refused(client, tmp_path):
+    """O_EXCL, reached with a name the workflow does declare.
+
+    Sending a legitimate input twice is the only way to reach the exclusive-open
+    refusal now: anything the run does not expect is turned away by the
+    declared-set gate first.
+    """
+    response = client.post(
+        "/convert",
+        data={"biochef_workflow": ONE_INPUT_WORKFLOW},
+        files=[("files", ("input-1-out", b"first", "text/plain")),
+               ("files", ("input-1-out", b"second", "text/plain"))],
+    )
+
+    assert response.status_code == 400
+    assert "sent twice" in response.text
+
+
+def test_a_declared_input_that_never_arrives_is_refused(client, tmp_path):
+    """The other half of the declared-set gate.
+
+    A run whose input never arrived used to proceed, generate a Snakefile, and
+    fail inside snakemake looking for a file nobody sent. The workflow says what
+    it needs, so the request can be refused naming what is missing.
+
+    Two declared inputs, one uploaded.
+    """
+    two_inputs = json.loads(ONE_INPUT_WORKFLOW)
+    two_inputs["nodes"].append(
+        {"id": "input-2", "type": "inputWorkflowNode",
+         "data": {"outputs": {"out": {"kind": "text", "data": "y"}}}})
+    two_inputs["edges"].append(
+        {"source": "input-2", "sourceHandle": "out",
+         "target": "t-1", "targetHandle": "second"})
+
+    response = client.post(
+        "/convert",
+        data={"biochef_workflow": json.dumps(two_inputs)},
+        files=[("files", ("input-1-out", b"x", "text/plain"))],
+    )
+
+    assert response.status_code == 400, response.text
+    assert "missing inputs" in response.text
+    assert "input-2-out" in response.text

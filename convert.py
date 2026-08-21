@@ -9,6 +9,8 @@ from enum import Enum
 
 from dotenv import load_dotenv
 
+from workspace import check_name
+
 load_dotenv()
 
 REGISTRY_URL = os.getenv("REGISTRY_URL", "registry.biochef.app")
@@ -82,24 +84,95 @@ class Workflow:
     nodes: list[Node] = field(default_factory=list)
 
 
+TOOL_CACHE = os.path.realpath(os.getenv("BIOCHEF_TOOL_CACHE", "tool-cache"))
+"""Where pulled bundles live, shared by every run.
+
+Splitting the cache out of the run directory is forced by giving each run its
+own directory, not a tidy-up. fetch_tool memoises and returns early on a hit, so
+it never re-copied the binary; with one shared directory that made the copy
+survive between runs, and with a fresh directory per run it would simply be
+missing on the second. The pull is cached here, and materialise_tools puts a
+copy in whichever workspace needs it.
+"""
+
 tools = {}
+
+
 def fetch_tool(tool_id, repo):
-    tool_id = tool_id.split("-")[0]
+    """Pull a bundle into the shared cache and return it.
+
+    The signature is unchanged on purpose: parse_biochef_workflow calls this,
+    and threading a workspace through would make the parse know about run
+    directories for no reason. It no longer copies or chmods anything -- placing
+    the binary is a separate pass that runs once the workspace exists.
+    """
+    tool_id = check_name(tool_id.split("-")[0])
 
     if tool_id in tools:
         return tools[tool_id]
 
-    client.pull(target=f"{REGISTRY_URL}/{repo}", outdir=f"{tool_id}")
-    with open(f"{tool_id}/bundle.json", "r") as f:
-        bundle = json.load(f)
+    outdir = os.path.join(TOOL_CACHE, tool_id)
+    if not os.path.exists(os.path.join(outdir, "bundle.json")):
+        # Staged, then moved into place, so an interrupted pull cannot leave a
+        # half-written bundle that the next run would read as complete. It is
+        # also the point where a digest would be checked (#9).
+        staging = outdir + ".part"
+        shutil.rmtree(staging, ignore_errors=True)
+        os.makedirs(staging, exist_ok=True)
+        client.pull(target=f"{REGISTRY_URL}/{repo}", outdir=staging)
+        shutil.rmtree(outdir, ignore_errors=True)
+        os.replace(staging, outdir)
 
-    tool_bin = bundle["bin"]
-    shutil.copyfile(f"{tool_id}/{tool_bin}", tool_bin)
-    os.chmod(tool_bin, os.stat(tool_bin).st_mode |
-             stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    with open(os.path.join(outdir, "bundle.json"), "r") as f:
+        bundle = json.load(f)
 
     tools[tool_id] = bundle
     return bundle
+
+
+def expected_uploads(workflow):
+    """The files the client has to supply, derived from the workflow itself.
+
+    Every intermediate file is named for the edge that carries it, so the set a
+    run consumes and the set it produces are both known before anything runs.
+    What is consumed but not produced by any node is what has to arrive as an
+    upload; everything else the run creates for itself.
+
+    This is the second of the two gates described in workspace.py. check_name
+    decides whether a name is a usable file name at all; this decides whether it
+    is one this run has any business receiving. Each catches what the other
+    cannot -- "samtools" is a perfectly good file name, and an output slot is a
+    name the workflow does declare.
+    """
+    produced = {name for node in workflow.nodes for name in node.outputs}
+    consumed = {name for node in workflow.nodes for name in node.inputs}
+    return consumed - produced
+
+
+def materialise_tools(workflow, ws):
+    """Put a copy of each tool's binary into this run's workspace.
+
+    Separate from fetch_tool so the cache is pulled once and every run still
+    gets its own copy. Done before the uploads, so that an upload named after a
+    binary is refused by O_EXCL rather than silently replacing it.
+
+    Once per BINARY, not once per node. Several operations routinely share one
+    executable -- 80 of the 176 in the catalogue do, including all 15 samtools
+    operations and all 20 seqtk ones -- so a workflow as ordinary as
+    "samtools sort" into "samtools index" has two nodes naming the same binary.
+    Placing it per node made the second one fail O_EXCL with FileExistsError and
+    the whole request 500. The old fetch_tool hid this behind its memo, which
+    returned early and skipped the copy; splitting the cache out lost that and
+    nothing replaced it.
+    """
+    placed = set()
+    for node in workflow.nodes:
+        name = check_name(node.bin)
+        if name in placed:
+            continue
+        source = os.path.join(TOOL_CACHE, check_name(node.id.split("-")[0]), name)
+        ws.place_executable(source, name)
+        placed.add(name)
 
 
 def get_node_data(node_id, node_list):
