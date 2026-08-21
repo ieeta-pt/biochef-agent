@@ -160,20 +160,48 @@ def test_a_timeout_kills_the_whole_process_group(tmp_path, monkeypatch):
 
     ws = make_workspace(str(tmp_path))
     result = {}
+    pid_file = Path(ws.path) / "grandchild.pid"
+
+    # The timeout has to dwarf the helper's own startup. The clock starts at
+    # Popen, but the grandchild does not exist until /bin/sh has been forked,
+    # has backgrounded `sleep`, and has written the pid -- and if the kill
+    # lands first there is no pid to read, so the test fails on its own
+    # precondition rather than on the behaviour it names.
+    #
+    # At timeout_s=1 that is exactly what happened: 10 failures in 25 runs
+    # under CPU contention, every one of them "the helper never spawned its
+    # grandchild", none of them about killing the group. Time to readiness,
+    # measured over 60 launches under six spinning cores, was a median of
+    # 435 ms and a maximum of 695 ms -- so a one second budget left a couple
+    # of hundred milliseconds of margin, and the suite's own contention was
+    # enough to spend it. This is the cost of testing a timeout honestly: the
+    # test takes about as long as the timeout it sets.
+    timeout_s = 5
 
     def run():
-        result["value"] = main.run_snakemake(ws, timeout_s=1)
+        result["value"] = main.run_snakemake(ws, timeout_s=timeout_s)
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
-    thread.join(15)
+
+    # Readiness is waited for and asserted on its own, so that a helper which
+    # never started is reported as that, rather than being dressed up as a
+    # failure to kill the process group.
+    ready_by = time.time() + timeout_s
+    while not pid_file.exists() and time.time() < ready_by:
+        time.sleep(0.01)
+    assert pid_file.exists(), (
+        f"the helper never spawned its grandchild within {timeout_s}s -- the "
+        f"test never reached the state it is about, so it can say nothing "
+        f"either way about killing the group"
+    )
+
+    thread.join(timeout_s + 15)
 
     try:
         assert not thread.is_alive(), "run_snakemake never returned -- it hung"
         assert result["value"][0] == -signal.SIGKILL
 
-        pid_file = Path(ws.path) / "grandchild.pid"
-        assert pid_file.exists(), "the helper never spawned its grandchild"
         grandchild = int(pid_file.read_text().strip())
 
         # os.kill rather than shelling out, so this cannot be affected by the
