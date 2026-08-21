@@ -18,10 +18,11 @@ no declared length is cut off at the same ceiling as one that declares itself
 honestly.
 """
 
+import json
 import os
 
 from starlette.datastructures import Headers
-from starlette.responses import JSONResponse
+
 
 def _limit_from_env(raw):
     """Read the limit, and refuse to start on a value that is not one.
@@ -105,21 +106,69 @@ class BodySizeLimitMiddleware:
                     return {"type": "http.disconnect"}
             return message
 
+        replaced = False
+
         async def guarded_send(message):
-            # Once the body has been refused, the application's own response is
-            # not the truth about what happened. Replace its status so the
-            # client is told why, rather than seeing whatever the handler made
-            # of a stream that stopped early.
-            if refused and message["type"] == "http.response.start":
-                message = dict(message, status=413)
+            # Once the body has been refused, the application's response is not
+            # the truth about what happened, and the whole of it has to go --
+            # status line, headers and body.
+            #
+            # Rewriting only the status was not enough, and produced something
+            # worse than either half: the application sees its stream stop
+            # early, FastAPI's blanket except around form parsing turns that
+            # into "There was an error parsing the body", and the status alone
+            # was swapped to 413. The client was told, accurately, that it had
+            # sent too much, and in the same breath told the reason was a
+            # malformed multipart body. Confirmed against real uvicorn on both
+            # httptools and h11. The two paths also disagreed: a declared
+            # Content-Length gave "exceeds the limit of N" and a streamed body
+            # gave the parse error, for the same condition.
+            #
+            # The application's headers have to go with it. They describe a
+            # response that is no longer being sent -- a Content-Length for a
+            # body we are discarding, or a Content-Disposition offering the
+            # client a download that does not exist.
+            nonlocal replaced
+            if not refused:
+                await send(message)
+                return
+            if message["type"] == "http.response.start":
+                await self._send_refusal(
+                    send,
+                    f"request body exceeds the limit of {self.max_bytes} bytes",
+                )
+                replaced = True
+                return
+            # Swallow whatever the application was going to say, including any
+            # further streamed chunks. Our own response is already complete.
+            if message["type"] == "http.response.body" and replaced:
+                return
             await send(message)
 
         await self.app(scope, counting_receive, guarded_send)
 
+    async def _send_refusal(self, send, detail: str):
+        """The one place a refusal is written, so both paths phrase it alike."""
+        body = json.dumps({"detail": detail}).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 413,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
     async def _too_large(self, send, declared: int):
-        response = JSONResponse(
-            status_code=413,
-            content={"detail": f"request body of {declared} bytes exceeds the "
-                               f"limit of {self.max_bytes}"},
+        # Routed through the same writer as the streaming refusal, so the two
+        # paths cannot drift apart in wording again. It also drops a
+        # JSONResponse that was being called with None for its receive
+        # callable and a scope containing only "type" -- it happens to work on
+        # the installed starlette, which reads neither, but nothing about the
+        # ASGI contract promises that.
+        await self._send_refusal(
+            send,
+            f"request body of {declared} bytes exceeds the "
+            f"limit of {self.max_bytes} bytes",
         )
-        await response({"type": "http"}, None, send)
