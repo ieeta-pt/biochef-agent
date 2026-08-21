@@ -139,7 +139,16 @@ def test_a_timeout_kills_the_whole_process_group(tmp_path, monkeypatch):
     instead of failing it.
     """
     script = tmp_path / "slow.sh"
-    script.write_text("#!/bin/sh\nsleep 300 &\necho $! > grandchild.pid\nwait\n")
+    # The grandchild writes its OWN pid and then execs, keeping that pid. So
+    # the file existing proves the process existed, where `echo $!` from the
+    # parent only proved the shell reached the echo. `sh -c` rather than a
+    # plain subshell because in POSIX sh, $$ inside ( ) is still the outer
+    # shell's pid -- a subshell would have written the wrong number.
+    script.write_text(
+        "#!/bin/sh\n"
+        "sh -c 'echo $$ > grandchild.pid; exec sleep 300' &\n"
+        "wait\n"
+    )
     script.chmod(0o755)
 
     real_popen = subprocess.Popen
@@ -187,20 +196,51 @@ def test_a_timeout_kills_the_whole_process_group(tmp_path, monkeypatch):
     # Readiness is waited for and asserted on its own, so that a helper which
     # never started is reported as that, rather than being dressed up as a
     # failure to kill the process group.
+    #
+    # A live pid, not merely a file. Waiting only for the file to appear was
+    # vacuous: it would have been satisfied by an empty or stale file, and by a
+    # grandchild that had already exited, either of which leaves the test
+    # asserting about a process that is not there.
+    def _live_grandchild():
+        try:
+            pid = int(pid_file.read_text().strip())
+        except (FileNotFoundError, ValueError):
+            return None
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError):
+            return None
+        return pid
+
     ready_by = time.time() + timeout_s
-    while not pid_file.exists() and time.time() < ready_by:
+    while _live_grandchild() is None and time.time() < ready_by:
         time.sleep(0.01)
-    assert pid_file.exists(), (
-        f"the helper never spawned its grandchild within {timeout_s}s -- the "
-        f"test never reached the state it is about, so it can say nothing "
-        f"either way about killing the group"
+    assert _live_grandchild() is not None, (
+        f"no live grandchild within {timeout_s}s (pid file: "
+        f"{pid_file.read_text()!r} if it exists) -- the test never reached the "
+        f"state it is about, so it can say nothing either way about killing "
+        f"the group"
     )
 
     thread.join(timeout_s + 15)
 
     try:
         assert not thread.is_alive(), "run_snakemake never returned -- it hung"
-        assert result["value"][0] == -signal.SIGKILL
+
+        # Explain itself when it fails. A bare `assert rc == -SIGKILL` produced
+        # "assert 0 == -9" and nothing else, which was not enough to tell a
+        # helper that exited early from a kill that never happened -- a rare
+        # failure seen twice in 160 loaded runs and never reproduced since.
+        if result["value"][0] != -signal.SIGKILL:
+            raw = pid_file.read_text() if pid_file.exists() else "<no pid file>"
+            raise AssertionError(
+                f"run_snakemake returned {result['value'][0]!r} rather than "
+                f"SIGKILL, so the helper ended before the timeout could kill "
+                f"it. pid file: {raw!r}; grandchild alive now: "
+                f"{_live_grandchild() is not None}; "
+                f"stdout: {result['value'][1]!r:.200}; "
+                f"stderr: {result['value'][2]!r:.200}"
+            )
 
         grandchild = int(pid_file.read_text().strip())
 
