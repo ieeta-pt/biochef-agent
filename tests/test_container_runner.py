@@ -81,7 +81,7 @@ def test_the_two_providers_run_the_same_workflow_the_same_way(tmp_path):
     )
     assert boxed[len(plain):] == [
         "--software-deployment-method", "apptainer", "--apptainer-prefix", "/cache",
-        "--apptainer-args", "--contain",
+        "--apptainer-args=--contain",
     ]
 
 
@@ -103,7 +103,60 @@ def test_the_container_is_contained_by_default():
 
     assert runner_module.APPTAINER_ARGS == "--contain"
     argv = ApptainerRunner(cache_dir="/cache").command(_Workspace("/ws"))
-    assert argv[argv.index("--apptainer-args") + 1] == "--contain"
+    assert "--apptainer-args=--contain" in argv
+
+
+def test_the_apptainer_args_are_one_argv_element():
+    """"--apptainer-args=X", not "--apptainer-args", "X".
+
+    The value starts with a dash. As a separate element argparse reads it as
+    another option and snakemake exits 2 with "expected one argument" and a
+    page of usage, which reads like a snakemake problem rather than a quoting
+    one. Confirmed against snakemake 9.21 both ways: the two-element form dies
+    at argparse, the "=" form parses and reaches the apptainer check.
+    """
+    argv = ApptainerRunner(cache_dir="/cache",
+                           apptainer_args="--contain --cleanenv").command(
+        _Workspace("/ws"))
+    assert "--apptainer-args" not in argv, (
+        "a bare --apptainer-args element means the value was passed separately"
+    )
+    assert "--apptainer-args=--contain --cleanenv" in argv
+
+
+def test_snakemake_accepts_the_argv_this_provider_builds(tmp_path):
+    """The check that was missing, and the reason a broken argv reached CI.
+
+    Every other test here inspects the list we build. None of them handed it to
+    snakemake, so "--apptainer-args", "--contain" as two elements looked
+    perfectly correct and died at argparse on the runner.
+
+    Exit 2 is argparse rejecting the command line. Exit 1 with the apptainer
+    message means the argv was understood and snakemake got as far as looking
+    for a container runtime, which is as far as it can get here.
+    """
+    import shutil
+    import subprocess
+
+    snakemake = shutil.which("snakemake")
+    if snakemake is None:
+        pytest.skip("snakemake is not on PATH")
+
+    runner = ApptainerRunner(image="docker://debian:stable-slim",
+                             cache_dir=str(tmp_path / "cache"))
+    (tmp_path / "Snakefile").write_text(
+        runner.snakefile_preamble()
+        + '\nrule all:\n    input: "o.txt"\n\nrule m:\n'
+          '    output: o_0="o.txt"\n    shell: "echo hi > {output.o_0}"\n'
+    )
+
+    done = subprocess.run(runner.command(_Workspace(tmp_path)) + ["--dry-run"],
+                          capture_output=True, text=True, cwd=str(tmp_path),
+                          timeout=120)
+    assert done.returncode != 2, (
+        f"snakemake rejected the command line this provider builds:\n"
+        f"{done.stderr[-1200:]}"
+    )
 
 
 def test_containment_can_be_turned_off_deliberately():

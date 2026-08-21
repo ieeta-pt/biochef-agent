@@ -201,7 +201,12 @@ class ApptainerRunner(Runner):
                 "--software-deployment-method", "apptainer",
                 "--apptainer-prefix", self.cache_dir]
         if self.apptainer_args:
-            argv += ["--apptainer-args", self.apptainer_args]
+            # One argv element with an "=", not two. The value starts with a
+            # dash, so as a separate element argparse reads it as another
+            # option and snakemake exits 2 with "--apptainer-args: expected one
+            # argument" and a page of usage -- which reads like a snakemake
+            # problem rather than a quoting one.
+            argv.append(f"--apptainer-args={self.apptainer_args}")
         return argv
 
 
