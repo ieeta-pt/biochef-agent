@@ -109,6 +109,12 @@ the workspace, which snakemake binds as the working directory, so the image only
 has to be able to execute it. That keeps one image for the whole catalogue
 instead of one per tool, and keeps the ORAS registry as the single place a tool
 comes from.
+
+It must contain bash. Snakemake runs each rule as `bash -c` inside the
+container, so an image without it fails every rule with exit 255 and an error
+that names the shell command rather than the missing shell. Found in CI: alpine
+was the obvious choice for a small image and cannot work at all. debian slim is
+about 30 MB more and does.
 """
 
 APPTAINER_CACHE = os.path.realpath(

@@ -11,7 +11,7 @@ the host. So the workflow produces two things:
   result.txt      the actual work. Must be byte-for-byte identical.
   where.txt       which operating system the step ran on. Must DIFFER.
 
-The runner is ubuntu; the image is alpine. If where.txt matches between the two
+The runner is ubuntu; the image is debian. If where.txt matches between the two
 runs, the container was never entered and the parity is meaningless.
 
 Kept out of the pytest suite deliberately: it needs apptainer and it pulls an
@@ -29,13 +29,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from runner import ApptainerRunner, SubprocessRunner
 
-IMAGE = os.getenv("BIOCHEF_PARITY_IMAGE", "docker://alpine:3.20")
+IMAGE = os.getenv("BIOCHEF_PARITY_IMAGE", "docker://debian:stable-slim")
+"""The service default, deliberately: this checks the image people get.
+
+Started as alpine, for size. Snakemake runs each rule as `bash -c` inside
+the container and alpine has no bash, so every rule failed with exit 255.
+Its os-release ID is "debian" against the runner's "ubuntu", so the two
+still tell each other apart.
+"""
 TIMEOUT_S = int(os.getenv("BIOCHEF_PARITY_TIMEOUT", "600"))
 
 INPUT_TEXT = "the quick brown fox\njumps over the lazy dog\n" * 32
 
-# Portable on purpose: this has to behave the same in busybox sh and in
-# ubuntu's coreutils, or a difference in the tools would be mistaken for a
+# Portable on purpose: this has to behave the same in the image's coreutils
+# and the runner's, or a difference in the tools would be mistaken for a
 # difference between the runners.
 SNAKEFILE = '''
 rule all:
