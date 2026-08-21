@@ -1,12 +1,12 @@
-"""Whether a step can be made to run in a container today (#15).
+"""Running every step in a container (#15).
 
-Recorded before anything changes. It cannot.
+The seam made the strategy replaceable. This is the second provider, and what
+E2 is actually for: a step no longer runs on the host as the agent's own user.
 
-The seam from the previous PR made the *strategy* replaceable, which is half of
-what E2 needs. The other half is that a step has to run somewhere isolated, and
-nothing in what the service writes or launches says so: the Snakefile carries no
-container directive, and the command carries no deployment method, so every
-rule's shell block runs directly on the host as the agent's own user.
+Apptainer rather than docker. Snakemake has no docker-per-rule mode at all --
+its per-rule container support goes through apptainer, which pulls docker://
+images, needs no daemon and no root, and is what the HPC systems this is meant
+to reach actually have (F4). One mechanism for the server and the cluster.
 """
 
 import os
@@ -36,7 +36,9 @@ if "oras" not in sys.modules:
     sys.modules["oras"] = oras
     sys.modules["oras.client"] = client_mod
 
-from runner import PROVIDERS, SubprocessRunner
+import pytest
+
+from runner import PROVIDERS, ApptainerRunner, SubprocessRunner, get_runner
 
 
 class _Workspace:
@@ -44,36 +46,153 @@ class _Workspace:
         self.path = str(path)
 
 
-def test_there_is_only_one_provider():
-    """A seam with one implementation is not yet a choice."""
-    assert sorted(PROVIDERS) == ["subprocess"]
+# --------------------------------------------------------------------------
+# the provider exists and is selectable
 
 
-def test_nothing_asks_snakemake_to_deploy_software_anywhere(tmp_path):
-    """No --software-deployment-method, so no rule is containerised.
+def test_both_providers_are_available():
+    assert sorted(PROVIDERS) == ["apptainer", "subprocess"]
+    assert isinstance(get_runner("apptainer"), ApptainerRunner)
 
-    Verified against snakemake itself rather than assumed: with a global
-    `container:` directive present, snakemake 9.21 refuses to start without
-    apptainer, and without the directive the same flags run to completion. So
-    the absence of both is what makes every step run on the host.
+
+def test_the_container_provider_asks_snakemake_to_deploy_with_apptainer(tmp_path):
+    argv = ApptainerRunner(image="docker://alpine:3.20",
+                           cache_dir="/cache").command(_Workspace(tmp_path))
+    assert "--software-deployment-method" in argv
+    assert argv[argv.index("--software-deployment-method") + 1] == "apptainer"
+    assert argv[argv.index("--apptainer-prefix") + 1] == "/cache"
+
+
+def test_the_two_providers_run_the_same_workflow_the_same_way(tmp_path):
+    """E2's acceptance is that both produce identical outputs.
+
+    That can only hold if they are running the same thing, so the parts that
+    decide WHAT runs -- the Snakefile and the working directory -- must be
+    identical, and only the deployment flags may differ.
     """
-    argv = SubprocessRunner().command(_Workspace(tmp_path))
-    assert "--software-deployment-method" not in argv
-    assert "--use-apptainer" not in argv
-    assert not any("container" in a for a in argv)
+    ws = _Workspace(tmp_path)
+    plain = SubprocessRunner().command(ws)
+    boxed = ApptainerRunner(image="docker://alpine:3.20",
+                            cache_dir="/cache").command(ws)
+
+    assert boxed[:len(plain)] == plain, (
+        "the container provider must run the same snakemake invocation, plus "
+        "deployment flags -- not a different one"
+    )
+    assert boxed[len(plain):] == [
+        "--software-deployment-method", "apptainer", "--apptainer-prefix", "/cache",
+    ]
 
 
-def test_a_provider_cannot_contribute_anything_to_the_snakefile():
-    """The Snakefile is entirely the emitter's, so a runner cannot ask for a
-    container without the emitter growing a container directive -- and the
-    emitter lives on a different branch of this stack."""
-    assert not hasattr(SubprocessRunner(), "snakefile_preamble")
+# --------------------------------------------------------------------------
+# the Snakefile preamble, which is how a provider asks for a container
+# without the emitter knowing anything about runners
 
 
-def test_the_snakefile_the_service_writes_has_no_container_directive():
-    """Read from the emitter's own output, not from a fixture."""
+def test_the_container_is_requested_globally_in_the_snakefile():
+    preamble = ApptainerRunner(image="docker://alpine:3.20").snakefile_preamble()
+    assert preamble == 'container: "docker://alpine:3.20"\n'
+
+
+def test_the_subprocess_provider_contributes_nothing():
+    """So the Snakefile it runs is byte-for-byte the emitter's, as before."""
+    assert SubprocessRunner().snakefile_preamble() == ""
+
+
+def test_snakemake_itself_parses_the_preamble_plus_the_emitted_snakefile(tmp_path):
+    """Checked with snakemake's parser, not Python's.
+
+    A Snakefile is not plain Python -- `rule all:` is a SyntaxError to
+    compile() -- so the only honest check is snakemake reading the file it will
+    actually be given. A dry run parses and plans without needing apptainer to
+    be installed, which is what makes this runnable here at all.
+    """
+    import shutil
+    import subprocess
+
     import convert
 
-    workflow = convert.Workflow(nodes=[])
-    text = convert.convert_to_snakemake(workflow)
-    assert "container:" not in text
+    text = (ApptainerRunner(image="docker://alpine:3.20").snakefile_preamble()
+            + convert.convert_to_snakemake(convert.Workflow(nodes=[])))
+    (tmp_path / "Snakefile").write_text(text)
+
+    snakemake = shutil.which("snakemake")
+    if snakemake is None:
+        pytest.skip("snakemake is not on PATH")
+
+    done = subprocess.run(
+        [snakemake, "-s", str(tmp_path / "Snakefile"), "-d", str(tmp_path),
+         "--cores", "1", "--dry-run"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert done.returncode == 0, done.stderr[-1500:]
+    assert "SyntaxError" not in done.stderr
+
+
+# --------------------------------------------------------------------------
+# the image is configuration that reaches the interpreter as code
+
+
+@pytest.mark.parametrize("hostile", [
+    'docker://x"\nimport os\nos.system("id")\n#',
+    "docker://x'; import os; os.system('id')",
+    'docker://x"',
+    "docker://x\nrule evil:\n    shell: 'id'",
+    "docker://x\\",
+    "",
+    "../../etc/passwd\nimport os",
+])
+def test_an_image_that_is_not_a_container_reference_is_refused(hostile):
+    """Shape check and json.dumps, both.
+
+    Either would do on its own. Both, because this repository has already
+    shipped one injection that survived a quoting function: shlex.quote was
+    correct for a shell, and the Snakefile turned out to be Python (#43).
+    """
+    with pytest.raises(ValueError, match="BIOCHEF_CONTAINER_IMAGE"):
+        ApptainerRunner(image=hostile)
+
+
+@pytest.mark.parametrize("legitimate", [
+    "docker://debian:stable-slim",
+    "docker://biocontainers/samtools:1.19--h50ea8bc_0",
+    "docker://ghcr.io/ieeta-pt/biochef@sha256:" + "a" * 64,
+    "docker://quay.io/biocontainers/seqtk:1.4--he4a0461_2",
+])
+def test_a_real_image_reference_is_accepted(legitimate):
+    """The shape check must not be so tight it refuses the registry's own names."""
+    runner = ApptainerRunner(image=legitimate)
+    assert legitimate in runner.snakefile_preamble()
+    compile(runner.snakefile_preamble(), "Snakefile", "exec")
+
+
+def test_a_bad_image_stops_the_process_rather_than_every_request(monkeypatch):
+    """The refusal has to happen where the provider is resolved, which is at
+    import, not when a Snakefile is first written.
+
+    Otherwise the service starts, accepts work, and fails every submission with
+    a 500 that says nothing about the misconfigured image.
+    """
+    import runner as runner_module
+
+    monkeypatch.setattr(runner_module, "CONTAINER_IMAGE", "not a reference")
+    with pytest.raises(ValueError, match="BIOCHEF_CONTAINER_IMAGE"):
+        get_runner("apptainer")
+
+    monkeypatch.setattr(runner_module, "CONTAINER_IMAGE", "docker://alpine:3.20")
+    assert isinstance(get_runner("apptainer"), ApptainerRunner)
+
+
+# --------------------------------------------------------------------------
+# the service actually uses it
+
+
+def test_the_service_writes_the_preamble_into_the_snakefile():
+    """The wiring, not just the pieces.
+
+    Read from main.py's own source: the preamble has to be applied where the
+    Snakefile is built, or the provider asks for a container that never appears.
+    """
+    source = Path(REPO_ROOT / "main.py").read_text()
+    assert "RUNNER.snakefile_preamble()" in source
+    assert "snakefile_preamble() + convert_to_snakemake" in source

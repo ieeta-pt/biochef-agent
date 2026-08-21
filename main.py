@@ -110,7 +110,11 @@ async def convert(
             )
 
         # Convert workflow to Snakemake and run
-        snakemake = convert_to_snakemake(workflow)
+        # The runner may need lines of its own at the top -- a container
+        # directive, for the provider that runs each step in one. Asking the
+        # runner keeps the emitter from having to know how the workflow will be
+        # executed.
+        snakemake = RUNNER.snakefile_preamble() + convert_to_snakemake(workflow)
         # Same mapping as the upload loop. An upload named "Snakefile" -- or,
         # on a case-insensitive filesystem, "SNAKEFILE" -- occupies this slot
         # first, and O_EXCL then refuses the generated write. That is the right
