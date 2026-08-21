@@ -16,6 +16,17 @@ Counting what actually arrives is the real one. The ASGI `receive` callable is
 wrapped, and the running total is checked as each chunk comes in, so a body with
 no declared length is cut off at the same ceiling as one that declares itself
 honestly.
+
+A refusal replaces the application's response entirely -- status, headers and
+body -- rather than only its status. Swapping the status alone left FastAPI's
+own "There was an error parsing the body" in place underneath a 413, so the
+client was told accurately that it had sent too much and in the same breath told
+the reason was a malformed multipart body. Both refusals go through one writer
+so the two paths cannot phrase the same condition differently again.
+
+What this bounds is what reaches the application and the disk, not what crosses
+the network. On the streamed path the client still finishes uploading; nothing
+here makes it stop sending.
 """
 
 import json
