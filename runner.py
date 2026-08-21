@@ -126,6 +126,22 @@ created and destroyed per run, so an image cached inside one would be pulled
 again every time.
 """
 
+APPTAINER_ARGS = os.getenv("BIOCHEF_APPTAINER_ARGS", "--contain")
+"""Extra flags for the apptainer invocation itself.
+
+--contain by default, and the default is the point. Apptainer binds the host's
+/tmp and /var/tmp into the container unless told not to, and a run's workspace
+is created in the system temp directory when BIOCHEF_RUN_ROOT is unset -- which
+is the default. Without this, a containerised tool would be isolated from the
+host's /usr and /etc and /home while still being able to read every other run's
+workspace, which for a service whose reason to exist is keeping one dataset away
+from another is the wrong half to get right. The container runs as the same
+user, so the 0700 mode on a workspace does not help.
+
+Emptying this variable turns containment off, for an operator who needs the host
+/tmp visible and knows what that means.
+"""
+
 _IMAGE_SHAPE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}\Z")
 
 
@@ -162,9 +178,12 @@ class ApptainerRunner(Runner):
 
     name = "apptainer"
 
-    def __init__(self, image: str = None, cache_dir: str = None):
+    def __init__(self, image: str = None, cache_dir: str = None,
+                 apptainer_args: str = None):
         self.image = CONTAINER_IMAGE if image is None else image
         self.cache_dir = APPTAINER_CACHE if cache_dir is None else cache_dir
+        self.apptainer_args = (APPTAINER_ARGS if apptainer_args is None
+                               else apptainer_args)
         # Fail here rather than when the Snakefile is written, so a bad image
         # stops the process from starting instead of failing every submission.
         self._literal = _image_literal(self.image)
@@ -176,11 +195,14 @@ class ApptainerRunner(Runner):
         return f"container: {self._literal}\n"
 
     def command(self, ws) -> List[str]:
-        return ["snakemake", "--cores", "4",
+        argv = ["snakemake", "--cores", "4",
                 "-s", os.path.join(ws.path, "Snakefile"),
                 "-d", ws.path,
                 "--software-deployment-method", "apptainer",
                 "--apptainer-prefix", self.cache_dir]
+        if self.apptainer_args:
+            argv += ["--apptainer-args", self.apptainer_args]
+        return argv
 
 
 PROVIDERS = {

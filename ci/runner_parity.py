@@ -6,13 +6,22 @@
 Asserting only that is not enough on its own. A container runner that silently
 fell back to running on the host would satisfy it perfectly, and that is exactly
 the failure worth catching -- the whole point of E2 is that the step is NOT on
-the host. So the workflow produces two things:
+the host. So the workflow produces three things:
 
   result.txt      the actual work. Must be byte-for-byte identical.
   where.txt       which operating system the step ran on. Must DIFFER.
+  neighbour.txt   whether another run's data on the host was readable. Must be
+                  readable outside the container and hidden inside it.
 
 The runner is ubuntu; the image is debian. If where.txt matches between the two
 runs, the container was never entered and the parity is meaningless.
+
+neighbour.txt is the one that nearly went missing. Apptainer binds the host's
+/tmp unless told not to, and a workspace is created in the system temp
+directory whenever BIOCHEF_RUN_ROOT is unset -- the default. A container that
+walls a tool off from /usr and /etc while leaving every other run's data
+readable has isolated the wrong half, and no comparison of outputs would show
+it. The sentinel stands in for another run's workspace.
 
 Kept out of the pytest suite deliberately: it needs apptainer and it pulls an
 image over the network, neither of which belongs in a unit test run on every
@@ -20,6 +29,7 @@ push. CI calls this directly.
 """
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -48,7 +58,8 @@ SNAKEFILE = '''
 rule all:
     input:
         "result.txt",
-        "where.txt"
+        "where.txt",
+        "neighbour.txt"
 
 rule work:
     input:
@@ -64,6 +75,12 @@ rule where:
     shell:
         "if [ -r /etc/os-release ]; then . /etc/os-release; printf '%s\\\\n' \\"$ID\\"; "
         "else uname -s; fi > {output.o_0}"
+
+rule neighbour:
+    output:
+        o_0="neighbour.txt"
+    shell:
+        "if [ -r __SENTINEL__ ]; then echo readable; else echo hidden; fi > {output.o_0}"
 '''
 
 
@@ -72,12 +89,13 @@ class _Workspace:
         self.path = path
 
 
-def _prepare(root, preamble):
+def _prepare(root, preamble, sentinel):
     ws = _Workspace(tempfile.mkdtemp(dir=root))
     with open(os.path.join(ws.path, "input.txt"), "w") as f:
         f.write(INPUT_TEXT)
     with open(os.path.join(ws.path, "Snakefile"), "w") as f:
-        f.write(preamble + SNAKEFILE)
+        f.write(preamble
+                + SNAKEFILE.replace("__SENTINEL__", shlex.quote(sentinel)))
     return ws
 
 
@@ -94,7 +112,17 @@ def main():
 
     root = tempfile.mkdtemp(prefix="biochef-parity-")
     cache = os.path.join(root, "apptainer-cache")
-    os.makedirs(cache, exist_ok=True)
+    # Deliberately NOT created here. Snakemake makes the --apptainer-prefix
+    # directory itself -- persistence/__init__.py runs makedirs over a list
+    # that includes container_img_path -- and creating it here would hide a
+    # production failure behind a CI convenience.
+
+    # Stands in for another run's workspace. It sits beside the workspaces in
+    # the system temp directory, which is exactly where make_workspace puts a
+    # real run when BIOCHEF_RUN_ROOT is unset, i.e. by default.
+    sentinel = os.path.join(root, "another-run-secret.txt")
+    with open(sentinel, "w") as f:
+        f.write("another run's data\n")
 
     runners = [
         ("subprocess", SubprocessRunner()),
@@ -103,18 +131,21 @@ def main():
 
     outcomes = {}
     for label, runner in runners:
-        ws = _prepare(root, runner.snakefile_preamble())
+        ws = _prepare(root, runner.snakefile_preamble(), sentinel)
         print(f"--- {label}: {' '.join(runner.command(ws))}", flush=True)
         result = runner.run(ws, timeout_s=TIMEOUT_S)
         if result.returncode != 0:
             print(f"FAIL: {label} exited {result.returncode}", file=sys.stderr)
             print(result.stderr[-4000:], file=sys.stderr)
             return 1
-        outcomes[label] = (_read(ws, "result.txt"), _read(ws, "where.txt"))
-        print(f"    ran on: {outcomes[label][1].decode().strip()!r}", flush=True)
+        outcomes[label] = (_read(ws, "result.txt"), _read(ws, "where.txt"),
+                           _read(ws, "neighbour.txt"))
+        print(f"    ran on: {outcomes[label][1].decode().strip()!r}   "
+              f"other runs' data: {outcomes[label][2].decode().strip()!r}",
+              flush=True)
 
-    plain_result, plain_where = outcomes["subprocess"]
-    boxed_result, boxed_where = outcomes["apptainer"]
+    plain_result, plain_where, plain_neighbour = outcomes["subprocess"]
+    boxed_result, boxed_where, boxed_neighbour = outcomes["apptainer"]
 
     failures = []
     if plain_result != boxed_result:
@@ -129,14 +160,32 @@ def main():
             f"entered -- identical outputs prove nothing here"
         )
 
+    # The isolation E2 is actually for. Apptainer binds the host's /tmp
+    # unless told not to, and that is where a workspace lives by default, so
+    # without --contain a containerised tool is walled off from /usr and /etc
+    # while still able to read every other run's data. The container runs as
+    # the same user, so a workspace's 0700 mode does not help.
+    if plain_neighbour.strip() != b"readable":
+        failures.append(
+            "the sentinel was not readable even on the host, so this check "
+            "cannot tell containment apart from a missing file"
+        )
+    if boxed_neighbour.strip() != b"hidden":
+        failures.append(
+            f"a containerised step could read another run's data on the host "
+            f"({boxed_neighbour.decode().strip()!r}) -- the container isolates "
+            f"the system but not the one thing that matters here"
+        )
+
     if failures:
         for f in failures:
             print(f"FAIL: {f}", file=sys.stderr)
         return 1
 
-    print(f"OK: identical outputs ({len(plain_result)} bytes), and the steps ran "
-          f"on different systems ({plain_where.decode().strip()!r} vs "
-          f"{boxed_where.decode().strip()!r}), so the container was real")
+    print(f"OK: identical outputs ({len(plain_result)} bytes); the steps ran on "
+          f"different systems ({plain_where.decode().strip()!r} vs "
+          f"{boxed_where.decode().strip()!r}), so the container was real; and "
+          f"another run's data was readable on the host but hidden inside it")
     return 0
 
 

@@ -72,8 +72,8 @@ def test_the_two_providers_run_the_same_workflow_the_same_way(tmp_path):
     """
     ws = _Workspace(tmp_path)
     plain = SubprocessRunner().command(ws)
-    boxed = ApptainerRunner(image="docker://alpine:3.20",
-                            cache_dir="/cache").command(ws)
+    boxed = ApptainerRunner(image="docker://alpine:3.20", cache_dir="/cache",
+                            apptainer_args="--contain").command(ws)
 
     assert boxed[:len(plain)] == plain, (
         "the container provider must run the same snakemake invocation, plus "
@@ -81,7 +81,37 @@ def test_the_two_providers_run_the_same_workflow_the_same_way(tmp_path):
     )
     assert boxed[len(plain):] == [
         "--software-deployment-method", "apptainer", "--apptainer-prefix", "/cache",
+        "--apptainer-args", "--contain",
     ]
+
+
+def test_the_container_is_contained_by_default():
+    """--contain, and the default is the security property, not a preference.
+
+    Apptainer binds the host's /tmp unless told not to, and make_workspace puts
+    a run in the system temp directory whenever BIOCHEF_RUN_ROOT is unset --
+    which is the default. Without this a containerised tool is walled off from
+    /usr and /etc while still able to read every other run's workspace, and the
+    container runs as the same user so the 0700 mode on a workspace does not
+    help. That is the wrong half to isolate for a service whose reason to exist
+    is keeping one dataset away from another.
+
+    Proved end to end by the CI parity check, which fails if a step inside the
+    container can read a file standing in for another run.
+    """
+    import runner as runner_module
+
+    assert runner_module.APPTAINER_ARGS == "--contain"
+    argv = ApptainerRunner(cache_dir="/cache").command(_Workspace("/ws"))
+    assert argv[argv.index("--apptainer-args") + 1] == "--contain"
+
+
+def test_containment_can_be_turned_off_deliberately():
+    """An operator who needs the host /tmp visible can say so, and gets no flag
+    rather than an empty one that apptainer would reject."""
+    argv = ApptainerRunner(cache_dir="/cache",
+                           apptainer_args="").command(_Workspace("/ws"))
+    assert "--apptainer-args" not in argv
 
 
 # --------------------------------------------------------------------------
