@@ -6,12 +6,20 @@
 Asserting only that is not enough on its own. A container runner that silently
 fell back to running on the host would satisfy it perfectly, and that is exactly
 the failure worth catching -- the whole point of E2 is that the step is NOT on
-the host. So the workflow produces three things:
+the host. So the workflow produces four things:
 
   result.txt      the actual work. Must be byte-for-byte identical.
   where.txt       which operating system the step ran on. Must DIFFER.
   neighbour.txt   whether another run's data on the host was readable. Must be
                   readable outside the container and hidden inside it.
+  exec.txt        the output of a file executed OUT OF the workspace. Must run
+                  under both.
+
+exec.txt exists because `./<bin>` is the only rule shape the emitter ever
+produces -- convert.py builds every command as `cmd = [f"./{node.bin}"]` -- and
+every other rule here runs something the image supplies. A container that binds
+the workspace readable but cannot execute out of it would run no real workflow
+at all, while a check made entirely of image-supplied tools reported green.
 
 The runner is ubuntu; the image is debian. If where.txt matches between the two
 runs, the container was never entered and the parity is meaningless.
@@ -37,15 +45,24 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from runner import ApptainerRunner, SubprocessRunner
+from runner import CONTAINER_IMAGE, ApptainerRunner, SubprocessRunner
 
-IMAGE = os.getenv("BIOCHEF_PARITY_IMAGE", "docker://debian:stable-slim")
-"""The service default, deliberately: this checks the image people get.
+IMAGE = os.getenv("BIOCHEF_PARITY_IMAGE") or CONTAINER_IMAGE
+"""The image the service would actually use, not a copy of it.
 
-Started as alpine, for size. Snakemake runs each rule as `bash -c` inside
-the container and alpine has no bash, so every rule failed with exit 255.
-Its os-release ID is "debian" against the runner's "ubuntu", so the two
-still tell each other apart.
+This previously repeated the default as a literal of its own and claimed, in
+this docstring, to be checking "the image people get". It was not. Changing the
+service default would have left this pulling the old image and reporting green
+while every real rule failed -- which is exactly the regression that has already
+happened once here: alpine has no bash, snakemake runs each rule as `bash -c`,
+and every rule failed with exit 255.
+
+Reading runner.CONTAINER_IMAGE means a change to the default is a change to what
+this check runs. BIOCHEF_PARITY_IMAGE still overrides it, for testing an image
+before making it the default.
+
+The image's os-release ID must differ from the runner's ("debian" against
+"ubuntu") or the container-was-really-entered check below cannot tell them apart.
 """
 TIMEOUT_S = int(os.getenv("BIOCHEF_PARITY_TIMEOUT", "600"))
 
@@ -59,7 +76,8 @@ rule all:
     input:
         "result.txt",
         "where.txt",
-        "neighbour.txt"
+        "neighbour.txt",
+        "exec.txt"
 
 rule work:
     input:
@@ -81,6 +99,12 @@ rule neighbour:
         o_0="neighbour.txt"
     shell:
         "if [ -r __SENTINEL__ ]; then echo readable; else echo hidden; fi > {output.o_0}"
+
+rule from_workspace:
+    output:
+        o_0="exec.txt"
+    shell:
+        "./tool > {output.o_0}"
 '''
 
 
@@ -96,6 +120,20 @@ def _prepare(root, preamble, sentinel):
     with open(os.path.join(ws.path, "Snakefile"), "w") as f:
         f.write(preamble
                 + SNAKEFILE.replace("__SENTINEL__", shlex.quote(sentinel)))
+
+    # Stands in for a tool binary. `./<bin>` is the ONLY rule shape the emitter
+    # produces (convert.py: cmd = [f"./{node.bin}"]), and every rule above runs
+    # something the image supplies instead -- so nothing here had ever asked the
+    # container to execute a file out of the bound workspace.
+    #
+    # Placed the way workspace.place_executable places a real one, 0700 and all.
+    # A script rather than a binary because that half needs no registry and no
+    # network; ABI compatibility of a real catalogue binary with the image is a
+    # separate question that CI cannot answer without credentials.
+    tool = os.path.join(ws.path, "tool")
+    with open(tool, "w") as f:
+        f.write("#!/bin/sh\necho executed-from-workspace\n")
+    os.chmod(tool, 0o700)
     return ws
 
 
@@ -139,13 +177,13 @@ def main():
             print(result.stderr[-4000:], file=sys.stderr)
             return 1
         outcomes[label] = (_read(ws, "result.txt"), _read(ws, "where.txt"),
-                           _read(ws, "neighbour.txt"))
+                           _read(ws, "neighbour.txt"), _read(ws, "exec.txt"))
         print(f"    ran on: {outcomes[label][1].decode().strip()!r}   "
               f"other runs' data: {outcomes[label][2].decode().strip()!r}",
               flush=True)
 
-    plain_result, plain_where, plain_neighbour = outcomes["subprocess"]
-    boxed_result, boxed_where, boxed_neighbour = outcomes["apptainer"]
+    plain_result, plain_where, plain_neighbour, plain_exec = outcomes["subprocess"]
+    boxed_result, boxed_where, boxed_neighbour, boxed_exec = outcomes["apptainer"]
 
     failures = []
     if plain_result != boxed_result:
@@ -177,6 +215,17 @@ def main():
             f"the system but not the one thing that matters here"
         )
 
+    # `./<bin>` is the only rule shape the emitter emits, so if a file cannot
+    # be executed out of the bound workspace inside the container, no real
+    # workflow runs at all -- while a check made of image-supplied tools stays
+    # green.
+    for label, got in (("subprocess", plain_exec), ("apptainer", boxed_exec)):
+        if got.strip() != b"executed-from-workspace":
+            failures.append(
+                f"{label}: a file placed in the workspace did not execute "
+                f"({got.strip()!r}); the emitter only ever produces ./<bin>"
+            )
+
     if failures:
         for f in failures:
             print(f"FAIL: {f}", file=sys.stderr)
@@ -184,8 +233,9 @@ def main():
 
     print(f"OK: identical outputs ({len(plain_result)} bytes); the steps ran on "
           f"different systems ({plain_where.decode().strip()!r} vs "
-          f"{boxed_where.decode().strip()!r}), so the container was real; and "
-          f"another run's data was readable on the host but hidden inside it")
+          f"{boxed_where.decode().strip()!r}), so the container was real; "
+          f"a file placed in the workspace executed under both; and another "
+          f"run's data was readable on the host but hidden inside it")
     return 0
 
 
