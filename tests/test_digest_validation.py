@@ -21,6 +21,7 @@ present nothing closes that gap -- which is the whole of C1, and the reason E1
 (cosign) has nothing to stand on yet.
 """
 
+import hashlib
 import inspect
 import json
 import os
@@ -55,7 +56,7 @@ if "oras" not in sys.modules:
 import pytest
 
 import convert
-from workspace import make_workspace
+from workspace import UnsafeName, make_workspace
 
 
 def _oras_provider_source():
@@ -98,65 +99,185 @@ def test_the_library_does_not_verify_what_it_downloads():
     assert "get_file_hash" not in pull
 
 
-def test_this_repository_does_not_verify_either():
-    source = inspect.getsource(convert.fetch_tool)
-    assert "client.pull" in source
-    # Not "digest": the function already carries a comment saying this is where
-    # a digest would be checked, and matching on prose rather than on code is
-    # how a test ends up asserting about a comment.
-    for evidence_of_checking in ("sha256", "hashlib", "get_manifest",
-                                 "hexdigest"):
-        assert evidence_of_checking not in source, evidence_of_checking
+def test_the_verification_happens_before_the_bundle_is_promoted():
+    """Order matters more than presence.
 
-
-def test_a_tampered_bundle_is_accepted_and_becomes_an_executable(tmp_path, monkeypatch):
-    """The consequence, end to end.
-
-    A registry -- or anything able to answer for one -- returns bytes that are
-    not the artifact. Nothing compares them to anything, the bundle is cached as
-    though it were genuine, and materialise_tools places the binary in the run
-    directory with the execute bit set.
+    Verifying after os.replace would leave a window in which a tampered bundle
+    is the cached one, and the cache is what every later run copies from.
     """
+    source = inspect.getsource(convert.fetch_tool)
+    assert "verify_against_manifest" in source
+    assert source.index("verify_against_manifest") < source.index("os.replace"), (
+        "the check must run while the pull is still staged in .part"
+    )
+
+
+def _manifest_for(files):
+    return {"layers": [
+        {"digest": "sha256:" + hashlib.sha256(content).hexdigest(),
+         "mediaType": "application/octet-stream",
+         "annotations": {"org.opencontainers.image.title": name}}
+        for name, content in files.items()
+    ]}
+
+
+class _Registry:
+    """A registry that pulls one set of bytes and vouches for another."""
+
+    def __init__(self, written, vouched=None):
+        self.written = written
+        self.vouched = written if vouched is None else vouched
+        self.manifest = _manifest_for(self.vouched)
+
+    def get_container(self, target):
+        return target
+
+    def get_manifest(self, container, *a, **k):
+        return self.manifest
+
+    def pull(self, target, outdir):
+        os.makedirs(outdir, exist_ok=True)
+        for name, content in self.written.items():
+            with open(os.path.join(outdir, name), "wb") as f:
+                f.write(content)
+
+
+GENUINE = {"bundle.json": json.dumps(
+               {"id": "tool", "name": "tool", "bin": "tool",
+                "io": {"inputs": [], "outputs": []}, "parameters": []}
+           ).encode(),
+           "tool": b"#!/bin/sh\necho genuine\n"}
+
+
+def test_a_bundle_that_matches_its_manifest_is_accepted(tmp_path, monkeypatch):
+    """The control. Without it, refusing everything would pass every other test."""
     monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(convert, "client", _Registry(GENUINE))
     convert.tools.clear()
-
-    class _TamperingRegistry:
-        """Answers with content that matches no digest at all."""
-
-        def pull(self, target, outdir):
-            os.makedirs(outdir, exist_ok=True)
-            with open(os.path.join(outdir, "bundle.json"), "w") as f:
-                json.dump({"id": "tool", "name": "tool", "bin": "tool",
-                           "io": {"inputs": [], "outputs": []},
-                           "parameters": []}, f)
-            with open(os.path.join(outdir, "tool"), "wb") as f:
-                f.write(b"#!/bin/sh\necho not-the-tool-you-asked-for\n")
-
-    monkeypatch.setattr(convert, "client", _TamperingRegistry())
-
-    bundle = convert.fetch_tool("tool-1", "tool:latest")
-    assert bundle["bin"] == "tool", "the tampered bundle was accepted"
-
-    workflow = convert.Workflow(nodes=[convert.Node(id="tool-1", bin="tool")])
-    ws = make_workspace(str(tmp_path / "runs"))
     try:
-        convert.materialise_tools(workflow, ws)
-        placed = Path(ws.path) / "tool"
-        assert placed.exists()
-        assert b"not-the-tool-you-asked-for" in placed.read_bytes()
-        assert os.stat(placed).st_mode & 0o100, (
-            "content nobody vouched for is now executable in the run directory"
-        )
+        assert convert.fetch_tool("tool-1", "tool:latest")["bin"] == "tool"
     finally:
-        ws.cleanup()
         convert.tools.clear()
 
 
-def test_nothing_ever_asks_the_registry_for_a_manifest():
-    """Which is where the digests would come from.
+def test_a_tampered_blob_is_rejected(tmp_path, monkeypatch):
+    """C1's acceptance: a deliberately tampered blob, refused explicitly."""
+    tampered = dict(GENUINE)
+    tampered["tool"] = b"#!/bin/sh\necho not-the-tool-you-asked-for\n"
 
-    fetch_tool calls pull and nothing else, so the manifest -- the only
-    statement of what the bytes should be -- is never fetched by this code.
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(convert, "client", _Registry(tampered, vouched=GENUINE))
+    convert.tools.clear()
+    try:
+        with pytest.raises(convert.ToolIntegrityError) as exc:
+            convert.fetch_tool("tool-1", "tool:latest")
+        assert "does not match the manifest" in str(exc.value)
+        assert "tool" in str(exc.value)
+    finally:
+        convert.tools.clear()
+
+
+def test_a_rejected_bundle_is_not_left_anywhere_a_run_could_use_it(tmp_path, monkeypatch):
+    """Refusing is not enough if the bytes stay on disk.
+
+    The cached directory is what materialise_tools copies into a run, so a
+    tampered pull must leave neither a promoted bundle nor a .part beside it.
     """
-    source = Path(REPO_ROOT / "convert.py").read_text()
-    assert "get_manifest" not in source
+    tampered = dict(GENUINE)
+    tampered["tool"] = b"tampered"
+
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(cache))
+    monkeypatch.setattr(convert, "client", _Registry(tampered, vouched=GENUINE))
+    convert.tools.clear()
+    try:
+        with pytest.raises(convert.ToolIntegrityError):
+            convert.fetch_tool("tool-1", "tool:latest")
+        assert not (cache / "tool").exists(), "a tampered bundle was promoted"
+        assert not (cache / "tool.part").exists(), "the staged copy was left behind"
+        assert "tool" not in convert.tools, "the tampered bundle was memoised"
+    finally:
+        convert.tools.clear()
+
+
+def test_a_directory_layer_is_refused_rather_than_skipped(tmp_path, monkeypatch):
+    """It cannot be verified, so it must not be treated as verified.
+
+    oras downloads a directory layer to a temporary archive and extracts it, so
+    nothing on disk is the blob. Passing it silently would be the exact failure
+    this issue is about, dressed up as a check.
+    """
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+    registry = _Registry(GENUINE)
+    registry.manifest["layers"][1]["mediaType"] = (
+        "application/vnd.oci.image.layer.v1.tar+gzip")
+    monkeypatch.setattr(convert, "client", registry)
+    convert.tools.clear()
+    try:
+        with pytest.raises(convert.ToolIntegrityError, match="directory archive"):
+            convert.fetch_tool("tool-1", "tool:latest")
+    finally:
+        convert.tools.clear()
+
+
+def test_a_manifest_title_is_not_allowed_to_choose_a_path(tmp_path, monkeypatch):
+    """The manifest comes from the registry, and the client chooses the registry.
+
+    A title of "../../etc/cron.d/x" would otherwise decide which file gets
+    hashed, and by extension which path is consulted at all.
+    """
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+    registry = _Registry(GENUINE)
+    registry.manifest["layers"][1]["annotations"][
+        "org.opencontainers.image.title"] = "../../etc/passwd"
+    monkeypatch.setattr(convert, "client", registry)
+    convert.tools.clear()
+    try:
+        # UnsafeName specifically, not merely "something raised". Without the
+        # name check the join still escapes the staging directory, the file is
+        # simply not found, and a test that accepted any exception passed while
+        # the path traversal went unchecked.
+        with pytest.raises(UnsafeName):
+            convert.fetch_tool("tool-1", "tool:latest")
+    finally:
+        convert.tools.clear()
+
+
+def test_a_manifest_with_no_layers_is_refused(tmp_path, monkeypatch):
+    """Otherwise "verified" would mean "there was nothing to check"."""
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+    registry = _Registry(GENUINE)
+    registry.manifest = {"layers": []}
+    monkeypatch.setattr(convert, "client", registry)
+    convert.tools.clear()
+    try:
+        with pytest.raises(convert.ToolIntegrityError, match="no layers"):
+            convert.fetch_tool("tool-1", "tool:latest")
+    finally:
+        convert.tools.clear()
+
+
+def test_a_declared_file_that_never_arrived_is_refused(tmp_path, monkeypatch):
+    """A manifest naming a file the pull did not produce is not a pass."""
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+    vouched = dict(GENUINE)
+    vouched["extra"] = b"never written"
+    monkeypatch.setattr(convert, "client", _Registry(GENUINE, vouched=vouched))
+    convert.tools.clear()
+    try:
+        with pytest.raises(convert.ToolIntegrityError, match="did not"):
+            convert.fetch_tool("tool-1", "tool:latest")
+    finally:
+        convert.tools.clear()
+
+
+def test_the_manifest_is_what_the_digests_come_from():
+    """Not a digest the caller passed in, which would prove nothing.
+
+    The manifest is fetched from the registry for the same target that was
+    pulled, so the comparison is against the registry's own statement of what
+    the artifact is.
+    """
+    source = inspect.getsource(convert.verify_against_manifest)
+    assert "client.get_manifest" in source
+    assert "hashlib" in inspect.getsource(convert._sha256_of)

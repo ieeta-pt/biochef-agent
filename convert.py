@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+import hashlib
 import json
 import oras.client
 import os
@@ -98,6 +99,80 @@ copy in whichever workspace needs it.
 tools = {}
 
 
+class ToolIntegrityError(Exception):
+    """The bytes that arrived are not the bytes the registry vouched for."""
+
+
+# Spelled out rather than imported from oras.defaults, because every test module
+# here replaces the oras package with a stub so nothing reaches the registry, and
+# importing a submodule of that stub fails. These two values are part of the OCI
+# specification rather than of oras.
+_ANNOTATION_TITLE = "org.opencontainers.image.title"
+_DIR_MEDIA_TYPE = "application/vnd.oci.image.layer.v1.tar+gzip"
+
+
+def _sha256_of(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def verify_against_manifest(target, staging):
+    """Check every staged file against the digest the manifest claims for it.
+
+    oras never does this. It builds the blob URL from the digest and streams the
+    response to a file, so the digest names what was asked for and never what
+    arrived (#9). What arrives is then made executable and run.
+
+    A layer's on-disk file IS the blob for ordinary layers, so hashing the staged
+    file is the comparison the specification intends. A directory layer is
+    different: oras downloads it to a temporary archive and extracts it, so
+    nothing on disk is the blob and the digest cannot be checked after the fact.
+    That case is refused rather than skipped -- an unverifiable artifact must not
+    be quietly treated as a verified one, which is the failure this whole issue
+    is about.
+    """
+    manifest = client.get_manifest(client.get_container(target))
+    layers = manifest.get("layers") or []
+    if not layers:
+        raise ToolIntegrityError(
+            f"{target} has no layers in its manifest, so there is nothing to "
+            f"verify the pulled files against"
+        )
+
+    for layer in layers:
+        digest = layer.get("digest")
+        if not digest:
+            raise ToolIntegrityError(f"{target}: a layer declares no digest")
+
+        if layer.get("mediaType") == _DIR_MEDIA_TYPE:
+            raise ToolIntegrityError(
+                f"{target}: layer {digest} is a directory archive, which is "
+                f"extracted on the way in, so what lands on disk is not the "
+                f"blob and its digest cannot be checked. Refusing rather than "
+                f"treating it as verified."
+            )
+
+        name = (layer.get("annotations") or {}).get(_ANNOTATION_TITLE) or digest
+        # The same gate the uploads go through. A manifest is registry-supplied,
+        # and a title of "../../etc/cron.d/x" would otherwise decide a path.
+        path = os.path.join(staging, check_name(name))
+        if not os.path.exists(path):
+            raise ToolIntegrityError(
+                f"{target}: the manifest declares {name!r} but the pull did not "
+                f"produce it"
+            )
+
+        actual = _sha256_of(path)
+        if actual != digest:
+            raise ToolIntegrityError(
+                f"{target}: {name!r} does not match the manifest. "
+                f"expected {digest}, got {actual}"
+            )
+
+
 def fetch_tool(tool_id, repo):
     """Pull a bundle into the shared cache and return it.
 
@@ -119,7 +194,16 @@ def fetch_tool(tool_id, repo):
         staging = outdir + ".part"
         shutil.rmtree(staging, ignore_errors=True)
         os.makedirs(staging, exist_ok=True)
-        client.pull(target=f"{REGISTRY_URL}/{repo}", outdir=staging)
+        target = f"{REGISTRY_URL}/{repo}"
+        client.pull(target=target, outdir=staging)
+        # Before the staged directory becomes the cached one, and so before
+        # anything in it can be copied into a run. A tampered bundle is left in
+        # .part and removed, never promoted.
+        try:
+            verify_against_manifest(target, staging)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
         shutil.rmtree(outdir, ignore_errors=True)
         os.replace(staging, outdir)
 
