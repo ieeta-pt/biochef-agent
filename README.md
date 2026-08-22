@@ -28,7 +28,29 @@ None of that is built yet. What exists today is the single endpoint below.
 
 ## The contract
 
-One endpoint. `POST /convert`, `multipart/form-data`, two fields:
+`openapi.json` in this repository is the source of truth, generated from the
+service itself (`python ci/export_openapi.py`) and checked by the suite, so it
+cannot drift.
+
+Two ways to run the same workflow.
+
+**Synchronously.** `POST /convert`, `multipart/form-data`, two fields. The
+connection is held for the whole run — up to `BIOCHEF_RUN_TIMEOUT`, fifteen
+minutes by default — and the outputs come back in the response. This is the
+contract the editor speaks today.
+
+**Asynchronously.** `POST /runs` takes the same two fields and answers `202`
+immediately with a `run_id`. `GET /runs/{run_id}` reports the state, and carries
+the outputs once it is `COMPLETE`. States are GA4GH WES's vocabulary verbatim —
+`QUEUED`, `INITIALIZING`, `RUNNING`, `COMPLETE`, `EXECUTOR_ERROR`,
+`SYSTEM_ERROR`, `CANCELING`, `CANCELED` — so exposing this as a WES endpoint
+later is an adapter rather than a rewrite.
+
+Runs are held in memory: nothing survives a restart, and nothing is shared
+between replicas. `BIOCHEF_MAX_RUNS` bounds how many are remembered, and a run
+still in flight is never forgotten.
+
+Both take the same fields:
 
 | field | what it is |
 |---|---|
@@ -90,6 +112,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_RUN_TIMEOUT` | `900` | seconds before a run's whole process group is killed |
 | `BIOCHEF_KEEP_WORKSPACE` | `false` | leave a run's directory behind, for debugging |
 | `BIOCHEF_MAX_UPLOAD_BYTES` | `536870912` | largest request body accepted, in bytes |
+| `BIOCHEF_MAX_RUNS` | `256` | how many runs are remembered for polling |
 | `BIOCHEF_AUTH` | `none` | who may call it: `none` or `bearer` |
 | `BIOCHEF_AUTH_TOKEN` | | the shared token, required when `BIOCHEF_AUTH=bearer` |
 | `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess` or `apptainer` |
