@@ -36,6 +36,7 @@ if "oras" not in sys.modules:
     sys.modules["oras"] = oras
     sys.modules["oras.client"] = client_mod
 
+import hashlib
 import json
 import os
 
@@ -67,19 +68,48 @@ WORKFLOW = json.dumps({
 })
 
 
+BINARY = "#!/bin/sh\n"
+
+
+def _digest(payload: bytes) -> str:
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
 class FakeRegistry:
-    """Stands in for the ORAS client, recording what was pulled and where."""
+    """Stands in for the ORAS client, recording what was pulled and where.
+
+    It also answers get_manifest, because the pull is now checked against the
+    manifest before the staged directory is promoted (#9). The digests here are
+    computed from the same bytes pull writes, so an honest registry verifies --
+    a test that hardcoded them would drift and start failing for the wrong
+    reason.
+    """
 
     def __init__(self):
         self.pulls = []
+        self.bundle_bytes = json.dumps(BUNDLE).encode()
+        self.binary_bytes = BINARY.encode()
+
+    def get_container(self, target):
+        return target
+
+    def get_manifest(self, container, *a, **k):
+        return {"layers": [
+            {"digest": _digest(self.bundle_bytes),
+             "mediaType": "application/octet-stream",
+             "annotations": {"org.opencontainers.image.title": "bundle.json"}},
+            {"digest": _digest(self.binary_bytes),
+             "mediaType": "application/octet-stream",
+             "annotations": {"org.opencontainers.image.title": "tool"}},
+        ]}
 
     def pull(self, target, outdir):
         self.pulls.append((target, outdir))
         os.makedirs(outdir, exist_ok=True)
-        with open(os.path.join(outdir, "bundle.json"), "w") as handle:
-            json.dump(BUNDLE, handle)
-        with open(os.path.join(outdir, "tool"), "w") as handle:
-            handle.write("#!/bin/sh\n")
+        with open(os.path.join(outdir, "bundle.json"), "wb") as handle:
+            handle.write(self.bundle_bytes)
+        with open(os.path.join(outdir, "tool"), "wb") as handle:
+            handle.write(self.binary_bytes)
 
 
 @pytest.fixture
