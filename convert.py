@@ -111,6 +111,29 @@ _ANNOTATION_TITLE = "org.opencontainers.image.title"
 _DIR_MEDIA_TYPE = "application/vnd.oci.image.layer.v1.tar+gzip"
 
 
+def _contained_path(root, name, target):
+    """Where a manifest title lands, refusing anything that escapes `root`.
+
+    check_name is the wrong instrument here and was the first thing tried. It
+    admits one plain file name, so it refused "bin/tool" and "lib/libz.so.1" --
+    titles oras itself accepts and sanitises. A bundle laid out in
+    subdirectories would have been rejected as an integrity failure.
+
+    Containment is the property that actually matters: the manifest comes from
+    the registry, the client chooses the registry, and a title of
+    "../../etc/cron.d/x" must not decide which path gets hashed. Resolving and
+    checking the prefix allows nesting and still refuses escape.
+    """
+    resolved = os.path.realpath(os.path.join(root, name))
+    base = os.path.realpath(root)
+    if resolved != base and not resolved.startswith(base + os.sep):
+        raise ToolIntegrityError(
+            f"{target}: the manifest names {name!r}, which resolves outside the "
+            f"directory the pull was staged in"
+        )
+    return resolved
+
+
 def _sha256_of(path):
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -119,7 +142,23 @@ def _sha256_of(path):
     return "sha256:" + digest.hexdigest()
 
 
-def verify_against_manifest(target, staging):
+def cache_matches(directory, manifest, target):
+    """Whether what is on disk already is what the manifest describes.
+
+    Silent, unlike verify_against_manifest: a mismatch here is a reason to pull
+    again, not a reason to fail. The tag may simply have moved to a new version,
+    which is the ordinary case and not an incident.
+    """
+    if not os.path.exists(os.path.join(directory, "bundle.json")):
+        return False
+    try:
+        verify_against_manifest(target, directory, manifest=manifest)
+    except ToolIntegrityError:
+        return False
+    return True
+
+
+def verify_against_manifest(target, staging, manifest=None):
     """Check every staged file against the digest the manifest claims for it.
 
     oras never does this. It builds the blob URL from the digest and streams the
@@ -134,7 +173,8 @@ def verify_against_manifest(target, staging):
     be quietly treated as a verified one, which is the failure this whole issue
     is about.
     """
-    manifest = client.get_manifest(client.get_container(target))
+    if manifest is None:
+        manifest = client.get_manifest(client.get_container(target))
     layers = manifest.get("layers") or []
     if not layers:
         raise ToolIntegrityError(
@@ -156,9 +196,7 @@ def verify_against_manifest(target, staging):
             )
 
         name = (layer.get("annotations") or {}).get(_ANNOTATION_TITLE) or digest
-        # The same gate the uploads go through. A manifest is registry-supplied,
-        # and a title of "../../etc/cron.d/x" would otherwise decide a path.
-        path = os.path.join(staging, check_name(name))
+        path = _contained_path(staging, name, target)
         if not os.path.exists(path):
             raise ToolIntegrityError(
                 f"{target}: the manifest declares {name!r} but the pull did not "
@@ -169,7 +207,10 @@ def verify_against_manifest(target, staging):
         if actual != digest:
             raise ToolIntegrityError(
                 f"{target}: {name!r} does not match the manifest. "
-                f"expected {digest}, got {actual}"
+                f"expected {digest}, got {actual}. Either the bytes are not the "
+                f"ones the registry vouched for, or the tag moved between the "
+                f"pull and this check -- an ordinary push to the same tag looks "
+                f"identical from here."
             )
 
 
@@ -183,24 +224,37 @@ def fetch_tool(tool_id, repo):
     """
     tool_id = check_name(tool_id.split("-")[0])
 
-    if tool_id in tools:
-        return tools[tool_id]
-
     outdir = os.path.join(TOOL_CACHE, tool_id)
-    if not os.path.exists(os.path.join(outdir, "bundle.json")):
+    target = f"{REGISTRY_URL}/{repo}"
+
+    # Fetched once, and used for both the cache check and the verification of
+    # anything pulled, so the two are talking about the same artifact. Two
+    # separate fetches made an ordinary push to the same tag, mid-pull, look
+    # exactly like tampering.
+    manifest = client.get_manifest(client.get_container(target))
+
+    # On EVERY call, not only on a miss. The cache is what materialise_tools
+    # copies into a run and chmods 0700, so verifying only the pull that created
+    # it proves something about a moment in the past rather than about the bytes
+    # being executed. It is a plain directory, written by this service, and a
+    # tool running under the subprocess runner is unconfined and runs as the
+    # same user -- so one run can rewrite what every later run executes. That is
+    # not a clever attack, it is the ordinary consequence of a shared cache.
+    #
+    # The cost is a manifest fetch and a local re-hash per tool per request. The
+    # blobs are not downloaded again.
+    if not cache_matches(outdir, manifest, target):
         # Staged, then moved into place, so an interrupted pull cannot leave a
-        # half-written bundle that the next run would read as complete. It is
-        # also the point where a digest would be checked (#9).
+        # half-written bundle that the next run would read as complete.
         staging = outdir + ".part"
         shutil.rmtree(staging, ignore_errors=True)
         os.makedirs(staging, exist_ok=True)
-        target = f"{REGISTRY_URL}/{repo}"
         client.pull(target=target, outdir=staging)
         # Before the staged directory becomes the cached one, and so before
-        # anything in it can be copied into a run. A tampered bundle is left in
-        # .part and removed, never promoted.
+        # anything in it can be copied into a run. A bundle that does not match
+        # is left in .part and removed, never promoted.
         try:
-            verify_against_manifest(target, staging)
+            verify_against_manifest(target, staging, manifest=manifest)
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
             raise

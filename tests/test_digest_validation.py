@@ -233,11 +233,11 @@ def test_a_manifest_title_is_not_allowed_to_choose_a_path(tmp_path, monkeypatch)
     monkeypatch.setattr(convert, "client", registry)
     convert.tools.clear()
     try:
-        # UnsafeName specifically, not merely "something raised". Without the
-        # name check the join still escapes the staging directory, the file is
-        # simply not found, and a test that accepted any exception passed while
-        # the path traversal went unchecked.
-        with pytest.raises(UnsafeName):
+        # The containment error specifically, not merely "something raised".
+        # Without the check the join still escapes the staging directory, the
+        # file is simply not found, and a test that accepted any exception
+        # passed while the traversal went unchecked.
+        with pytest.raises(convert.ToolIntegrityError, match="resolves outside"):
             convert.fetch_tool("tool-1", "tool:latest")
     finally:
         convert.tools.clear()
@@ -281,3 +281,174 @@ def test_the_manifest_is_what_the_digests_come_from():
     source = inspect.getsource(convert.verify_against_manifest)
     assert "client.get_manifest" in source
     assert "hashlib" in inspect.getsource(convert._sha256_of)
+
+
+# --------------------------------------------------------------------------
+# the cache is what actually runs, so it is what has to be verified
+
+
+def test_a_nested_layer_title_is_accepted(tmp_path, monkeypatch):
+    """oras accepts titles like "bin/tool" and sanitises them.
+
+    The first version of this used check_name, which admits one plain file name,
+    so it refused "bin/tool" and "lib/libz.so.1" -- a bundle laid out in
+    subdirectories would have been rejected as an integrity failure. Containment
+    is the property that matters, not flatness.
+    """
+    nested = {"bundle.json": GENUINE["bundle.json"],
+              "bin/tool": b"#!/bin/sh\necho nested\n"}
+
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+
+    class _Nested(_Registry):
+        def pull(self, target, outdir):
+            for name, content in self.written.items():
+                path = os.path.join(outdir, name)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(content)
+
+    monkeypatch.setattr(convert, "client", _Nested(nested))
+    convert.tools.clear()
+    try:
+        assert convert.fetch_tool("tool-1", "tool:latest")["bin"] == "tool"
+    finally:
+        convert.tools.clear()
+
+
+def test_a_cached_bundle_is_verified_again_before_it_is_used(tmp_path, monkeypatch):
+    """The cache is what runs, so verifying only the pull proves nothing.
+
+    TOOL_CACHE is a plain directory this service writes, and materialise_tools
+    copies out of it and chmods 0700. A tool running under the subprocess runner
+    is unconfined and runs as the same user, so one run can rewrite what every
+    later run executes -- no cleverness required, just a shared cache.
+
+    Verifying only at pull time made that invisible: the second fetch asked the
+    registry nothing at all and handed back the rewritten bytes.
+    """
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(cache))
+    registry = _Registry(GENUINE)
+    monkeypatch.setattr(convert, "client", registry)
+    convert.tools.clear()
+    try:
+        convert.fetch_tool("tool-1", "tool:latest")
+        assert (cache / "tool" / "tool").read_bytes() == GENUINE["tool"]
+
+        # Something with the agent's own privileges rewrites the cached binary.
+        (cache / "tool" / "tool").write_bytes(b"#!/bin/sh\necho rewritten\n")
+        convert.tools.clear()          # as if a later request, or a restart
+
+        convert.fetch_tool("tool-1", "tool:latest")
+        assert (cache / "tool" / "tool").read_bytes() == GENUINE["tool"], (
+            "the rewritten binary survived and would have been executed"
+        )
+    finally:
+        convert.tools.clear()
+
+
+def test_the_registry_is_consulted_on_every_fetch(tmp_path, monkeypatch):
+    """Not only on a cache miss, and not skipped by the in-process memo.
+
+    The memo returned the parsed bundle without looking at disk, so a cached
+    entry short-circuited the check within a process as well as across restarts.
+    """
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+
+    class _Counting(_Registry):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.manifest_fetches = 0
+
+        def get_manifest(self, container, *a, **k):
+            self.manifest_fetches += 1
+            return self.manifest
+
+    registry = _Counting(GENUINE)
+    monkeypatch.setattr(convert, "client", registry)
+    convert.tools.clear()
+    try:
+        convert.fetch_tool("tool-1", "tool:latest")
+        convert.fetch_tool("tool-1", "tool:latest")
+        assert registry.manifest_fetches == 2, (
+            f"the second fetch consulted the registry {registry.manifest_fetches} "
+            f"time(s); a cached entry must still be checked"
+        )
+    finally:
+        convert.tools.clear()
+
+
+def test_a_moved_tag_replaces_the_cache_rather_than_failing(tmp_path, monkeypatch):
+    """A new version published under the same tag is ordinary, not an incident.
+
+    The cache check is silent for exactly this reason: a mismatch there means
+    pull again, and only a mismatch AFTER the pull is an integrity failure.
+    """
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(cache))
+    registry = _Registry(GENUINE)
+    monkeypatch.setattr(convert, "client", registry)
+    convert.tools.clear()
+    try:
+        convert.fetch_tool("tool-1", "tool:latest")
+
+        # The tag moves: new bytes, and a manifest that vouches for them.
+        newer = dict(GENUINE)
+        newer["tool"] = b"#!/bin/sh\necho version-two\n"
+        registry.written = newer
+        registry.vouched = newer
+        registry.manifest = _manifest_for(newer)
+        convert.tools.clear()
+
+        convert.fetch_tool("tool-1", "tool:latest")
+        assert (cache / "tool" / "tool").read_bytes() == newer["tool"]
+    finally:
+        convert.tools.clear()
+
+
+def test_a_client_is_told_the_failure_was_upstream(tmp_path, monkeypatch):
+    """502 with a reason, not a bare 500.
+
+    Unhandled, ToolIntegrityError surfaced as "Internal Server Error" -- which
+    leaked nothing, but also said nothing, and gave an operator no reason to
+    look at the registry. The failure is upstream and not the client's doing.
+    """
+    import main
+    from fastapi.testclient import TestClient
+
+    tampered = dict(GENUINE)
+    tampered["tool"] = b"TAMPERED"
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(convert, "client", _Registry(tampered, vouched=GENUINE))
+    convert.tools.clear()
+
+    workflow = json.dumps({
+        "nodes": [
+            {"id": "input-1", "type": "inputWorkflowNode", "data": {}},
+            {"id": "tool-1", "type": "workflowNode",
+             "data": {"label": "tool", "repo": "r", "paramValues": {}, "outputs": {}}},
+            {"id": "output-1", "type": "outputWorkflowNode", "data": {}},
+        ],
+        "edges": [
+            {"source": "input-1", "sourceHandle": "out",
+             "target": "tool-1", "targetHandle": "in"},
+            {"source": "tool-1", "sourceHandle": "out",
+             "target": "output-1", "targetHandle": "in"},
+        ],
+    })
+
+    try:
+        client = TestClient(main.app, raise_server_exceptions=False)
+        response = client.post(
+            "/convert", data={"biochef_workflow": workflow},
+            files=[("files", ("input-1-out", b"data", "application/octet-stream"))])
+
+        assert response.status_code == 502, response.status_code
+        assert "tool_integrity" in response.text
+        assert "does not match the manifest" in response.text
+        # Nothing local: the message is about the artifact, not this machine.
+        assert str(tmp_path) not in response.text
+        assert "Traceback" not in response.text
+    finally:
+        convert.tools.clear()
