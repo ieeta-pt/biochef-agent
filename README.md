@@ -90,12 +90,23 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_RUN_TIMEOUT` | `900` | seconds before a run's whole process group is killed |
 | `BIOCHEF_KEEP_WORKSPACE` | `false` | leave a run's directory behind, for debugging |
 | `BIOCHEF_MAX_UPLOAD_BYTES` | `536870912` | largest request body accepted, in bytes |
+| `BIOCHEF_AUTH` | `none` | who may call it: `none` or `bearer` |
+| `BIOCHEF_AUTH_TOKEN` | | the shared token, required when `BIOCHEF_AUTH=bearer` |
 | `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess` or `apptainer` |
 | `BIOCHEF_CONTAINER_IMAGE` | `docker://debian:stable-slim` | image each step runs in, under the `apptainer` runner |
 | `BIOCHEF_APPTAINER_CACHE` | `apptainer-cache` | where pulled container images are kept between runs |
 | `BIOCHEF_APPTAINER_ARGS` | `--contain` | extra flags for apptainer itself |
 
-Three of those decide how isolated a run is, and are worth reading twice before
+`BIOCHEF_AUTH` defaults to `none`, which means **any caller that can open a
+socket to this service can make it execute tool binaries**. That is a reasonable
+default on a laptop and the wrong one anywhere else. `bearer` requires
+`Authorization: Bearer <token>` matching `BIOCHEF_AUTH_TOKEN`; a shared secret is
+not identity -- every holder is the same caller -- but it is the difference
+between an open endpoint and a closed one. Selecting `bearer` without a token
+stops the service from starting rather than letting it run with a token nobody
+has to guess.
+
+Three more decide how isolated a run is, and are worth reading twice before
 changing.
 
 `BIOCHEF_RUNNER` defaults to `subprocess`, which runs every step **on the host,
@@ -141,15 +152,22 @@ run's data**. Emptying this variable turns that off deliberately.
 
 ## Before deploying this
 
-**It is not ready to be exposed.** There is no authentication of any kind, and
-several open issues describe defects reachable by anyone who can reach the port.
-The most significant are tracked in the issue tracker; read them before putting
-this anywhere a stranger can send it a request.
+**It is not ready to be exposed.** Several open issues describe defects reachable
+by anyone who can reach the port. The most significant are tracked in the issue
+tracker; read them before putting this anywhere a stranger can send it a request.
+
+Authentication now exists but is **off by default**. `BIOCHEF_AUTH=none` is the
+default, and it means what it says: any caller that can open a socket can make
+this service execute tool binaries. Setting `BIOCHEF_AUTH=bearer` closes that,
+and a deployment that does not is choosing to leave it open.
+
+Even set, a shared token is not identity — every holder is the same caller, and
+nothing yet decides what a given caller may run or read. That is F3 (Passports),
+and it does not exist.
 
 That matters more here than the sentence usually implies. The environments this
 is aimed at are the ones where it would do the most damage: an agent inside a
-TRE sits next to data that is there precisely because it may not leave. Deciding
-what a caller may run and read is C2 and F3, and neither exists yet.
+TRE sits next to data that is there precisely because it may not leave.
 
 Development is organised as numbered workstreams (A–G) in the issues: the
 converter and its intermediate model, asynchronous runs, authentication and
