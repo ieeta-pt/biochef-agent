@@ -142,7 +142,27 @@ Emptying this variable turns containment off, for an operator who needs the host
 /tmp visible and knows what that means.
 """
 
-_IMAGE_SHAPE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}\Z")
+_IMAGE_SHAPE = re.compile(r"\A[A-Za-z0-9/][A-Za-z0-9._:/@+-]{0,255}\Z")
+"""Characters a container reference may contain.
+
+The leading "/" is allowed so an absolute path to a local .sif can reach the
+second check below. Without it that branch was unreachable -- the shape test
+rejected every absolute path before the local-image rule ever ran.
+"""
+
+_IMAGE_SCHEMES = ("docker://", "oras://", "library://", "shub://",
+                  "http://", "https://")
+
+_LOCAL_IMAGE = re.compile(r"\A/[A-Za-z0-9._/+-]{1,255}\.(sif|simg)\Z")
+"""An image already on disk, named absolutely.
+
+Absolute on purpose. Snakemake decides what a container value means with
+is_local_file(url): anything without a scheme is a local FILE, and its path is
+resolved against the working directory -- which for us is the run's workspace,
+where the client's uploads are written. So a relative value does not merely fail,
+it quietly means "use a file out of the run directory as the container image".
+An operator typing `ubuntu` would get that rather than an error.
+"""
 
 
 def _image_literal(image: str) -> str:
@@ -157,6 +177,14 @@ def _image_literal(image: str) -> str:
     if not _IMAGE_SHAPE.match(image):
         raise ValueError(
             f"BIOCHEF_CONTAINER_IMAGE={image!r} is not a container reference"
+        )
+    if not (image.startswith(_IMAGE_SCHEMES) or _LOCAL_IMAGE.match(image)):
+        raise ValueError(
+            f"BIOCHEF_CONTAINER_IMAGE={image!r} has no scheme. Snakemake reads "
+            f"a value without one as a local image FILE, resolved against the "
+            f"run's own directory, so this would silently mean something other "
+            f"than what it looks like. Use one of "
+            f"{', '.join(_IMAGE_SCHEMES)} or an absolute path to a .sif."
         )
     return json.dumps(image)
 

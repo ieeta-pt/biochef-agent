@@ -200,8 +200,15 @@ jobs:
         # It is not enough to compare outputs. A container runner that quietly
         # fell back to the host would produce identical outputs and pass, and
         # that is precisely the failure worth catching. So the workflow also
-        # records which operating system each step ran on: the runner is ubuntu
-        # and the image is alpine, and the check FAILS if those match.
+        # records which operating system each step ran on -- the runner and the
+        # image must not agree -- whether another run's data on the host was
+        # readable, and whether a file placed in the workspace can be executed
+        # out of it, which is the only rule shape the emitter produces.
+        #
+        # The image is not named here on purpose: the check reads
+        # runner.CONTAINER_IMAGE, so changing the service default changes what
+        # is tested. This comment previously named alpine and went stale the
+        # moment the default moved.
         #
         # It also fails, rather than skipping, when apptainer is absent. A check
         # that cannot verify anything must not report success.

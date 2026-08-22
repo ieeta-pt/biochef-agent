@@ -236,8 +236,45 @@ def test_an_image_that_is_not_a_container_reference_is_refused(hostile):
         ApptainerRunner(image=hostile)
 
 
+@pytest.mark.parametrize("no_scheme", [
+    "debian:stable-slim",
+    "ubuntu",
+    "some.sif",
+    "biocontainers/samtools:1.19",
+])
+def test_an_image_with_no_scheme_is_refused(no_scheme):
+    """Because snakemake reads it as a local FILE, not as a registry reference.
+
+    deployment/singularity.py decides with is_local_file(url): anything without
+    a scheme is local, and its path is resolved against the working directory --
+    which for us is the run's own workspace, where the client's uploads are
+    written. So `BIOCHEF_CONTAINER_IMAGE=ubuntu` does not fail, it quietly means
+    "use a file out of the run directory as the container image".
+
+    An operator's typo should say so rather than becoming a different feature.
+    """
+    with pytest.raises(ValueError, match="no scheme"):
+        ApptainerRunner(image=no_scheme)
+
+
+@pytest.mark.parametrize("not_an_image", ["/etc/passwd", "/etc/shadow", "/tmp/x"])
+def test_an_absolute_path_that_is_not_an_image_is_refused(not_an_image):
+    """A local image is allowed, but it has to look like one.
+
+    Absolute paths are permitted so an operator can point at a .sif built ahead
+    of time -- which is the normal thing to do on an HPC system with no outbound
+    network -- but only with an image extension.
+    """
+    with pytest.raises(ValueError):
+        ApptainerRunner(image=not_an_image)
+
+
 @pytest.mark.parametrize("legitimate", [
     "docker://debian:stable-slim",
+    "oras://registry.biochef.app/image:1",
+    "library://user/collection/image:tag",
+    "/opt/images/samtools.sif",
+    "/opt/images/samtools.simg",
     "docker://biocontainers/samtools:1.19--h50ea8bc_0",
     "docker://ghcr.io/ieeta-pt/biochef@sha256:" + "a" * 64,
     "docker://quay.io/biocontainers/seqtk:1.4--he4a0461_2",

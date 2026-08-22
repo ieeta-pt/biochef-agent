@@ -85,16 +85,50 @@ Configuration is by environment variable, and `example.env` lists them:
 | `REGISTRY_PASSWORD` | | |
 | `REGISTRY_INSECURE` | `false` | allow a plain-HTTP registry |
 | `ORAS_AUTH_BACKEND` | `token` | ORAS authentication backend |
+| `BIOCHEF_TOOL_CACHE` | `tool-cache` | where pulled tool bundles are kept between runs |
+| `BIOCHEF_RUN_ROOT` | the system temp directory | where a run's private directory is created |
+| `BIOCHEF_RUN_TIMEOUT` | `900` | seconds before a run's whole process group is killed |
+| `BIOCHEF_KEEP_WORKSPACE` | `false` | leave a run's directory behind, for debugging |
+| `BIOCHEF_MAX_UPLOAD_BYTES` | `536870912` | largest request body accepted, in bytes |
+| `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess` or `apptainer` |
+| `BIOCHEF_CONTAINER_IMAGE` | `docker://debian:stable-slim` | image each step runs in, under the `apptainer` runner |
+| `BIOCHEF_APPTAINER_CACHE` | `apptainer-cache` | where pulled container images are kept between runs |
+| `BIOCHEF_APPTAINER_ARGS` | `--contain` | extra flags for apptainer itself |
+
+Three of those decide how isolated a run is, and are worth reading twice before
+changing.
+
+`BIOCHEF_RUNNER` defaults to `subprocess`, which runs every step **on the host,
+as the user this service runs as**. `apptainer` runs each step in a container
+instead. The container is the boundary between an untrusted tool binary and the
+machine, so on any deployment holding data that matters, `apptainer` is the
+setting you want.
+
+`BIOCHEF_CONTAINER_IMAGE` must carry a scheme — `docker://`, `oras://`,
+`library://`, `shub://`, `http://`, `https://` — or be an absolute path to a
+`.sif`. A value without one is not a registry reference to snakemake; it is a
+local image *file*, resolved against the run's own directory. The service
+refuses to start rather than let a typo mean that. The image also has to contain
+`bash`, because snakemake runs each rule as `bash -c` inside it.
+
+`BIOCHEF_APPTAINER_ARGS` defaults to `--contain` because apptainer otherwise
+binds the host's `/tmp` into the container, and that is where a run's directory
+lives unless `BIOCHEF_RUN_ROOT` says otherwise. Without it, a containerised tool
+is walled off from `/usr` and `/etc` while still able to read **every other
+run's data**. Emptying this variable turns that off deliberately.
 
 ## How a request is served
 
-1. Uploaded files are written into `tmp/`.
+1. A private directory is created for this run, and uploaded files are written
+   into it — only those the workflow declares as inputs.
 2. The workflow JSON is parsed, and each node's bundle is pulled from the
    registry and its binary copied in.
 3. A `Snakefile` is generated: one rule per node, with the node's inputs,
    outputs and command line.
-4. `snakemake` runs it.
+4. The configured runner executes it, bounded by `BIOCHEF_RUN_TIMEOUT`, and the
+   whole process group is killed if it overruns.
 5. Each declared output is read back and base64-encoded into the response.
+6. The run's directory is removed, whether it succeeded or not.
 
 ## Before deploying this
 
