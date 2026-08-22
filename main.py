@@ -11,6 +11,7 @@ import subprocess
 import base64
 
 from workspace import UnsafeName, check_name, make_workspace
+from auth import AuthenticationMiddleware, NoAuth, get_auth
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
 from runner import SubprocessRunner, get_runner
 
@@ -20,6 +21,18 @@ app = FastAPI()
 # before the handler is entered, so a limit enforced in /convert would be
 # refusing bytes that are already on disk (#11).
 app.add_middleware(BodySizeLimitMiddleware)
+
+AUTH = get_auth(os.getenv("BIOCHEF_AUTH", NoAuth.name))
+"""Who may ask this service to run something.
+
+Resolved at import so a deployment naming a provider it does not have, or asking
+for bearer without a token, fails to start rather than accepting work.
+"""
+
+# Added last, so it is OUTERMOST and runs before the body limit -- and therefore
+# before any of the body is accepted. An anonymous caller should not be able to
+# make this service buffer half a gigabyte before being told no (#10).
+app.add_middleware(AuthenticationMiddleware, provider=AUTH)
 
 
 @app.exception_handler(UnsafeName)
