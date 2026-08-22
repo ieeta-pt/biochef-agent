@@ -111,6 +111,15 @@ local image *file*, resolved against the run's own directory. The service
 refuses to start rather than let a typo mean that. The image also has to contain
 `bash`, because snakemake runs each rule as `bash -c` inside it.
 
+**Pin it by digest on anything long-lived.** The default is a moving tag, and
+snakemake caches a pulled image under the md5 of the *reference string* and
+skips the pull whenever that file already exists. So `docker://debian:stable-slim`
+is fetched once and then never revalidated: the tag moves, the cached image does
+not, and base-image security updates never arrive. A digest —
+`docker://debian@sha256:…` — makes the reference change when the image does,
+which is the only way that cache invalidates. Deleting `apptainer-cache/` forces
+a re-pull in the meantime.
+
 `BIOCHEF_APPTAINER_ARGS` defaults to `--contain` because apptainer otherwise
 binds the host's `/tmp` into the container, and that is where a run's directory
 lives unless `BIOCHEF_RUN_ROOT` says otherwise. Without it, a containerised tool

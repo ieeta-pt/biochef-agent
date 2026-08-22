@@ -68,6 +68,13 @@ class Runner:
         start_new_session puts the command and everything it spawns in one
         process group, and the timeout kills the GROUP. The pgid is captured
         before the first wait, because after the child is reaped getpgid raises.
+
+        That capture is belt and braces rather than strictly necessary:
+        start_new_session makes the child a group leader, so its pgid always
+        equals its pid. Replacing os.getpgid(process.pid) with process.pid is an
+        equivalent change and no test can tell them apart -- noted so the next
+        person does not spend time proving it, and kept because it says what is
+        meant rather than relying on that identity.
         """
         process = subprocess.Popen(
             self.command(ws),
@@ -81,7 +88,12 @@ class Runner:
         except subprocess.TimeoutExpired:
             os.killpg(pgid, signal.SIGKILL)
             out, err = process.communicate()
-            return RunResult(-signal.SIGKILL, out or "", err or "")
+            # The real code, not a constant. This used to return -SIGKILL
+            # literally, which reported the signal we meant to send rather than
+            # what happened -- so changing the signal, or the process dying some
+            # other way, still claimed SIGKILL. It also made the timeout test
+            # unable to tell the two apart.
+            return RunResult(process.returncode, out or "", err or "")
 
 
 class SubprocessRunner(Runner):

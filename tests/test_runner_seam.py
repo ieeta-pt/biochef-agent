@@ -14,6 +14,7 @@ right and the part whose absence is invisible until a tool is left running.
 import inspect
 import os
 import signal
+import time
 import sys
 import types
 from pathlib import Path
@@ -137,6 +138,95 @@ def test_no_provider_reimplements_the_kill(tmp_path):
     base = inspect.getsource(Runner.run)
     assert "os.killpg" in base
     assert "start_new_session=True" in base
+
+
+def test_the_configured_timeout_is_the_one_applied(monkeypatch, tmp_path):
+    """Not merely "eventually killed", and not measured by a stopwatch either.
+
+    A regression that doubled the timeout passed the whole suite: the existing
+    test waits generously enough that a later kill is still a pass. So a run
+    could outlive its configured bound by any factor and nothing would say so,
+    which for a service that exists partly to stop a hanging tool is the wrong
+    thing to be vague about.
+
+    My first attempt at this asserted on elapsed wall-clock, and a doubled
+    timeout slipped under the bound anyway -- any bound loose enough to survive
+    a loaded machine is loose enough to hide a factor of two. Recording what is
+    actually handed to communicate() is exact and cannot flake.
+    """
+    import runner as runner_module
+
+    seen = {}
+
+    class _FakePopen:
+        def __init__(self, argv, **kwargs):
+            self.pid = os.getpid()      # so os.getpgid() has something real
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            seen["timeout"] = timeout
+            return ("", "")
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", _FakePopen)
+    _SleepRunner().run(_Workspace(tmp_path), timeout_s=11)
+
+    assert seen["timeout"] == 11, (
+        f"the run was bounded at {seen['timeout']!r}, not the configured 11"
+    )
+
+
+class _FailingRunner(Runner):
+    """A provider whose command fails, as a broken workflow does."""
+
+    name = "failing-for-test"
+
+    def command(self, ws):
+        return ["sh", "-c", "echo to-stderr >&2; exit 3"]
+
+
+def test_a_failing_run_reports_its_failure(tmp_path):
+    """Forcing the success path to return 0 passed the entire suite.
+
+    Nothing exercised a run that fails through a real runner -- the tests that
+    cover failure replace run_snakemake wholesale -- so a runner that reported
+    every run as successful would have been caught by nothing. The handler
+    turns a non-zero code into a 500; reporting 0 for a failed workflow would
+    have it collect outputs that were never produced.
+    """
+    result = _FailingRunner().run(_Workspace(tmp_path), timeout_s=30)
+
+    assert result.returncode == 3, result
+    assert "to-stderr" in result.stderr
+
+
+def test_the_service_runs_through_the_runner_it_resolved(monkeypatch, tmp_path):
+    """The wiring, and the mutation that survived everything else.
+
+    Replacing main's `RUNNER.run(...)` with `SubprocessRunner().run(...)` --
+    i.e. the service quietly ignoring BIOCHEF_RUNNER and executing every step on
+    the host regardless of configuration -- passed the whole suite. Asserting
+    that main.RUNNER is the right object says nothing about whether it is used.
+    """
+    used = {}
+
+    class _Recording(Runner):
+        name = "recording"
+
+        def command(self, ws):
+            return ["true"]
+
+        def run(self, ws, timeout_s):
+            used["ws"] = ws
+            used["timeout_s"] = timeout_s
+            return RunResult(0, "", "")
+
+    monkeypatch.setattr(main, "RUNNER", _Recording())
+    ws = _Workspace(tmp_path)
+    result = main.run_snakemake(ws, timeout_s=7)
+
+    assert used.get("ws") is ws, "the configured runner was not the one used"
+    assert used.get("timeout_s") == 7
+    assert result.returncode == 0
 
 
 def test_the_command_is_the_only_thing_a_provider_must_supply():
