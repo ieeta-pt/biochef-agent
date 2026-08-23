@@ -1,5 +1,6 @@
 from convert import *
 import asyncio
+import weakref
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
@@ -233,7 +234,35 @@ Runs beyond the limit wait in QUEUED, which is what that state is for -- WES
 means "accepted, not yet started" by it, and a client polling sees exactly that.
 """
 
-_slots = asyncio.Semaphore(MAX_CONCURRENT_RUNS)
+_slots_by_loop = weakref.WeakKeyDictionary()
+
+
+def _slots():
+    """The semaphore for whichever event loop is running.
+
+    Not one module-level Semaphore. asyncio locks bind themselves to a loop the
+    first time a waiter is created -- so a single shared one works until it is
+    contended, and from then on any use from a different loop raises
+    "is bound to a different event loop".
+
+      loop 1 with contention: ok
+      loop 2 with contention: RuntimeError: <Semaphore [locked]> is bound to a
+                              different event loop
+
+    A server runs one loop, so this would not have bitten in production. It
+    would have bitten in tests, which build a fresh loop per TestClient -- and
+    only did not because the test that forces contention substitutes its own
+    semaphore. A bound that breaks the moment someone tests it properly is not
+    much of a bound.
+
+    Weakly keyed, so a finished loop takes its semaphore with it.
+    """
+    loop = asyncio.get_running_loop()
+    semaphore = _slots_by_loop.get(loop)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_RUNS)
+        _slots_by_loop[loop] = semaphore
+    return semaphore
 
 _running = set()
 """Strong references to the tasks in flight.
@@ -269,7 +298,7 @@ async def _execute(run_id: str, biochef_workflow: str, uploads):
         # Waits here while the service is busy, and the run stays QUEUED until a
         # slot frees. Acquiring before anything else means a queued run has not
         # yet made a workspace or pulled a tool.
-        async with _slots:
+        async with _slots():
             results = await run_in_threadpool(
                 perform_run, biochef_workflow, uploads, progress)
     except HTTPException as refusal:

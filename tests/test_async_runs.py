@@ -405,10 +405,14 @@ def test_execution_is_bounded_and_the_rest_wait_in_QUEUED(service, monkeypatch):
     submissions became up to forty snakemake processes at once. Runs beyond the
     limit wait in QUEUED, which is precisely what WES means by it.
     """
-    import asyncio as _asyncio
     import threading
 
-    monkeypatch.setattr(main, "_slots", _asyncio.Semaphore(2))
+    # The limit itself, not a substituted semaphore. Patching in a fresh one
+    # was how the loop-binding defect stayed hidden: the module-level semaphore
+    # was never contended in a test, so it was never bound, so nothing noticed
+    # that a second loop could not use it.
+    monkeypatch.setattr(main, "MAX_CONCURRENT_RUNS", 2)
+    main._slots_by_loop.clear()
 
     live = {"now": 0, "peak": 0}
     lock = threading.Lock()
@@ -453,3 +457,30 @@ def test_the_default_limit_is_well_below_the_threadpool_size():
         f"{main.MAX_CONCURRENT_RUNS} concurrent runs is not a meaningful bound "
         f"against a threadpool of 40; each run is a real snakemake process"
     )
+
+
+def test_the_bound_survives_a_second_event_loop(service):
+    """Each TestClient builds its own loop, and a server may be restarted.
+
+    asyncio locks bind to a loop once contended. A single module-level
+    semaphore therefore worked exactly until something waited on it, and then
+    refused every later loop. Two contended runs in two loops is the smallest
+    thing that shows it.
+    """
+    import threading
+
+    monkeypatch_free_limit = 1
+    main.MAX_CONCURRENT_RUNS = monkeypatch_free_limit
+    main._slots_by_loop.clear()
+
+    from fastapi.testclient import TestClient
+
+    try:
+        for _ in range(2):                        # two separate event loops
+            with TestClient(main.app) as client:
+                run_ids = [_submit(client).json()["run_id"] for _ in range(3)]
+                states = [_poll(client, r)["state"] for r in run_ids]
+            assert states == [RunState.COMPLETE.value] * 3, states
+    finally:
+        main.MAX_CONCURRENT_RUNS = 4
+        main._slots_by_loop.clear()
