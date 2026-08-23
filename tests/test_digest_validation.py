@@ -105,10 +105,22 @@ def test_the_verification_happens_before_the_bundle_is_promoted():
     Verifying after os.replace would leave a window in which a tampered bundle
     is the cached one, and the cache is what every later run copies from.
     """
-    source = inspect.getsource(convert.fetch_tool)
+    # _fetch_tool_once, not fetch_tool: the latter is now a thin retry wrapper
+    # around it, for a cross-process race in the shared cache.
+    source = inspect.getsource(convert._fetch_tool_once)
+    promote = inspect.getsource(convert._promote)
+
     assert "verify_against_manifest" in source
-    assert source.index("verify_against_manifest") < source.index("os.replace"), (
-        "the check must run while the pull is still staged in .part"
+    # The CALL, not the string. Asserting on "os.replace" matched a comment
+    # explaining the promote, which is the second time in this suite that a
+    # check has been fooled by prose sitting next to the code it describes.
+    assert "os.replace(staging, outdir)" not in source, (
+        "the promote moved into _promote; this test must follow it"
+    )
+    assert "os.replace(staging, outdir)" in promote
+    assert source.index("verify_against_manifest") < source.index("_promote("), (
+        "the check must run while the pull is still staged, before anything is "
+        "put in place"
     )
 
 
