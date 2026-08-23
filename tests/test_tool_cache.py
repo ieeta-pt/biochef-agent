@@ -132,11 +132,15 @@ def test_a_bundle_is_pulled_into_the_cache_and_staged_first(registry, tmp_path):
     assert bundle["bin"] == "tool"
     assert len(registry.pulls) == 1
     target, outdir = registry.pulls[0]
-    assert outdir.endswith(".part"), "the pull must be staged, not written in place"
-
     cache = Path(convert.TOOL_CACHE) / "tool"
+
+    assert ".part." in outdir, "the pull must be staged, not written in place"
+    assert outdir != str(cache) + ".part", (
+        "the staging name must be unique per attempt -- a fixed one is shared "
+        "between concurrent runs, which is what let them delete each other's work"
+    )
     assert (cache / "bundle.json").exists(), "the staged directory was not moved into place"
-    assert not Path(str(cache) + ".part").exists(), "the staging directory was left behind"
+    assert not list(cache.parent.glob("tool.part*")), "a staging directory was left behind"
 
 
 def test_a_second_node_does_not_pull_again(registry):
@@ -148,10 +152,19 @@ def test_a_second_node_does_not_pull_again(registry):
 
 def test_a_leftover_staging_directory_from_an_interrupted_pull_is_discarded(
         registry, tmp_path):
-    """The reason for rmtree before makedirs.
+    """A previous run killed mid-pull leaves a staging directory behind.
 
-    A previous run killed mid-pull leaves a .part behind; reusing it would mix
-    two pulls together.
+    It must never be reused, because mixing two pulls together would produce a
+    bundle that matches no manifest -- or worse, one that does.
+
+    The mechanism changed: this used to be an rmtree before makedirs of a fixed
+    ".part" name, and that fixed name was exactly what let concurrent runs
+    delete each other's work. Staging names are now unique per attempt, so a
+    leftover is not reused because nothing ever looks at it again. The property
+    is the same; the reason is not.
+
+    A hard kill can still leave one on disk. Nothing reads it, and the next
+    attempt neither reuses nor trips over it.
     """
     staging = Path(convert.TOOL_CACHE) / "tool.part"
     staging.mkdir(parents=True)
@@ -162,6 +175,30 @@ def test_a_leftover_staging_directory_from_an_interrupted_pull_is_discarded(
     cache = Path(convert.TOOL_CACHE) / "tool"
     assert (cache / "bundle.json").exists()
     assert not (cache / "stale-file").exists(), "content from the interrupted pull survived"
+
+
+def test_a_failed_pull_takes_its_staging_directory_with_it(registry, tmp_path):
+    """A refused bundle must not be left where anything could find it.
+
+    The promote is what makes a pull visible, so an unverified one is only ever
+    in staging -- but staging is beside the cache, and leaving it there would
+    mean bytes nobody vouched for sitting next to bytes that were vouched for,
+    waiting for someone to write the wrong glob.
+    """
+    def failing_pull(target, outdir):
+        os.makedirs(outdir, exist_ok=True)
+        with open(os.path.join(outdir, "half-written"), "w") as handle:
+            handle.write("interrupted")
+        raise RuntimeError("the registry went away")
+
+    registry.pull = failing_pull
+
+    with pytest.raises(RuntimeError):
+        convert.fetch_tool("tool-1", "some/repo")
+
+    cache_root = Path(convert.TOOL_CACHE)
+    leftovers = list(cache_root.glob("tool.part*")) if cache_root.exists() else []
+    assert not leftovers, f"staging survived a failed pull: {leftovers}"
 
 
 def test_a_cached_bundle_on_disk_is_not_pulled_again(registry, tmp_path):

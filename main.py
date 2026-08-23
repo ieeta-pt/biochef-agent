@@ -221,6 +221,31 @@ async def convert(
     return await run_in_threadpool(perform_run, biochef_workflow, uploads)
 
 
+MAX_CONCURRENT_RUNS = int(os.getenv("BIOCHEF_MAX_CONCURRENT_RUNS", "4"))
+"""How many runs may execute at once.
+
+Without a bound, a burst of submissions became a burst of snakemake processes:
+anyio's default thread limiter is 40, so forty tools could be running at once on
+a machine sized for rather fewer, each with its own workspace on the same disk.
+Accepting work is cheap; doing it is not, and the two need separating.
+
+Runs beyond the limit wait in QUEUED, which is what that state is for -- WES
+means "accepted, not yet started" by it, and a client polling sees exactly that.
+"""
+
+_slots = asyncio.Semaphore(MAX_CONCURRENT_RUNS)
+
+_running = set()
+"""Strong references to the tasks in flight.
+
+asyncio.create_task returns a task the caller is expected to keep. The event
+loop holds only a WEAK reference, so a task nobody else refers to can be
+garbage collected part-way through -- documented CPython behaviour, and a
+particularly unpleasant one here, because the run would simply stop, stay
+non-terminal, and be polled forever by a client waiting for an answer that is
+never coming.
+"""
+
 RUNS = RunStore()
 """Runs this process is aware of.
 
@@ -241,8 +266,12 @@ async def _execute(run_id: str, biochef_workflow: str, uploads):
         _advance(run_id, state)
 
     try:
-        results = await run_in_threadpool(
-            perform_run, biochef_workflow, uploads, progress)
+        # Waits here while the service is busy, and the run stays QUEUED until a
+        # slot frees. Acquiring before anything else means a queued run has not
+        # yet made a workspace or pulled a tool.
+        async with _slots:
+            results = await run_in_threadpool(
+                perform_run, biochef_workflow, uploads, progress)
     except HTTPException as refusal:
         # The run failed for a reason attributable to what was submitted or to
         # the tools it named -- a bad workflow, a missing input, a tool exiting
@@ -284,7 +313,11 @@ async def submit_run(
     """
     uploads = [(f.filename, await f.read()) for f in files]
     run = RUNS.create()
-    asyncio.create_task(_execute(run.run_id, biochef_workflow, uploads))
+    task = asyncio.create_task(_execute(run.run_id, biochef_workflow, uploads))
+    # Held until it finishes, then dropped. See _running above: without this the
+    # task can be collected mid-run and the run never reaches a terminal state.
+    _running.add(task)
+    task.add_done_callback(_running.discard)
     return run.as_dict()
 
 

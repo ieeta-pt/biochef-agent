@@ -352,3 +352,104 @@ def test_the_document_describes_both_ways_of_running_a_workflow():
     assert "post" in document["paths"]["/convert"]
     assert "post" in document["paths"]["/runs"]
     assert "get" in document["paths"]["/runs/{run_id}"]
+
+
+# --------------------------------------------------------------------------
+# what happens when more than one run is asked for at once
+
+
+def test_many_runs_submitted_at_once_all_succeed(service):
+    """Concurrency is the point of this endpoint, so it has to survive it.
+
+    Twenty simultaneous submissions used to leave one COMPLETE and nineteen
+    SYSTEM_ERROR: every run pulled the same tool into the same fixed .part
+    directory, and they deleted each other's work --
+
+      [Errno 17] File exists: .../cache/tool.part
+      [Errno  2] No such file or directory: .../cache/tool.part
+
+    The race predates this endpoint -- two concurrent /convert calls could
+    always hit it -- but nothing made it easy to reach until runs could be
+    submitted without waiting.
+    """
+    from fastapi.testclient import TestClient
+
+    with TestClient(main.app) as client:
+        run_ids = [_submit(client).json()["run_id"] for _ in range(20)]
+        states = [_poll(client, run_id)["state"] for run_id in run_ids]
+
+    assert states == [RunState.COMPLETE.value] * 20, {
+        state: states.count(state) for state in set(states)
+    }
+
+
+def test_a_background_task_is_referenced_until_it_finishes():
+    """asyncio.create_task returns a task the caller must keep.
+
+    The event loop holds only a WEAK reference, so a task nobody refers to can
+    be collected part-way through. Here that would stop the run, leave it
+    non-terminal, and have a client poll forever for an answer that is never
+    coming.
+    """
+    source = inspect.getsource(main.submit_run)
+    assert "_running.add(task)" in source
+    assert "add_done_callback" in source, (
+        "held forever is a leak; it has to be dropped when the task finishes"
+    )
+
+
+def test_execution_is_bounded_and_the_rest_wait_in_QUEUED(service, monkeypatch):
+    """Accepting work is cheap; doing it is not.
+
+    anyio's default thread limiter is 40, so without a bound a burst of
+    submissions became up to forty snakemake processes at once. Runs beyond the
+    limit wait in QUEUED, which is precisely what WES means by it.
+    """
+    import asyncio as _asyncio
+    import threading
+
+    monkeypatch.setattr(main, "_slots", _asyncio.Semaphore(2))
+
+    live = {"now": 0, "peak": 0}
+    lock = threading.Lock()
+
+    def slow(ws, timeout_s=None):
+        import os
+        with lock:
+            live["now"] += 1
+            live["peak"] = max(live["peak"], live["now"])
+        time.sleep(0.25)
+        with lock:
+            live["now"] -= 1
+        with open(os.path.join(ws.path, "tool-1-out"), "wb") as f:
+            f.write(b"the output")
+        return 0, "", ""
+
+    monkeypatch.setattr(main, "run_snakemake", slow)
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(main.app) as client:
+        run_ids = [_submit(client).json()["run_id"] for _ in range(8)]
+        states = [_poll(client, run_id)["state"] for run_id in run_ids]
+
+    assert states == [RunState.COMPLETE.value] * 8
+    assert live["peak"] <= 2, (
+        f"{live['peak']} runs executed at once against a limit of 2"
+    )
+
+
+def test_the_default_limit_is_well_below_the_threadpool_size():
+    """The bound only means something if it is lower than what it bounds.
+
+    run_in_threadpool draws on anyio's default limiter, which is 40. A limit set
+    at or above that would be no limit at all, and the burst it exists to
+    prevent would go through untouched.
+    """
+    import anyio.to_thread
+
+    assert main.MAX_CONCURRENT_RUNS >= 1
+    assert main.MAX_CONCURRENT_RUNS <= 16, (
+        f"{main.MAX_CONCURRENT_RUNS} concurrent runs is not a meaningful bound "
+        f"against a threadpool of 40; each run is a real snakemake process"
+    )

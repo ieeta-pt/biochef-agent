@@ -5,6 +5,8 @@ import oras.client
 import os
 import shutil
 import stat
+import threading
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -97,6 +99,31 @@ copy in whichever workspace needs it.
 """
 
 tools = {}
+
+_fetch_locks = {}
+_fetch_locks_guard = threading.Lock()
+
+
+def _fetch_lock(tool_id):
+    """One lock per tool, so two runs never pull the same one at once.
+
+    Without this, concurrent runs raced on the shared staging directory and
+    destroyed each other's work: both would rmtree it, both makedirs it, and
+    then one would os.replace a directory the other had already moved. Measured
+    with twenty simultaneous submissions, nineteen failed --
+
+      [Errno 17] File exists: .../cache/tool.part
+      [Errno  2] No such file or directory: .../cache/tool.part
+
+    -- and the one that survived did so by being first. The race predates
+    asynchronous runs, since two concurrent /convert calls could always hit it,
+    but nothing made concurrency easy to reach until now.
+
+    Per tool rather than one global lock: two different tools have no reason to
+    wait for each other, and a pull can be slow.
+    """
+    with _fetch_locks_guard:
+        return _fetch_locks.setdefault(tool_id, threading.Lock())
 
 
 class ToolIntegrityError(Exception):
@@ -243,23 +270,33 @@ def fetch_tool(tool_id, repo):
     #
     # The cost is a manifest fetch and a local re-hash per tool per request. The
     # blobs are not downloaded again.
-    if not cache_matches(outdir, manifest, target):
-        # Staged, then moved into place, so an interrupted pull cannot leave a
-        # half-written bundle that the next run would read as complete.
-        staging = outdir + ".part"
-        shutil.rmtree(staging, ignore_errors=True)
-        os.makedirs(staging, exist_ok=True)
-        client.pull(target=target, outdir=staging)
-        # Before the staged directory becomes the cached one, and so before
-        # anything in it can be copied into a run. A bundle that does not match
-        # is left in .part and removed, never promoted.
-        try:
-            verify_against_manifest(target, staging, manifest=manifest)
-        except Exception:
-            shutil.rmtree(staging, ignore_errors=True)
-            raise
-        shutil.rmtree(outdir, ignore_errors=True)
-        os.replace(staging, outdir)
+    with _fetch_lock(tool_id):
+        # Re-checked inside the lock. Another run may have pulled this very
+        # tool while this one waited, in which case there is nothing to do --
+        # and pulling again would be both wasteful and another chance to race.
+        if not cache_matches(outdir, manifest, target):
+            # Staged, then moved into place, so an interrupted pull cannot leave
+            # a half-written bundle that the next run would read as complete.
+            #
+            # The staging name is unique per attempt. A fixed ".part" was shared
+            # between concurrent runs, which is what let them delete each
+            # other's work; the lock alone would fix that for this process, but
+            # a unique name also survives a second process sharing the cache
+            # directory, which is a supported deployment.
+            staging = f"{outdir}.part.{uuid.uuid4().hex}"
+            os.makedirs(staging, exist_ok=True)
+            try:
+                client.pull(target=target, outdir=staging)
+                # Before the staged directory becomes the cached one, and so
+                # before anything in it can be copied into a run. A bundle that
+                # does not match is removed, never promoted.
+                verify_against_manifest(target, staging, manifest=manifest)
+                shutil.rmtree(outdir, ignore_errors=True)
+                os.replace(staging, outdir)
+            finally:
+                # Whatever happened, this attempt's directory does not outlive
+                # it. os.replace moved it on success, so this is a no-op then.
+                shutil.rmtree(staging, ignore_errors=True)
 
     with open(os.path.join(outdir, "bundle.json"), "r") as f:
         bundle = json.load(f)
