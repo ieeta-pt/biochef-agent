@@ -1,4 +1,6 @@
 from convert import *
+import asyncio
+import weakref
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
@@ -12,6 +14,7 @@ import base64
 
 from workspace import UnsafeName, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
+from runs import IllegalTransition, RunState, RunStore, UnknownRun
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
 from runner import SubprocessRunner, get_runner
 
@@ -87,14 +90,26 @@ class BiochefWorkflow(BaseModel):
     edges: list
 
 
-@app.post("/convert")
-async def convert(
-    biochef_workflow: str = Form(...),
-    files: List[UploadFile] = File(...)
-):
+def perform_run(biochef_workflow: str, uploads, progress=None):
+    """One run, start to finish, given the uploads already read.
+
+    Split out of the handler so the synchronous endpoint and the asynchronous one
+    execute the same code rather than two copies that drift. The uploads arrive
+    as (name, bytes) because the asynchronous path has to read them while the
+    request is still open -- by the time the work runs, there is no request left
+    to read them from.
+
+    Synchronous on purpose: every step here blocks, and both callers hand it to a
+    worker thread. `progress` is called with each RunState as it is entered, and
+    is None for the synchronous path, which has nowhere to report it.
+    """
+    def report(state):
+        if progress is not None:
+            progress(state)
+
+    report(RunState.INITIALIZING)
     ws = make_workspace(RUN_ROOT)
     try:
-        # Parse workflow
         workflow_dict = json.loads(biochef_workflow)
         workflow = parse_biochef_workflow(workflow_dict)
 
@@ -116,8 +131,8 @@ async def convert(
         # output does not exist yet.
         expected = expected_uploads(workflow)
         seen = set()
-        for f in files:
-            name = check_name(f.filename)
+        for filename, content in uploads:
+            name = check_name(filename)
             if name not in expected:
                 raise HTTPException(
                     status_code=400,
@@ -125,7 +140,7 @@ async def convert(
                            f"it expects {sorted(expected)}",
                 )
             try:
-                ws.write_bytes(name, await f.read())
+                ws.write_bytes(name, content)
             except FileExistsError:
                 raise HTTPException(
                     status_code=400,
@@ -140,7 +155,6 @@ async def convert(
                 detail=f"missing inputs: {sorted(expected - seen)}",
             )
 
-        # Convert workflow to Snakemake and run
         # The runner may need lines of its own at the top -- a container
         # directive, for the provider that runs each step in one. Asking the
         # runner keeps the emitter from having to know how the workflow will be
@@ -159,9 +173,8 @@ async def convert(
                 detail="an upload occupies a name this run needs: 'Snakefile'",
             )
 
-        # Off the event loop: communicate() blocks, and running it inline would
-        # mean the service never has two runs in flight to keep apart.
-        code, _out, err = await run_in_threadpool(run_snakemake, ws)
+        report(RunState.RUNNING)
+        code, _out, err = run_snakemake(ws)
         if code != 0:
             raise HTTPException(
                 status_code=500,
@@ -193,3 +206,158 @@ async def convert(
         # not.
         if not KEEP_WORKSPACE:
             ws.cleanup()
+
+
+@app.post("/convert")
+async def convert(
+    biochef_workflow: str = Form(...),
+    files: List[UploadFile] = File(...)
+):
+    """Unchanged: the whole run happens inside this request.
+
+    Kept as it was because it is the contract the editor speaks today. /runs is
+    the same work without the wait.
+    """
+    uploads = [(f.filename, await f.read()) for f in files]
+    return await run_in_threadpool(perform_run, biochef_workflow, uploads)
+
+
+MAX_CONCURRENT_RUNS = int(os.getenv("BIOCHEF_MAX_CONCURRENT_RUNS", "4"))
+"""How many runs may execute at once.
+
+Without a bound, a burst of submissions became a burst of snakemake processes:
+anyio's default thread limiter is 40, so forty tools could be running at once on
+a machine sized for rather fewer, each with its own workspace on the same disk.
+Accepting work is cheap; doing it is not, and the two need separating.
+
+Runs beyond the limit wait in QUEUED, which is what that state is for -- WES
+means "accepted, not yet started" by it, and a client polling sees exactly that.
+"""
+
+_slots_by_loop = weakref.WeakKeyDictionary()
+
+
+def _slots():
+    """The semaphore for whichever event loop is running.
+
+    Not one module-level Semaphore. asyncio locks bind themselves to a loop the
+    first time a waiter is created -- so a single shared one works until it is
+    contended, and from then on any use from a different loop raises
+    "is bound to a different event loop".
+
+      loop 1 with contention: ok
+      loop 2 with contention: RuntimeError: <Semaphore [locked]> is bound to a
+                              different event loop
+
+    A server runs one loop, so this would not have bitten in production. It
+    would have bitten in tests, which build a fresh loop per TestClient -- and
+    only did not because the test that forces contention substitutes its own
+    semaphore. A bound that breaks the moment someone tests it properly is not
+    much of a bound.
+
+    Weakly keyed, so a finished loop takes its semaphore with it.
+    """
+    loop = asyncio.get_running_loop()
+    semaphore = _slots_by_loop.get(loop)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_RUNS)
+        _slots_by_loop[loop] = semaphore
+    return semaphore
+
+_running = set()
+"""Strong references to the tasks in flight.
+
+asyncio.create_task returns a task the caller is expected to keep. The event
+loop holds only a WEAK reference, so a task nobody else refers to can be
+garbage collected part-way through -- documented CPython behaviour, and a
+particularly unpleasant one here, because the run would simply stop, stay
+non-terminal, and be polled forever by a client waiting for an answer that is
+never coming.
+"""
+
+RUNS = RunStore()
+"""Runs this process is aware of.
+
+In memory, so nothing survives a restart and nothing is shared between replicas.
+Both are real limits rather than oversights, and both are why a persistent store
+is its own piece of work.
+"""
+
+
+async def _execute(run_id: str, biochef_workflow: str, uploads):
+    """Do the run, and record how it ended.
+
+    Every path out of here reaches a terminal state. A run stuck in RUNNING
+    because something raised on the way to recording a failure would be worse
+    than a run that failed: a client polling it would wait forever.
+    """
+    def progress(state):
+        _advance(run_id, state)
+
+    try:
+        # Waits here while the service is busy, and the run stays QUEUED until a
+        # slot frees. Acquiring before anything else means a queued run has not
+        # yet made a workspace or pulled a tool.
+        async with _slots():
+            results = await run_in_threadpool(
+                perform_run, biochef_workflow, uploads, progress)
+    except HTTPException as refusal:
+        # The run failed for a reason attributable to what was submitted or to
+        # the tools it named -- a bad workflow, a missing input, a tool exiting
+        # non-zero. WES calls that EXECUTOR_ERROR.
+        _advance(run_id, RunState.EXECUTOR_ERROR, error=refusal.detail)
+    except Exception as failure:                     # noqa: BLE001
+        # Anything else is us, not the submission. SYSTEM_ERROR says so rather
+        # than blaming the workflow for a defect in this service.
+        _advance(run_id, RunState.SYSTEM_ERROR,
+                 error={"error": "system_error", "message": str(failure)})
+    else:
+        _advance(run_id, RunState.COMPLETE, outputs=results)
+
+
+def _advance(run_id, state, **detail):
+    """Record a transition, tolerating one that is no longer legal.
+
+    A run may have reached a terminal state already -- cancelled, once #7
+    exists -- and the worker will not know. Refusing loudly inside a background
+    task would only raise into nowhere.
+    """
+    try:
+        RUNS.advance(run_id, state, **detail)
+    except (IllegalTransition, UnknownRun):
+        pass
+
+
+@app.post("/runs", status_code=202)
+async def submit_run(
+    biochef_workflow: str = Form(...),
+    files: List[UploadFile] = File(...)
+):
+    """Accept a workflow and answer immediately with something to poll.
+
+    The uploads are read here, while the request is still open. By the time the
+    work runs there is no request left to read them from -- which is the whole
+    difference between this and /convert, and the reason it cannot simply call
+    the same handler in the background.
+    """
+    uploads = [(f.filename, await f.read()) for f in files]
+    run = RUNS.create()
+    task = asyncio.create_task(_execute(run.run_id, biochef_workflow, uploads))
+    # Held until it finishes, then dropped. See _running above: without this the
+    # task can be collected mid-run and the run never reaches a terminal state.
+    _running.add(task)
+    task.add_done_callback(_running.discard)
+    return run.as_dict()
+
+
+@app.get("/runs/{run_id}")
+async def get_run(run_id: str):
+    """Where a run has got to, and its outputs once it is COMPLETE."""
+    try:
+        return RUNS.get(run_id).as_dict()
+    except UnknownRun:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no run {run_id!r}; it never existed, or it finished long "
+                   f"enough ago to have been forgotten",
+        )

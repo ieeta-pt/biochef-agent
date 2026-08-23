@@ -1,10 +1,14 @@
 from fastapi import FastAPI
+import errno
 import hashlib
 import json
 import oras.client
 import os
 import shutil
 import stat
+import threading
+import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -97,6 +101,31 @@ copy in whichever workspace needs it.
 """
 
 tools = {}
+
+_fetch_locks = {}
+_fetch_locks_guard = threading.Lock()
+
+
+def _fetch_lock(tool_id):
+    """One lock per tool, so two runs never pull the same one at once.
+
+    Without this, concurrent runs raced on the shared staging directory and
+    destroyed each other's work: both would rmtree it, both makedirs it, and
+    then one would os.replace a directory the other had already moved. Measured
+    with twenty simultaneous submissions, nineteen failed --
+
+      [Errno 17] File exists: .../cache/tool.part
+      [Errno  2] No such file or directory: .../cache/tool.part
+
+    -- and the one that survived did so by being first. The race predates
+    asynchronous runs, since two concurrent /convert calls could always hit it,
+    but nothing made concurrency easy to reach until now.
+
+    Per tool rather than one global lock: two different tools have no reason to
+    wait for each other, and a pull can be slow.
+    """
+    with _fetch_locks_guard:
+        return _fetch_locks.setdefault(tool_id, threading.Lock())
 
 
 class ToolIntegrityError(Exception):
@@ -214,7 +243,34 @@ def verify_against_manifest(target, staging, manifest=None):
             )
 
 
-def fetch_tool(tool_id, repo):
+def fetch_tool(tool_id, repo, attempts=4):
+    """Pull a bundle into the shared cache and return it.
+
+    Retried, because the cache is shared between processes and the promote is
+    not atomic across them. Another process replacing this tool deletes the
+    cached directory a moment before putting the new one in its place, and a
+    reader arriving in that window finds nothing -- reproduced with six
+    processes on one cold cache as
+
+      FileNotFoundError: .../shared-cache/tool/bundle.json
+
+    The per-tool lock covers threads in this process; nothing covers processes,
+    and a directory cannot be swapped atomically on POSIX. The state is
+    self-healing -- whatever the other process was putting there arrives a
+    moment later, verified -- so looking again is the honest answer. Doing it
+    properly means an indirection that CAN be swapped atomically, which is a
+    change of on-disk layout and its own piece of work.
+    """
+    for remaining in range(attempts - 1, -1, -1):
+        try:
+            return _fetch_tool_once(tool_id, repo)
+        except (FileNotFoundError, NotADirectoryError):
+            if remaining == 0:
+                raise
+            time.sleep(0.05)
+
+
+def _fetch_tool_once(tool_id, repo):
     """Pull a bundle into the shared cache and return it.
 
     The signature is unchanged on purpose: parse_biochef_workflow calls this,
@@ -243,29 +299,98 @@ def fetch_tool(tool_id, repo):
     #
     # The cost is a manifest fetch and a local re-hash per tool per request. The
     # blobs are not downloaded again.
-    if not cache_matches(outdir, manifest, target):
-        # Staged, then moved into place, so an interrupted pull cannot leave a
-        # half-written bundle that the next run would read as complete.
-        staging = outdir + ".part"
-        shutil.rmtree(staging, ignore_errors=True)
-        os.makedirs(staging, exist_ok=True)
-        client.pull(target=target, outdir=staging)
-        # Before the staged directory becomes the cached one, and so before
-        # anything in it can be copied into a run. A bundle that does not match
-        # is left in .part and removed, never promoted.
-        try:
-            verify_against_manifest(target, staging, manifest=manifest)
-        except Exception:
-            shutil.rmtree(staging, ignore_errors=True)
-            raise
-        shutil.rmtree(outdir, ignore_errors=True)
-        os.replace(staging, outdir)
+    with _fetch_lock(tool_id):
+        # Re-checked inside the lock. Another run may have pulled this very
+        # tool while this one waited, in which case there is nothing to do --
+        # and pulling again would be both wasteful and another chance to race.
+        if not cache_matches(outdir, manifest, target):
+            # Staged, then moved into place, so an interrupted pull cannot leave
+            # a half-written bundle that the next run would read as complete.
+            #
+            # The staging name is unique per attempt. A fixed ".part" was
+            # shared between concurrent runs, which is what let them delete
+            # each other's work.
+            #
+            # An earlier version of this comment claimed the unique name also
+            # made a second PROCESS sharing the cache safe. It does not, and
+            # saying so was worse than saying nothing, because it told the next
+            # reader not to look. _fetch_lock is a threading.Lock and reaches
+            # only this process; the promote below is two syscalls and is not
+            # atomic across processes. Both halves of that are handled where
+            # they happen -- _promote tolerates losing the race, and fetch_tool
+            # retries a read that lands in the gap -- but neither is the same as
+            # being atomic, and a shared cache between replicas is eventually
+            # consistent rather than safe by construction.
+            staging = f"{outdir}.part.{uuid.uuid4().hex}"
+            os.makedirs(staging, exist_ok=True)
+            try:
+                client.pull(target=target, outdir=staging)
+                # Before the staged directory becomes the cached one, and so
+                # before anything in it can be copied into a run. A bundle that
+                # does not match is removed, never promoted.
+                verify_against_manifest(target, staging, manifest=manifest)
+                _promote(staging, outdir, manifest, target)
+            finally:
+                # Whatever happened, this attempt's directory does not outlive
+                # it. os.replace moved it on success, so this is a no-op then.
+                shutil.rmtree(staging, ignore_errors=True)
 
-    with open(os.path.join(outdir, "bundle.json"), "r") as f:
-        bundle = json.load(f)
+        # Read while the lock is still held. The promote deletes the cached
+        # directory before putting the new one in its place, so a reader in
+        # another THREAD could otherwise find it missing between the two.
+        with open(os.path.join(outdir, "bundle.json"), "r") as f:
+            bundle = json.load(f)
 
     tools[tool_id] = bundle
     return bundle
+
+
+def _promote(staging, outdir, manifest, target, attempts=5):
+    """Put a verified staging directory in place, against other processes.
+
+    os.replace will not overwrite a non-empty directory, and the promote is two
+    syscalls -- rmtree then replace -- so two processes sharing a cache trip
+    over each other. Measured with four processes on one cache: two failed in
+    every trial.
+
+    _fetch_lock does not help; it is a threading.Lock and reaches only this
+    process. Multi-process is opt-in -- run.sh starts one worker -- but a shared
+    cache volume between replicas is a real deployment, so this handles it.
+
+    A clash is not a failure. Whoever won had also passed
+    verify_against_manifest against this same manifest, so their copy is as good
+    as ours: if what is now in place matches, we use it. Retried because the
+    re-check races too, a third process can rmtree between our clash and our
+    look, and one attempt left roughly one failure in twenty-four.
+    """
+    last = None
+    for _ in range(attempts):
+        shutil.rmtree(outdir, ignore_errors=True)
+        try:
+            os.replace(staging, outdir)
+            return
+        except OSError as clash:
+                    # Another process promoted the same tool between our rmtree
+                    # and our replace. os.replace will not overwrite a
+                    # non-empty directory, so it raises ENOTEMPTY (66 on
+                    # darwin, 39 on Linux) and this run failed for no reason
+                    # other than losing a footrace. Measured at two failures in
+                    # four processes, in every trial.
+                    #
+                    # Their copy is as good as ours -- both passed
+                    # verify_against_manifest against the same manifest before
+                    # either got here -- so the answer is to check that what is
+                    # now in place matches, and use it. If it does not, this is
+                    # a real failure and it is raised.
+            if clash.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                raise
+            last = clash
+            if cache_matches(outdir, manifest, target):
+                return          # someone else put an equivalent copy in place
+    raise ToolIntegrityError(
+        f"{target}: could not put the verified bundle in place after "
+        f"{attempts} attempts; another process kept replacing it. Last: {last}"
+    )
 
 
 def expected_uploads(workflow):
