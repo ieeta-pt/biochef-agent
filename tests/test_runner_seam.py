@@ -215,7 +215,7 @@ def test_the_service_runs_through_the_runner_it_resolved(monkeypatch, tmp_path):
         def command(self, ws):
             return ["true"]
 
-        def run(self, ws, timeout_s):
+        def run(self, ws, timeout_s, on_start=None):
             used["ws"] = ws
             used["timeout_s"] = timeout_s
             return RunResult(0, "", "")
@@ -237,3 +237,36 @@ def test_the_command_is_the_only_thing_a_provider_must_supply():
 
     with pytest.raises(NotImplementedError):
         _Bare().command(_Workspace("/tmp"))
+
+
+def test_a_provider_hands_out_the_process_group_it_created(tmp_path):
+    """So something other than the timeout can end a run (#7).
+
+    Cancellation needs precisely the lever the timeout pulls, and the only place
+    that knows the group id is the runner. Tested here rather than through the
+    cancel endpoint, because those tests stub run_snakemake and call on_start
+    themselves -- so removing this from the real runner went unnoticed by all of
+    them.
+
+    The id must be the CHILD's own group, not ours: that is what
+    start_new_session buys, and killing our own group would take the service
+    with it.
+    """
+    seen = []
+
+    class _Brief(Runner):
+        name = "brief-for-test"
+
+        def command(self, ws):
+            return ["sh", "-c", "exit 0"]
+
+    result = _Brief().run(_Workspace(tmp_path), timeout_s=30,
+                          on_start=seen.append)
+
+    assert result.returncode == 0
+    assert len(seen) == 1, f"on_start was called {len(seen)} times"
+    assert isinstance(seen[0], int)
+    assert seen[0] != os.getpgid(0), (
+        "the runner handed out this process's own group; killing it would take "
+        "the service down with the run"
+    )

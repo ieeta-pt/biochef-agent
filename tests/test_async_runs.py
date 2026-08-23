@@ -125,7 +125,7 @@ def service(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "RUN_ROOT", str(tmp_path / "runs"))
     convert.tools.clear()
 
-    def fake_run(ws, timeout_s=None):
+    def fake_run(ws, timeout_s=None, **kwargs):
         import os
         with open(os.path.join(ws.path, "tool-1-out"), "wb") as f:
             f.write(b"the output")
@@ -187,7 +187,7 @@ def test_a_failing_run_reaches_EXECUTOR_ERROR_and_says_why(service, monkeypatch)
     from fastapi.testclient import TestClient
 
     monkeypatch.setattr(main, "run_snakemake",
-                        lambda ws, timeout_s=None: (2, "", "it went wrong"))
+                        lambda ws, timeout_s=None, **kw: (2, "", "it went wrong"))
 
     with TestClient(main.app) as client:
         run_id = _submit(client).json()["run_id"]
@@ -201,7 +201,7 @@ def test_a_failing_run_reaches_EXECUTOR_ERROR_and_says_why(service, monkeypatch)
 def test_a_defect_in_the_service_is_SYSTEM_ERROR_not_the_workflows_fault(service, monkeypatch):
     from fastapi.testclient import TestClient
 
-    def boom(ws, timeout_s=None):
+    def boom(ws, timeout_s=None, **kwargs):
         raise RuntimeError("a bug in this service")
 
     monkeypatch.setattr(main, "run_snakemake", boom)
@@ -417,7 +417,7 @@ def test_execution_is_bounded_and_the_rest_wait_in_QUEUED(service, monkeypatch):
     live = {"now": 0, "peak": 0}
     lock = threading.Lock()
 
-    def slow(ws, timeout_s=None):
+    def slow(ws, timeout_s=None, **kwargs):
         import os
         with lock:
             live["now"] += 1

@@ -62,7 +62,7 @@ class Runner:
         """What this provider is, for an operator reading a log or an error."""
         return self.name
 
-    def run(self, ws, timeout_s: int) -> RunResult:
+    def run(self, ws, timeout_s: int, on_start=None) -> RunResult:
         """Launch the command in its own process group and bound how long it lives.
 
         start_new_session puts the command and everything it spawns in one
@@ -82,6 +82,12 @@ class Runner:
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         pgid = os.getpgid(process.pid)
+        # Handed out so something other than the timeout can end this run.
+        # Cancellation needs precisely the lever the timeout already pulls, and
+        # a caller that has the group id can pull it without this class growing
+        # a notion of why a run is being stopped.
+        if on_start is not None:
+            on_start(pgid)
         try:
             out, err = process.communicate(timeout=timeout_s)
             return RunResult(process.returncode, out, err)

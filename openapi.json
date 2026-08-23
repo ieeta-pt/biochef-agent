@@ -217,6 +217,44 @@
         },
         "summary": "Get Run"
       }
+    },
+    "/runs/{run_id}/cancel": {
+      "post": {
+        "description": "Ask a run to stop, and end the processes doing it.\n\nThe path is WES's, so exposing this as a WES endpoint later (F5) does not\nmove it.\n\nTwo shapes of run, and they differ. One waiting for a slot has executed\nnothing, so cancelling it is a matter of state: it settles CANCELED when its\nturn comes and it declines to start. One that is running has a process\ngroup, and that group is ended -- the tool and everything it spawned,\nexactly as the timeout does it, because a tool that spawns children and\nsurvives its parent is the reason group-killing is there at all.\n\nThe reply is CANCELING rather than CANCELED, and that is not evasion: the\nkill has been issued, but the run is not over until the worker has finished\ntidying up and said so. Reporting CANCELED here would be claiming something\nthat has not happened yet.",
+        "operationId": "cancel_run_runs__run_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Run"
+      }
     }
   }
 }

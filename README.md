@@ -46,6 +46,13 @@ the outputs once it is `COMPLETE`. States are GA4GH WES's vocabulary verbatim �
 `SYSTEM_ERROR`, `CANCELING`, `CANCELED` — so exposing this as a WES endpoint
 later is an adapter rather than a rewrite.
 
+`POST /runs/{run_id}/cancel` stops one. A run still waiting for a slot has
+executed nothing, so it settles `CANCELED` without ever starting; a run that is
+executing has its whole process group ended — the tool and anything it spawned,
+the same lever the timeout pulls. The reply is `CANCELING`, because the kill has
+been issued but the run is not over until the worker has tidied up and said so.
+A cancelled run returns no outputs even if the work finished anyway.
+
 Runs are held in memory: nothing survives a restart, and nothing is shared
 between replicas. `BIOCHEF_MAX_RUNS` bounds how many are remembered, and a run
 still in flight is never forgotten.
