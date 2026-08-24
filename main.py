@@ -76,14 +76,14 @@ start, rather than accepting work and failing every submission.
 """
 
 
-def run_snakemake(ws, timeout_s=RUN_TIMEOUT_S, on_start=None):
+def run_snakemake(ws, timeout_s=RUN_TIMEOUT_S, on_start=None, on_finish=None):
     """Execute the workflow with the configured runner.
 
     Kept as a function, rather than calling RUNNER.run at the call site, so that
     the timeout default lives in one place and the handler does not have to know
     which provider it got.
     """
-    return RUNNER.run(ws, timeout_s, on_start=on_start)
+    return RUNNER.run(ws, timeout_s, on_start=on_start, on_finish=on_finish)
 
 
 class BiochefWorkflow(BaseModel):
@@ -91,7 +91,8 @@ class BiochefWorkflow(BaseModel):
     edges: list
 
 
-def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None):
+def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None,
+                on_finish=None):
     """One run, start to finish, given the uploads already read.
 
     Split out of the handler so the synchronous endpoint and the asynchronous one
@@ -175,7 +176,8 @@ def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None):
             )
 
         report(RunState.RUNNING)
-        code, _out, err = run_snakemake(ws, on_start=on_start)
+        code, _out, err = run_snakemake(ws, on_start=on_start,
+                                        on_finish=on_finish)
         if code != 0:
             raise HTTPException(
                 status_code=500,
@@ -298,6 +300,9 @@ async def _execute(run_id: str, biochef_workflow: str, uploads):
     def started(pgid):
         RUNS.attach(run_id, pgid)
 
+    def finished():
+        RUNS.detach(run_id)
+
     try:
         # Waits here while the service is busy, and the run stays QUEUED until a
         # slot frees. Acquiring before anything else means a queued run has not
@@ -309,7 +314,8 @@ async def _execute(run_id: str, biochef_workflow: str, uploads):
                 _advance(run_id, RunState.CANCELED)
                 return
             results = await run_in_threadpool(
-                perform_run, biochef_workflow, uploads, progress, started)
+                perform_run, biochef_workflow, uploads, progress, started,
+                finished)
     except HTTPException as refusal:
         if _was_cancelled(run_id):
             _advance(run_id, RunState.CANCELED)

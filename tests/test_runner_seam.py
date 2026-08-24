@@ -215,7 +215,7 @@ def test_the_service_runs_through_the_runner_it_resolved(monkeypatch, tmp_path):
         def command(self, ws):
             return ["true"]
 
-        def run(self, ws, timeout_s, on_start=None):
+        def run(self, ws, timeout_s, on_start=None, on_finish=None):
             used["ws"] = ws
             used["timeout_s"] = timeout_s
             return RunResult(0, "", "")
@@ -260,8 +260,11 @@ def test_a_provider_hands_out_the_process_group_it_created(tmp_path):
         def command(self, ws):
             return ["sh", "-c", "exit 0"]
 
+    taken_back = []
+
     result = _Brief().run(_Workspace(tmp_path), timeout_s=30,
-                          on_start=seen.append)
+                          on_start=seen.append,
+                          on_finish=lambda: taken_back.append(True))
 
     assert result.returncode == 0
     assert len(seen) == 1, f"on_start was called {len(seen)} times"
@@ -270,3 +273,20 @@ def test_a_provider_hands_out_the_process_group_it_created(tmp_path):
         "the runner handed out this process's own group; killing it would take "
         "the service down with the run"
     )
+    assert taken_back == [True], (
+        "the group id was handed out and never taken back. It is a number the "
+        "kernel reissues once the group is empty, so a caller still holding it "
+        "is aiming at whoever gets it next -- and killpg reaches only group "
+        "LEADERS, which every run of this service is by construction"
+    )
+
+
+def test_the_group_id_is_taken_back_even_when_the_run_times_out(tmp_path):
+    """The timeout path reaps the child too, and must not leave a live number."""
+    taken_back = []
+
+    result = _SleepRunner().run(_Workspace(tmp_path), timeout_s=1,
+                                on_finish=lambda: taken_back.append(True))
+
+    assert result.returncode == -signal.SIGKILL
+    assert taken_back == [True]

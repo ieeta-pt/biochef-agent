@@ -62,7 +62,7 @@ class Runner:
         """What this provider is, for an operator reading a log or an error."""
         return self.name
 
-    def run(self, ws, timeout_s: int, on_start=None) -> RunResult:
+    def run(self, ws, timeout_s: int, on_start=None, on_finish=None) -> RunResult:
         """Launch the command in its own process group and bound how long it lives.
 
         start_new_session puts the command and everything it spawns in one
@@ -86,6 +86,14 @@ class Runner:
         # Cancellation needs precisely the lever the timeout already pulls, and
         # a caller that has the group id can pull it without this class growing
         # a notion of why a run is being stopped.
+        #
+        # Taken back the moment the child is reaped, which matters more than it
+        # sounds. A process group id is a number the kernel is free to reissue
+        # once the group is empty, so a caller still holding it after the run
+        # has ended is holding a loaded weapon aimed at whoever gets that number
+        # next. killpg only reaches a group LEADER, so the likely victim is
+        # another run of this same service -- every one is a leader by
+        # construction, and their creation rate rises with load.
         if on_start is not None:
             on_start(pgid)
         try:
@@ -100,6 +108,10 @@ class Runner:
             # other way, still claimed SIGKILL. It also made the timeout test
             # unable to tell the two apart.
             return RunResult(process.returncode, out or "", err or "")
+        finally:
+            # Both paths reach here, and both have reaped the child by now.
+            if on_finish is not None:
+                on_finish()
 
 
 class SubprocessRunner(Runner):

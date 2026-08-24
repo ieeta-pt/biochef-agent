@@ -174,6 +174,17 @@ class RunStore:
             if run is not None:
                 run.pgid = pgid
 
+    def detach(self, run_id: str) -> None:
+        """Forget the process group, because it no longer exists.
+
+        The number outlives the group, and the kernel may reissue it. Anything
+        still holding it is aiming at whoever gets it next.
+        """
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is not None:
+                run.pgid = None
+
     def _evict_if_needed(self):
         """Called with the lock held."""
         while len(self._runs) >= self._max:

@@ -177,7 +177,7 @@ def test_a_running_run_is_cancelled_and_its_processes_end(service, monkeypatch):
 
     grandchild = {}
 
-    def spawning(ws, timeout_s=None, on_start=None, **kwargs):
+    def spawning(ws, timeout_s=None, on_start=None, on_finish=None, **kwargs):
         import subprocess
         script = os.path.join(ws.path, "slow.sh")
         with open(script, "w") as f:
@@ -199,7 +199,18 @@ def test_a_running_run_is_cancelled_and_its_processes_end(service, monkeypatch):
                 break
             except (FileNotFoundError, ValueError):
                 time.sleep(0.01)
-        out, err = process.communicate()
+        try:
+            out, err = process.communicate()
+        finally:
+            # Never leave the group behind. Earlier versions of this test left
+            # orphaned `sleep 300` groups on the host when the run took an
+            # unexpected path, which an audit found still running.
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            if on_finish is not None:
+                on_finish()
         return process.returncode, out, err
 
     monkeypatch.setattr(main, "run_snakemake", spawning)
@@ -343,3 +354,73 @@ def test_cancelling_an_unknown_run_is_404(service):
 
     with TestClient(main.app) as client:
         assert client.post("/runs/nope/cancel").status_code == 404
+
+
+def test_cancel_aims_at_nothing_once_the_child_has_been_reaped(service, monkeypatch):
+    """The window between the process ending and the state saying so.
+
+    A run is still RUNNING while its outputs are read, base64'd and its
+    workspace removed -- measured between 0.01s and 1.14s depending on output
+    size. The process group is already gone by then, and a process group id is a
+    number the kernel reissues once the group is empty.
+
+    So a cancel arriving in that window used to SIGKILL whoever had inherited
+    the number. killpg reaches only group LEADERS, which narrows the victims --
+    to login shells, service units, and above all this service's OWN later runs,
+    every one of which is a leader by construction and whose creation rate rises
+    with load. One run silently killing another's snakemake, reported as an
+    unexplained error, is the realistic outcome.
+
+    The runner now takes the id back the instant it reaps the child, so by the
+    time this window opens there is nothing to aim at.
+    """
+    import subprocess
+    import threading
+
+    from fastapi.testclient import TestClient
+
+    killed = []
+    monkeypatch.setattr(main.os, "killpg",
+                        lambda pgid, sig: killed.append((pgid, sig)))
+
+    reaped = threading.Event()
+    release = threading.Event()
+
+    def reap_then_stall(ws, timeout_s=None, on_start=None, on_finish=None, **kw):
+        process = subprocess.Popen(["sh", "-c", "exit 0"], cwd=ws.path,
+                                   start_new_session=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True)
+        pgid = os.getpgid(process.pid)
+        if on_start is not None:
+            on_start(pgid)
+        process.communicate()                 # the child is gone and reaped
+        if on_finish is not None:
+            on_finish()
+        reaped.set()
+        release.wait(15)                      # stand in for the post-run work
+        with open(os.path.join(ws.path, "tool-1-out"), "wb") as f:
+            f.write(b"x")
+        return 0, "", ""
+
+    monkeypatch.setattr(main, "run_snakemake", reap_then_stall)
+
+    with TestClient(main.app) as client:
+        run_id = _submit(client).json()["run_id"]
+        assert reaped.wait(15), "the stub never ran"
+
+        assert service.get(run_id).state is RunState.RUNNING, (
+            "the window this test is about did not open"
+        )
+        assert service.get(run_id).pgid is None, (
+            "the group id survived the process it names"
+        )
+
+        assert client.post(f"/runs/{run_id}/cancel").status_code == 200
+        release.set()
+        _wait_for(service, run_id, {RunState.CANCELED})
+
+    assert killed == [], (
+        f"cancel sent {killed} at a group that no longer existed; the number "
+        f"may belong to something else by now"
+    )
