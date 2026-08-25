@@ -16,6 +16,7 @@ from workspace import UnsafeName, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
 from runs import (IllegalTransition, RunState, RunStore, TERMINAL,
                   UnknownRun)
+from steplogs import failing_steps
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
 from runner import SubprocessRunner, get_runner
 
@@ -92,7 +93,7 @@ class BiochefWorkflow(BaseModel):
 
 
 def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None,
-                on_finish=None):
+                on_finish=None, on_logs=None):
     """One run, start to finish, given the uploads already read.
 
     Split out of the handler so the synchronous endpoint and the asynchronous one
@@ -176,8 +177,15 @@ def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None,
             )
 
         report(RunState.RUNNING)
-        code, _out, err = run_snakemake(ws, on_start=on_start,
-                                        on_finish=on_finish)
+        code, out, err = run_snakemake(ws, on_start=on_start,
+                                       on_finish=on_finish)
+
+        # Recorded before the failure path raises, because a failed run is
+        # exactly the one whose output someone needs. Reporting it only on
+        # success, or only as a 2000-character tail, was the whole of #6.
+        if on_logs is not None:
+            on_logs(out, err, [node.id for node in workflow.nodes])
+
         if code != 0:
             raise HTTPException(
                 status_code=500,
@@ -303,6 +311,12 @@ async def _execute(run_id: str, biochef_workflow: str, uploads):
     def finished():
         RUNS.detach(run_id)
 
+    def logs(stdout, stderr, node_ids):
+        # Attributed here, where the emitter is already imported, so the run
+        # store does not have to reach for it.
+        steps = failing_steps(stderr, node_ids, rule_name_for)
+        RUNS.record_logs(run_id, stdout, stderr, steps)
+
     try:
         # Waits here while the service is busy, and the run stays QUEUED until a
         # slot frees. Acquiring before anything else means a queued run has not
@@ -315,7 +329,7 @@ async def _execute(run_id: str, biochef_workflow: str, uploads):
                 return
             results = await run_in_threadpool(
                 perform_run, biochef_workflow, uploads, progress, started,
-                finished)
+                finished, logs)
     except HTTPException as refusal:
         if _was_cancelled(run_id):
             _advance(run_id, RunState.CANCELED)
@@ -450,3 +464,29 @@ async def cancel_run(run_id: str):
             pass
 
     return RUNS.get(run_id).as_dict()
+
+
+@app.get("/runs/{run_id}/logs")
+async def get_run_logs(run_id: str):
+    """What the run printed, and which step snakemake blamed.
+
+    Two halves, and the response says which is which rather than blurring them.
+    `steps` names the nodes that FAILED, because snakemake states that outright.
+    A step that succeeded is not separated out: its output is in `stdout` along
+    with everything else's, and nothing marks where one rule's writing ends.
+    Splitting that needs a log: directive per rule, which is the emitter's
+    business.
+
+    Available while a run is still going, not only at the end -- there is no
+    reason to make someone wait for a fifteen-minute run to finish before seeing
+    what it has said so far.
+    """
+    try:
+        run = RUNS.get(run_id)
+    except UnknownRun:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no run {run_id!r}; it never existed, or it finished long "
+                   f"enough ago to have been forgotten",
+        )
+    return run.logs_as_dict()
