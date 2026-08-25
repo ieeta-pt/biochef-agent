@@ -14,7 +14,8 @@ import base64
 
 from workspace import UnsafeName, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
-from runs import IllegalTransition, RunState, RunStore, UnknownRun
+from runs import (IllegalTransition, RunState, RunStore, TERMINAL,
+                  UnknownRun)
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
 from runner import SubprocessRunner, get_runner
 
@@ -75,14 +76,14 @@ start, rather than accepting work and failing every submission.
 """
 
 
-def run_snakemake(ws, timeout_s=RUN_TIMEOUT_S):
+def run_snakemake(ws, timeout_s=RUN_TIMEOUT_S, on_start=None, on_finish=None):
     """Execute the workflow with the configured runner.
 
     Kept as a function, rather than calling RUNNER.run at the call site, so that
     the timeout default lives in one place and the handler does not have to know
     which provider it got.
     """
-    return RUNNER.run(ws, timeout_s)
+    return RUNNER.run(ws, timeout_s, on_start=on_start, on_finish=on_finish)
 
 
 class BiochefWorkflow(BaseModel):
@@ -90,7 +91,8 @@ class BiochefWorkflow(BaseModel):
     edges: list
 
 
-def perform_run(biochef_workflow: str, uploads, progress=None):
+def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None,
+                on_finish=None):
     """One run, start to finish, given the uploads already read.
 
     Split out of the handler so the synchronous endpoint and the asynchronous one
@@ -174,7 +176,8 @@ def perform_run(biochef_workflow: str, uploads, progress=None):
             )
 
         report(RunState.RUNNING)
-        code, _out, err = run_snakemake(ws)
+        code, _out, err = run_snakemake(ws, on_start=on_start,
+                                        on_finish=on_finish)
         if code != 0:
             raise HTTPException(
                 status_code=500,
@@ -294,25 +297,56 @@ async def _execute(run_id: str, biochef_workflow: str, uploads):
     def progress(state):
         _advance(run_id, state)
 
+    def started(pgid):
+        RUNS.attach(run_id, pgid)
+
+    def finished():
+        RUNS.detach(run_id)
+
     try:
         # Waits here while the service is busy, and the run stays QUEUED until a
         # slot frees. Acquiring before anything else means a queued run has not
         # yet made a workspace or pulled a tool.
         async with _slots():
+            # Asked for while queued, and never started. Nothing was executed,
+            # so there is nothing to kill -- only a state to settle.
+            if RUNS.get(run_id).state is RunState.CANCELING:
+                _advance(run_id, RunState.CANCELED)
+                return
             results = await run_in_threadpool(
-                perform_run, biochef_workflow, uploads, progress)
+                perform_run, biochef_workflow, uploads, progress, started,
+                finished)
     except HTTPException as refusal:
+        if _was_cancelled(run_id):
+            _advance(run_id, RunState.CANCELED)
+            return
         # The run failed for a reason attributable to what was submitted or to
         # the tools it named -- a bad workflow, a missing input, a tool exiting
         # non-zero. WES calls that EXECUTOR_ERROR.
         _advance(run_id, RunState.EXECUTOR_ERROR, error=refusal.detail)
     except Exception as failure:                     # noqa: BLE001
+        if _was_cancelled(run_id):
+            _advance(run_id, RunState.CANCELED)
+            return
         # Anything else is us, not the submission. SYSTEM_ERROR says so rather
         # than blaming the workflow for a defect in this service.
         _advance(run_id, RunState.SYSTEM_ERROR,
                  error={"error": "system_error", "message": str(failure)})
     else:
+        if _was_cancelled(run_id):
+            # The kill lost the race and the work finished anyway. It was still
+            # asked to stop, and saying COMPLETE would hand back outputs the
+            # caller has said they do not want.
+            _advance(run_id, RunState.CANCELED)
+            return
         _advance(run_id, RunState.COMPLETE, outputs=results)
+
+
+def _was_cancelled(run_id) -> bool:
+    try:
+        return RUNS.get(run_id).state is RunState.CANCELING
+    except UnknownRun:
+        return False
 
 
 def _advance(run_id, state, **detail):
@@ -361,3 +395,58 @@ async def get_run(run_id: str):
             detail=f"no run {run_id!r}; it never existed, or it finished long "
                    f"enough ago to have been forgotten",
         )
+
+
+@app.post("/runs/{run_id}/cancel")
+async def cancel_run(run_id: str):
+    """Ask a run to stop, and end the processes doing it.
+
+    The path is WES's, so exposing this as a WES endpoint later (F5) does not
+    move it.
+
+    Two shapes of run, and they differ. One waiting for a slot has executed
+    nothing, so cancelling it is a matter of state: it settles CANCELED when its
+    turn comes and it declines to start. One that is running has a process
+    group, and that group is ended -- the tool and everything it spawned,
+    exactly as the timeout does it, because a tool that spawns children and
+    survives its parent is the reason group-killing is there at all.
+
+    The reply is CANCELING rather than CANCELED, and that is not evasion: the
+    kill has been issued, but the run is not over until the worker has finished
+    tidying up and said so. Reporting CANCELED here would be claiming something
+    that has not happened yet.
+    """
+    try:
+        run = RUNS.get(run_id)
+    except UnknownRun:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no run {run_id!r}; it never existed, or it finished long "
+                   f"enough ago to have been forgotten",
+        )
+
+    if run.state in TERMINAL:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "already_finished", "run_id": run_id,
+                    "state": run.state.value,
+                    "message": "this run has already ended; there is nothing "
+                               "to cancel"},
+        )
+
+    try:
+        RUNS.advance(run_id, RunState.CANCELING)
+    except IllegalTransition:
+        # Someone else asked first, or it ended between the check and here.
+        return RUNS.get(run_id).as_dict()
+
+    pgid = run.pgid
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            # Already gone -- it finished on its own in the meantime. The
+            # worker will settle the state.
+            pass
+
+    return RUNS.get(run_id).as_dict()

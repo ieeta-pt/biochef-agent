@@ -26,6 +26,14 @@ import subprocess
 from typing import List, NamedTuple
 
 
+def _kill_group(pgid):
+    """End a process group, tolerating one that has already gone."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 class RunResult(NamedTuple):
     """What a run produced. A tuple, because the handler already unpacks three."""
 
@@ -62,7 +70,7 @@ class Runner:
         """What this provider is, for an operator reading a log or an error."""
         return self.name
 
-    def run(self, ws, timeout_s: int) -> RunResult:
+    def run(self, ws, timeout_s: int, on_start=None, on_finish=None) -> RunResult:
         """Launch the command in its own process group and bound how long it lives.
 
         start_new_session puts the command and everything it spawns in one
@@ -82,6 +90,20 @@ class Runner:
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         pgid = os.getpgid(process.pid)
+        # Handed out so something other than the timeout can end this run.
+        # Cancellation needs precisely the lever the timeout already pulls, and
+        # a caller that has the group id can pull it without this class growing
+        # a notion of why a run is being stopped.
+        #
+        # Taken back the moment the child is reaped, which matters more than it
+        # sounds. A process group id is a number the kernel is free to reissue
+        # once the group is empty, so a caller still holding it after the run
+        # has ended is holding a loaded weapon aimed at whoever gets that number
+        # next. killpg only reaches a group LEADER, so the likely victim is
+        # another run of this same service -- every one is a leader by
+        # construction, and their creation rate rises with load.
+        if on_start is not None:
+            on_start(pgid)
         try:
             out, err = process.communicate(timeout=timeout_s)
             return RunResult(process.returncode, out, err)
@@ -94,6 +116,34 @@ class Runner:
             # other way, still claimed SIGKILL. It also made the timeout test
             # unable to tell the two apart.
             return RunResult(process.returncode, out or "", err or "")
+        except BaseException:
+            # Any other way out -- a broken pipe, an interpreter shutdown, a
+            # KeyboardInterrupt -- and the child has NOT been reaped. The
+            # finally below is about to forget its group id, which would leave
+            # the tool running with nothing able to stop it, against a workspace
+            # perform_run is on its way to deleting.
+            #
+            # Demonstrated by making communicate() raise OSError: the group was
+            # still alive and the only handle to it had just been cleared.
+            _kill_group(pgid)
+            # Reaped as well as killed. SIGKILL ends the processes but leaves
+            # this one's direct child a zombie until it is waited for, and a
+            # zombie still occupies the process group -- so the group would
+            # outlive everything in it, which is both a leak and a number that
+            # cannot be reissued. CI caught this on Linux where the timing
+            # differs from a laptop's.
+            try:
+                process.wait(timeout=10)
+            except Exception:                    # noqa: BLE001
+                pass
+            raise
+        finally:
+            # Reached by every path, and by now the group is either reaped or
+            # killed above. An earlier version of this comment said "both paths
+            # reach here, and both have reaped the child", which was true of the
+            # two paths it named and false of every other.
+            if on_finish is not None:
+                on_finish()
 
 
 class SubprocessRunner(Runner):

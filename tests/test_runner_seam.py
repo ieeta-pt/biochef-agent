@@ -215,7 +215,7 @@ def test_the_service_runs_through_the_runner_it_resolved(monkeypatch, tmp_path):
         def command(self, ws):
             return ["true"]
 
-        def run(self, ws, timeout_s):
+        def run(self, ws, timeout_s, on_start=None, on_finish=None):
             used["ws"] = ws
             used["timeout_s"] = timeout_s
             return RunResult(0, "", "")
@@ -237,3 +237,124 @@ def test_the_command_is_the_only_thing_a_provider_must_supply():
 
     with pytest.raises(NotImplementedError):
         _Bare().command(_Workspace("/tmp"))
+
+
+def test_a_provider_hands_out_the_process_group_it_created(tmp_path):
+    """So something other than the timeout can end a run (#7).
+
+    Cancellation needs precisely the lever the timeout pulls, and the only place
+    that knows the group id is the runner. Tested here rather than through the
+    cancel endpoint, because those tests stub run_snakemake and call on_start
+    themselves -- so removing this from the real runner went unnoticed by all of
+    them.
+
+    The id must be the CHILD's own group, not ours: that is what
+    start_new_session buys, and killing our own group would take the service
+    with it.
+    """
+    seen = []
+
+    class _Brief(Runner):
+        name = "brief-for-test"
+
+        def command(self, ws):
+            return ["sh", "-c", "exit 0"]
+
+    taken_back = []
+
+    result = _Brief().run(_Workspace(tmp_path), timeout_s=30,
+                          on_start=seen.append,
+                          on_finish=lambda: taken_back.append(True))
+
+    assert result.returncode == 0
+    assert len(seen) == 1, f"on_start was called {len(seen)} times"
+    assert isinstance(seen[0], int)
+    assert seen[0] != os.getpgid(0), (
+        "the runner handed out this process's own group; killing it would take "
+        "the service down with the run"
+    )
+    assert taken_back == [True], (
+        "the group id was handed out and never taken back. It is a number the "
+        "kernel reissues once the group is empty, so a caller still holding it "
+        "is aiming at whoever gets it next -- and killpg reaches only group "
+        "LEADERS, which every run of this service is by construction"
+    )
+
+
+def test_the_group_id_is_taken_back_even_when_the_run_times_out(tmp_path):
+    """The timeout path reaps the child too, and must not leave a live number."""
+    taken_back = []
+
+    result = _SleepRunner().run(_Workspace(tmp_path), timeout_s=1,
+                                on_finish=lambda: taken_back.append(True))
+
+    assert result.returncode == -signal.SIGKILL
+    assert taken_back == [True]
+
+
+class _NeverEnds(Runner):
+    """A provider whose command outlives anything that goes wrong around it."""
+
+    name = "never-ends-for-test"
+
+    def command(self, ws):
+        return ["sh", "-c", "sleep 120"]
+
+
+def test_an_unexpected_failure_does_not_leave_the_group_running(tmp_path,
+                                                                monkeypatch):
+    """The inverse of the stale-pgid bug, and it was in the same finally.
+
+    On the normal and timeout paths the child is reaped before the group id is
+    handed back. On any OTHER path -- a broken pipe, an interpreter shutdown,
+    a KeyboardInterrupt -- it is not, and handing the id back there left the
+    tool running with nothing able to stop it, against a workspace perform_run
+    was about to delete.
+
+    The comment on that finally used to say "both paths reach here, and both
+    have reaped the child": true of the two it named, false of every other.
+    """
+    import subprocess
+
+    handed_out = []
+    real_communicate = subprocess.Popen.communicate
+
+    def broken(self, *a, **k):
+        raise OSError("the pipe broke")
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", broken)
+
+    with pytest.raises(OSError):
+        _NeverEnds().run(_Workspace(tmp_path), timeout_s=30,
+                         on_start=handed_out.append)
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", real_communicate)
+
+    assert handed_out, "the run never started"
+    pgid = handed_out[0]
+
+    # Polled rather than probed once. SIGKILL is asynchronous, and a killed
+    # child stays a zombie -- still occupying the group -- until it is reaped,
+    # so an immediate check can see a group that is on its way out. Probing
+    # once passed on macOS and failed in CI on Linux, which is the sort of
+    # difference that makes a test lie about which platform is wrong.
+    alive = True
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            alive = False
+            break
+        time.sleep(0.05)
+
+    if alive:                                      # do not leak from the test
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    assert not alive, (
+        f"process group {pgid} is still running after run() failed, and its id "
+        f"has already been handed back -- nothing can stop it now"
+    )
