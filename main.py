@@ -1,4 +1,5 @@
 from convert import *
+from convert import rule_name_for
 import asyncio
 import weakref
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -16,7 +17,7 @@ from workspace import UnsafeName, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
 from runs import (IllegalTransition, RunState, RunStore, TERMINAL,
                   UnknownRun)
-from steplogs import failing_steps
+from steplogs import Progress, failing_steps
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
 from runner import SubprocessRunner, get_runner
 
@@ -77,14 +78,16 @@ start, rather than accepting work and failing every submission.
 """
 
 
-def run_snakemake(ws, timeout_s=RUN_TIMEOUT_S, on_start=None, on_finish=None):
+def run_snakemake(ws, timeout_s=RUN_TIMEOUT_S, on_start=None, on_finish=None,
+                  on_line=None):
     """Execute the workflow with the configured runner.
 
     Kept as a function, rather than calling RUNNER.run at the call site, so that
     the timeout default lives in one place and the handler does not have to know
     which provider it got.
     """
-    return RUNNER.run(ws, timeout_s, on_start=on_start, on_finish=on_finish)
+    return RUNNER.run(ws, timeout_s, on_start=on_start, on_finish=on_finish,
+                      on_line=on_line)
 
 
 class BiochefWorkflow(BaseModel):
@@ -93,7 +96,7 @@ class BiochefWorkflow(BaseModel):
 
 
 def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None,
-                on_finish=None, on_logs=None):
+                on_finish=None, on_logs=None, on_progress=None):
     """One run, start to finish, given the uploads already read.
 
     Split out of the handler so the synchronous endpoint and the asynchronous one
@@ -177,8 +180,22 @@ def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None,
             )
 
         report(RunState.RUNNING)
+
+        # Built here because this is where the workflow's nodes are known, and
+        # fed from the reader threads as snakemake announces each job. Every
+        # node starts PENDING, which is what snakemake implies by saying nothing
+        # about a job until it starts it.
+        progress = Progress([node.id for node in workflow.nodes], rule_name_for)
+        if on_progress is not None:
+            on_progress(progress.snapshot())
+
+        def observe(stream, line):
+            if progress.observe(line) and on_progress is not None:
+                on_progress(progress.snapshot())
+
         code, out, err = run_snakemake(ws, on_start=on_start,
-                                       on_finish=on_finish)
+                                       on_finish=on_finish,
+                                       on_line=observe if on_progress else None)
 
         # Recorded before the failure path raises, because a failed run is
         # exactly the one whose output someone needs. Reporting it only on
@@ -311,6 +328,13 @@ async def _execute(run_id: str, biochef_workflow: str, uploads):
     def finished():
         RUNS.detach(run_id)
 
+    def step_progress(step_status):
+        # Named apart from `progress` above, which reports RUN state. An earlier
+        # version called both of them progress, so the second definition
+        # shadowed the first and every state transition was handed to
+        # record_progress as if it were a per-step map.
+        RUNS.record_progress(run_id, step_status)
+
     def logs(stdout, stderr, node_ids):
         # Attributed here, where the emitter is already imported, so the run
         # store does not have to reach for it.
@@ -329,7 +353,7 @@ async def _execute(run_id: str, biochef_workflow: str, uploads):
                 return
             results = await run_in_threadpool(
                 perform_run, biochef_workflow, uploads, progress, started,
-                finished, logs)
+                finished, logs, step_progress)
     except HTTPException as refusal:
         if _was_cancelled(run_id):
             _advance(run_id, RunState.CANCELED)

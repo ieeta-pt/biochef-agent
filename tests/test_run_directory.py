@@ -38,6 +38,7 @@ if "oras" not in sys.modules:
     sys.modules["oras.client"] = client_mod
 
 import base64
+import io
 import json
 import os
 import shutil
@@ -492,15 +493,24 @@ def test_run_snakemake_is_given_the_directory_explicitly(tmp_path, monkeypatch):
     captured = {}
 
     class FakePopen:
+        """Enough of a Popen for the runner, which reads the pipes itself.
+
+        It used to be enough to answer communicate(); the runner streams both
+        streams now and waits on the process, so a stand-in needs stdout and
+        stderr that end immediately.
+        """
+
         def __init__(self, argv, **kwargs):
             captured["argv"] = argv
             captured["cwd"] = kwargs.get("cwd")
             captured["new_session"] = kwargs.get("start_new_session")
             self.pid = os.getpid()
             self.returncode = 0
+            self.stdout = io.StringIO("")
+            self.stderr = io.StringIO("")
 
-        def communicate(self, timeout=None):
-            return "", ""
+        def wait(self, timeout=None):
+            return 0
 
     # main.os IS the os module, so patching through it patches os.getpgid
     # globally -- a lambda calling os.getpgid would then call itself. Keep the

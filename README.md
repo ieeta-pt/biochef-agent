@@ -46,14 +46,22 @@ the outputs once it is `COMPLETE`. States are GA4GH WES's vocabulary verbatim �
 `SYSTEM_ERROR`, `CANCELING`, `CANCELED` — so exposing this as a WES endpoint
 later is an adapter rather than a rewrite.
 
-`GET /runs/{run_id}/logs` returns what the run printed, plus `steps`, naming the
-nodes that **failed** and what snakemake said about each.
+`GET /runs/{run_id}` carries `steps` while the run is happening — one of
+`PENDING`, `RUNNING`, `COMPLETE`, `FAILED` per node, which is what the editor
+paints. Snakemake announces each job as it starts and finishes, and the agent
+reads its output as it arrives rather than at the end, so a node changes colour
+while the work is going on. A node nobody has mentioned is `PENDING`, which is
+what snakemake implies by saying nothing about a job until it starts it.
 
-It is not a stream. The output is captured with `communicate()`, which buffers
-until the workflow process exits, so the logs appear once execution has finished
-— before the run reaches a terminal state, but not during the part that takes
-the time. Following a run as it goes would mean reading the pipes incrementally,
-which is a different piece of work. A step that succeeded is not separated out:
+`GET /runs/{run_id}/logs` returns what the run printed, plus `failed_steps`,
+naming the nodes that failed and what snakemake said about each.
+
+**The logs are not streamed, though the progress is.** They are recorded in one
+go when the workflow process exits — readable while the run is still finishing,
+but not during it. The two differ because progress is a handful of state
+transitions and the logs are unbounded output; flushing every line into the run
+store would take a lock per line. Following the output live is a separate piece
+of work. A step that succeeded is not separated out:
 its output is in `stdout` along with everything else's, and nothing in
 snakemake's output marks where one rule's writing ends. Splitting that needs a
 `log:` directive per rule, which is emitter work.

@@ -12,6 +12,7 @@ right and the part whose absence is invisible until a tool is left running.
 """
 
 import inspect
+import io
 import os
 import signal
 import time
@@ -159,13 +160,21 @@ def test_the_configured_timeout_is_the_one_applied(monkeypatch, tmp_path):
     seen = {}
 
     class _FakePopen:
+        """Enough of a Popen for the runner: two streams and a wait().
+
+        The runner reads the pipes itself now rather than calling communicate,
+        so a stand-in needs stdout and stderr that end immediately.
+        """
+
         def __init__(self, argv, **kwargs):
             self.pid = os.getpid()      # so os.getpgid() has something real
             self.returncode = 0
+            self.stdout = io.StringIO("")
+            self.stderr = io.StringIO("")
 
-        def communicate(self, timeout=None):
+        def wait(self, timeout=None):
             seen["timeout"] = timeout
-            return ("", "")
+            return 0
 
     monkeypatch.setattr(runner_module.subprocess, "Popen", _FakePopen)
     _SleepRunner().run(_Workspace(tmp_path), timeout_s=11)
@@ -215,7 +224,8 @@ def test_the_service_runs_through_the_runner_it_resolved(monkeypatch, tmp_path):
         def command(self, ws):
             return ["true"]
 
-        def run(self, ws, timeout_s, on_start=None, on_finish=None):
+        def run(self, ws, timeout_s, on_start=None, on_finish=None,
+                on_line=None):
             used["ws"] = ws
             used["timeout_s"] = timeout_s
             return RunResult(0, "", "")
@@ -317,18 +327,20 @@ def test_an_unexpected_failure_does_not_leave_the_group_running(tmp_path,
     import subprocess
 
     handed_out = []
-    real_communicate = subprocess.Popen.communicate
+    real_wait = subprocess.Popen.wait
 
     def broken(self, *a, **k):
         raise OSError("the pipe broke")
 
-    monkeypatch.setattr(subprocess.Popen, "communicate", broken)
+    # wait(), not communicate(): the runner reads the pipes itself and waits on
+    # the process, so this is where an unexpected failure now comes from.
+    monkeypatch.setattr(subprocess.Popen, "wait", broken)
 
     with pytest.raises(OSError):
         _NeverEnds().run(_Workspace(tmp_path), timeout_s=30,
                          on_start=handed_out.append)
 
-    monkeypatch.setattr(subprocess.Popen, "communicate", real_communicate)
+    monkeypatch.setattr(subprocess.Popen, "wait", real_wait)
 
     assert handed_out, "the run never started"
     pgid = handed_out[0]
@@ -358,3 +370,122 @@ def test_an_unexpected_failure_does_not_leave_the_group_running(tmp_path,
         f"process group {pgid} is still running after run() failed, and its id "
         f"has already been handed back -- nothing can stop it now"
     )
+
+
+# --------------------------------------------------------------------------
+# streaming, which is what makes per-step progress possible (#8)
+
+
+class _Chatty(Runner):
+    """A provider that writes to both streams and then exits."""
+
+    name = "chatty-for-test"
+
+    def command(self, ws):
+        return ["sh", "-c",
+                "echo out-one; echo err-one >&2; echo out-two; echo err-two >&2"]
+
+
+def test_the_runner_reports_each_line_as_it_reads_it(tmp_path):
+    """Nothing else drives this.
+
+    The progress tests stub run_snakemake and call on_line themselves, so
+    removing the callback from the real runner went unnoticed by every one of
+    them -- the same blind spot that hid the pgid hand-out and the hand-back.
+    """
+    seen = []
+
+    result = _Chatty().run(_Workspace(tmp_path), timeout_s=30,
+                           on_line=lambda stream, line: seen.append(
+                               (stream, line.strip())))
+
+    assert result.returncode == 0
+    assert ("stdout", "out-one") in seen, seen
+    assert ("stderr", "err-one") in seen, seen
+    assert {stream for stream, _ in seen} == {"stdout", "stderr"}, (
+        "both streams must be reported, and each labelled with which it was"
+    )
+
+
+def test_a_failure_in_the_line_callback_does_not_take_the_run_with_it(tmp_path):
+    """Reporting is not the job; running the workflow is.
+
+    A defect in whatever is watching the output must not turn a successful run
+    into a failed one, and the line must still be collected.
+    """
+    def explodes(stream, line):
+        raise RuntimeError("the watcher is broken")
+
+    result = _Chatty().run(_Workspace(tmp_path), timeout_s=30, on_line=explodes)
+
+    assert result.returncode == 0
+    # Every line, not just the first. The reader appends before it reports, so
+    # asserting only on line one passed even when the exception killed the
+    # reader thread and every later line was lost.
+    for expected in ("out-one", "out-two"):
+        assert expected in result.stdout, f"{expected} missing: {result.stdout!r}"
+    for expected in ("err-one", "err-two"):
+        assert expected in result.stderr, f"{expected} missing: {result.stderr!r}"
+
+
+class _Verbose(Runner):
+    """A provider that writes more than fits in a pipe buffer."""
+
+    name = "verbose-for-test"
+
+    def command(self, ws):
+        return ["sh", "-c", "i=0; while [ $i -lt 2000 ]; do "
+                            "echo \"line-$i\"; echo \"err-$i\" >&2; "
+                            "i=$((i+1)); done"]
+
+
+def test_every_line_is_collected_even_when_there_are_many(tmp_path):
+    """Two things at once, and both have bitten real programs.
+
+    Draining one pipe and not the other deadlocks as soon as the undrained one
+    fills -- which is the whole reason communicate() exists. And returning
+    before the readers have finished loses the tail, because the process can
+    exit while its output is still in flight.
+    """
+    result = _Verbose().run(_Workspace(tmp_path), timeout_s=60)
+
+    assert result.returncode == 0
+    assert result.stdout.count("\n") == 2000, (
+        f"{result.stdout.count(chr(10))} of 2000 stdout lines survived"
+    )
+    assert result.stderr.count("\n") == 2000, (
+        f"{result.stderr.count(chr(10))} of 2000 stderr lines survived"
+    )
+    assert "line-1999" in result.stdout, "the tail was lost"
+    assert "err-1999" in result.stderr, "the tail was lost"
+
+
+def test_output_still_in_flight_when_the_process_exits_is_not_lost(tmp_path):
+    """The readers are joined before the result is built.
+
+    A process can exit while its output is still being read, and returning at
+    that moment loses whatever had not been consumed yet. Ordinarily the readers
+    win the race and nothing is missing, which is why dropping the join passed
+    every other test here -- so this makes them lose it, by slowing the callback
+    down until the process is long gone.
+    """
+    import time as _time
+
+    class _Burst(Runner):
+        name = "burst-for-test"
+
+        def command(self, ws):
+            return ["sh", "-c", "i=0; while [ $i -lt 20 ]; do echo \"n-$i\"; "
+                                "i=$((i+1)); done"]
+
+    def slowly(stream, line):
+        _time.sleep(0.02)
+
+    result = _Burst().run(_Workspace(tmp_path), timeout_s=60, on_line=slowly)
+
+    assert result.returncode == 0
+    assert result.stdout.count("\n") == 20, (
+        f"only {result.stdout.count(chr(10))} of 20 lines survived; the result "
+        f"was built before the readers had finished"
+    )
+    assert "n-19" in result.stdout, "the tail was lost"

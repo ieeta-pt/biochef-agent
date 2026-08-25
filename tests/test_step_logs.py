@@ -177,7 +177,7 @@ def test_a_successful_run_reports_what_it_printed(service, monkeypatch):
 
     assert body["stdout"] == "progress on stdout"
     assert body["stderr"] == "a warning on stderr"
-    assert body["steps"] == {}, "nothing failed, so nothing is blamed"
+    assert body["failed_steps"] == {}, "nothing failed, so nothing is blamed"
 
 
 def test_a_failing_run_keeps_its_whole_stderr(service, monkeypatch):
@@ -218,8 +218,8 @@ def test_a_failing_step_is_named(service, monkeypatch):
         _wait(service, run_id, TERMINAL_STATES)
         body = client.get(f"/runs/{run_id}/logs").json()
 
-    assert "tn93.distance-1" in body["steps"], body["steps"]
-    step = body["steps"]["tn93.distance-1"]
+    assert "tn93.distance-1" in body["failed_steps"], body["failed_steps"]
+    step = body["failed_steps"]["tn93.distance-1"]
     assert step["rule"] == "tn93_distance_1"
     assert "command exited with non-zero exit code" in step["stderr"]
 
