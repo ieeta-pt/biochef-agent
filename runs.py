@@ -16,6 +16,8 @@ import threading
 import uuid
 from collections import OrderedDict
 from enum import Enum
+
+from steplogs import clamp
 from typing import Optional
 
 
@@ -87,6 +89,9 @@ class Run:
         self.state = RunState.QUEUED
         self.outputs = None
         self.error = None
+        self.stdout = ""
+        self.stderr = ""
+        self.steps = {}
         self.pgid = None
         """The process group executing this run, once there is one.
 
@@ -94,6 +99,21 @@ class Run:
         state alone. A run that has started needs the group ended, which is the
         same lever the timeout pulls.
         """
+
+    def logs_as_dict(self) -> dict:
+        """What this run printed, and which steps failed.
+
+        `steps` is only ever the failing ones, and the docstring on steplogs
+        explains why: snakemake attributes failures by name and does not
+        separate anything else.
+        """
+        return {
+            "run_id": self.run_id,
+            "state": self.state.value,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "steps": self.steps,
+        }
 
     def as_dict(self) -> dict:
         """What a caller is told about this run.
@@ -173,6 +193,22 @@ class RunStore:
             run = self._runs.get(run_id)
             if run is not None:
                 run.pgid = pgid
+
+    def record_logs(self, run_id: str, stdout, stderr, steps) -> None:
+        """Keep what the run printed, bounded, with failures already attributed.
+
+        The attribution arrives finished rather than being worked out here.
+        Doing it in this module would mean importing the emitter for its rule
+        naming, and the emitter builds a registry client at import -- so asking
+        a run store what state a run is in would open a connection.
+        """
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                return
+            run.stdout = clamp(stdout)
+            run.stderr = clamp(stderr)
+            run.steps = steps
 
     def detach(self, run_id: str) -> None:
         """Forget the process group, because it no longer exists.

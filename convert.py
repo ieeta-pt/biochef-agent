@@ -438,6 +438,18 @@ def materialise_tools(workflow, ws):
         placed.add(name)
 
 
+def rule_name_for(node_id):
+    """The snakemake rule name a node is emitted as.
+
+    Extracted so there is one of these rather than two. Attribution of a failing
+    step reads "Error in rule <name>:" out of snakemake's output and has to turn
+    that back into a node id; a second copy of this transform would go on
+    working right up until someone changed the emitter, and then attribute
+    failures to nothing at all.
+    """
+    return node_id.replace(".", "_").replace("-", "_")
+
+
 def get_node_data(node_id, node_list):
     return next(node for node in node_list if node["id"] == node_id)
 
@@ -509,7 +521,7 @@ def convert_to_snakemake(workflow: Workflow):
 
     for node in workflow.nodes:
         # print(node)
-        result.append(f"rule {node.id.replace(".", "_").replace("-", "_")}:")
+        result.append(f"rule {rule_name_for(node.id)}:")
         cmd = [f"./{node.bin}"]
         extra_cms = []
 

@@ -46,6 +46,18 @@ the outputs once it is `COMPLETE`. States are GA4GH WES's vocabulary verbatim �
 `SYSTEM_ERROR`, `CANCELING`, `CANCELED` — so exposing this as a WES endpoint
 later is an adapter rather than a rewrite.
 
+`GET /runs/{run_id}/logs` returns what the run printed, plus `steps`, naming the
+nodes that **failed** and what snakemake said about each.
+
+It is not a stream. The output is captured with `communicate()`, which buffers
+until the workflow process exits, so the logs appear once execution has finished
+— before the run reaches a terminal state, but not during the part that takes
+the time. Following a run as it goes would mean reading the pipes incrementally,
+which is a different piece of work. A step that succeeded is not separated out:
+its output is in `stdout` along with everything else's, and nothing in
+snakemake's output marks where one rule's writing ends. Splitting that needs a
+`log:` directive per rule, which is emitter work.
+
 `POST /runs/{run_id}/cancel` stops one. A run still waiting for a slot has
 executed nothing, so it settles `CANCELED` without ever starting; a run that is
 executing has its whole process group ended — the tool and anything it spawned,
@@ -56,6 +68,12 @@ A cancelled run returns no outputs even if the work finished anyway.
 Runs are held in memory: nothing survives a restart, and nothing is shared
 between replicas. `BIOCHEF_MAX_RUNS` bounds how many are remembered, and a run
 still in flight is never forgotten.
+
+**Budget for that.** At the defaults the logs alone can reach 512 MiB —
+`BIOCHEF_MAX_RUNS` × `BIOCHEF_MAX_LOG_BYTES` × two streams — and each remembered
+run also holds its outputs, base64-encoded, bounded only by how many runs are
+kept. A deployment that returns large outputs should lower `BIOCHEF_MAX_RUNS`,
+`BIOCHEF_MAX_LOG_BYTES`, or both.
 
 Both take the same fields:
 
@@ -120,6 +138,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_KEEP_WORKSPACE` | `false` | leave a run's directory behind, for debugging |
 | `BIOCHEF_MAX_UPLOAD_BYTES` | `536870912` | largest request body accepted, in bytes |
 | `BIOCHEF_MAX_RUNS` | `256` | how many runs are remembered for polling |
+| `BIOCHEF_MAX_LOG_BYTES` | `1048576` | how much of a run's output is kept, tail first |
 | `BIOCHEF_MAX_CONCURRENT_RUNS` | `4` | how many runs execute at once; the rest wait in `QUEUED` |
 | `BIOCHEF_AUTH` | `none` | who may call it: `none` or `bearer` |
 | `BIOCHEF_AUTH_TOKEN` | | the shared token, required when `BIOCHEF_AUTH=bearer` |

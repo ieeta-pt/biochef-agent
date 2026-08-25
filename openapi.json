@@ -255,6 +255,44 @@
         },
         "summary": "Cancel Run"
       }
+    },
+    "/runs/{run_id}/logs": {
+      "get": {
+        "description": "What the run printed, and which step snakemake blamed.\n\nTwo halves, and the response says which is which rather than blurring them.\n`steps` names the nodes that FAILED, because snakemake states that outright.\nA step that succeeded is not separated out: its output is in `stdout` along\nwith everything else's, and nothing marks where one rule's writing ends.\nSplitting that needs a log: directive per rule, which is the emitter's\nbusiness.\n\nAvailable while a run is still going, not only at the end -- there is no\nreason to make someone wait for a fifteen-minute run to finish before seeing\nwhat it has said so far.",
+        "operationId": "get_run_logs_runs__run_id__logs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Run Logs"
+      }
     }
   }
 }
