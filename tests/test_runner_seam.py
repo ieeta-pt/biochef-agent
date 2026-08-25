@@ -290,3 +290,58 @@ def test_the_group_id_is_taken_back_even_when_the_run_times_out(tmp_path):
 
     assert result.returncode == -signal.SIGKILL
     assert taken_back == [True]
+
+
+class _NeverEnds(Runner):
+    """A provider whose command outlives anything that goes wrong around it."""
+
+    name = "never-ends-for-test"
+
+    def command(self, ws):
+        return ["sh", "-c", "sleep 120"]
+
+
+def test_an_unexpected_failure_does_not_leave_the_group_running(tmp_path,
+                                                                monkeypatch):
+    """The inverse of the stale-pgid bug, and it was in the same finally.
+
+    On the normal and timeout paths the child is reaped before the group id is
+    handed back. On any OTHER path -- a broken pipe, an interpreter shutdown,
+    a KeyboardInterrupt -- it is not, and handing the id back there left the
+    tool running with nothing able to stop it, against a workspace perform_run
+    was about to delete.
+
+    The comment on that finally used to say "both paths reach here, and both
+    have reaped the child": true of the two it named, false of every other.
+    """
+    import subprocess
+
+    handed_out = []
+    real_communicate = subprocess.Popen.communicate
+
+    def broken(self, *a, **k):
+        raise OSError("the pipe broke")
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", broken)
+
+    with pytest.raises(OSError):
+        _NeverEnds().run(_Workspace(tmp_path), timeout_s=30,
+                         on_start=handed_out.append)
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", real_communicate)
+
+    assert handed_out, "the run never started"
+    pgid = handed_out[0]
+    alive = True
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        alive = False
+    finally:
+        if alive:                                  # do not leak from the test
+            os.killpg(pgid, signal.SIGKILL)
+
+    assert not alive, (
+        f"process group {pgid} is still running after run() failed, and its id "
+        f"has already been handed back -- nothing can stop it now"
+    )

@@ -26,6 +26,14 @@ import subprocess
 from typing import List, NamedTuple
 
 
+def _kill_group(pgid):
+    """End a process group, tolerating one that has already gone."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 class RunResult(NamedTuple):
     """What a run produced. A tuple, because the handler already unpacks three."""
 
@@ -108,8 +116,22 @@ class Runner:
             # other way, still claimed SIGKILL. It also made the timeout test
             # unable to tell the two apart.
             return RunResult(process.returncode, out or "", err or "")
+        except BaseException:
+            # Any other way out -- a broken pipe, an interpreter shutdown, a
+            # KeyboardInterrupt -- and the child has NOT been reaped. The
+            # finally below is about to forget its group id, which would leave
+            # the tool running with nothing able to stop it, against a workspace
+            # perform_run is on its way to deleting.
+            #
+            # Demonstrated by making communicate() raise OSError: the group was
+            # still alive and the only handle to it had just been cleared.
+            _kill_group(pgid)
+            raise
         finally:
-            # Both paths reach here, and both have reaped the child by now.
+            # Reached by every path, and by now the group is either reaped or
+            # killed above. An earlier version of this comment said "both paths
+            # reach here, and both have reaped the child", which was true of the
+            # two paths it named and false of every other.
             if on_finish is not None:
                 on_finish()
 
