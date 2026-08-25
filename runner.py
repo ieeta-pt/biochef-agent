@@ -23,6 +23,7 @@ import os
 import re
 import signal
 import subprocess
+import threading
 from typing import List, NamedTuple
 
 
@@ -70,7 +71,8 @@ class Runner:
         """What this provider is, for an operator reading a log or an error."""
         return self.name
 
-    def run(self, ws, timeout_s: int, on_start=None, on_finish=None) -> RunResult:
+    def run(self, ws, timeout_s: int, on_start=None, on_finish=None,
+            on_line=None) -> RunResult:
         """Launch the command in its own process group and bound how long it lives.
 
         start_new_session puts the command and everything it spawns in one
@@ -104,18 +106,48 @@ class Runner:
         # construction, and their creation rate rises with load.
         if on_start is not None:
             on_start(pgid)
+
+        # Read as it arrives rather than with communicate(), which returns only
+        # when the process has exited. Nothing could be reported about a run in
+        # progress while its output sat in a pipe nobody was reading -- not the
+        # logs, and not which step was on.
+        #
+        # Two threads, one per stream, because draining only one of them is the
+        # deadlock communicate() exists to avoid: a tool that fills the other
+        # pipe's buffer blocks forever waiting for someone to read it.
+        collected = {"stdout": [], "stderr": []}
+
+        def pump(stream, name):
+            try:
+                for line in stream:
+                    collected[name].append(line)
+                    if on_line is not None:
+                        try:
+                            on_line(name, line)
+                        except Exception:            # noqa: BLE001
+                            # A defect in reporting must not take the run with
+                            # it. The line is still collected either way.
+                            pass
+            finally:
+                try:
+                    stream.close()
+                except Exception:                    # noqa: BLE001
+                    pass
+
+        readers = [
+            threading.Thread(target=pump, args=(process.stdout, "stdout"),
+                             daemon=True),
+            threading.Thread(target=pump, args=(process.stderr, "stderr"),
+                             daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+
         try:
-            out, err = process.communicate(timeout=timeout_s)
-            return RunResult(process.returncode, out, err)
+            process.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
             os.killpg(pgid, signal.SIGKILL)
-            out, err = process.communicate()
-            # The real code, not a constant. This used to return -SIGKILL
-            # literally, which reported the signal we meant to send rather than
-            # what happened -- so changing the signal, or the process dying some
-            # other way, still claimed SIGKILL. It also made the timeout test
-            # unable to tell the two apart.
-            return RunResult(process.returncode, out or "", err or "")
+            process.wait()
         except BaseException:
             # Any other way out -- a broken pipe, an interpreter shutdown, a
             # KeyboardInterrupt -- and the child has NOT been reaped. The
@@ -142,8 +174,23 @@ class Runner:
             # killed above. An earlier version of this comment said "both paths
             # reach here, and both have reaped the child", which was true of the
             # two paths it named and false of every other.
+            #
+            # The readers are joined with a bound rather than indefinitely. A
+            # grandchild that inherited the pipes and outlived its parent holds
+            # them open, and waiting forever for that is the hang the process
+            # group exists to prevent -- so a run that gets there returns what
+            # was read by then rather than never returning.
+            for reader in readers:
+                reader.join(timeout=10)
             if on_finish is not None:
                 on_finish()
+
+        # The real code, not a constant. This used to return -SIGKILL literally
+        # on the timeout path, which reported the signal we meant to send rather
+        # than what happened.
+        return RunResult(process.returncode,
+                         "".join(collected["stdout"]),
+                         "".join(collected["stderr"]))
 
 
 class SubprocessRunner(Runner):

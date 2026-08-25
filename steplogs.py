@@ -91,3 +91,63 @@ def failing_steps(stderr, node_ids, rule_name_for):
             if ambiguous:
                 attributed[node_id]["ambiguous"] = sorted(owners)
     return attributed
+
+
+# Snakemake announces each job as it starts and as it finishes.
+#
+# "Error in rule X:" contains "rule X:" as a substring, and mistaking it for a
+# start would turn a node green in front of someone watching it break. What
+# actually prevents that is .match(), which only ever matches at position zero;
+# the leading ^ is belt and braces and no test can tell it from its absence.
+# Kept because it still matters if anyone reaches for .search() later.
+_RULE_STARTS = re.compile(r"^(?:local)?rule ([A-Za-z_][A-Za-z0-9_]*):\s*$")
+_RULE_DONE = re.compile(r"^Finished jobid: \d+ \(Rule: ([A-Za-z_][A-Za-z0-9_]*)\)")
+_RULE_FAILED = re.compile(r"^Error in rule ([A-Za-z_][A-Za-z0-9_]*):")
+
+PENDING = "PENDING"
+RUNNING = "RUNNING"
+COMPLETE = "COMPLETE"
+FAILED = "FAILED"
+
+
+class Progress:
+    """Per-step status, built from snakemake's output as it arrives.
+
+    The states are the four B4 asks for, spelled like the run states so the
+    editor is not translating two vocabularies. A step nobody has mentioned is
+    PENDING, which is the honest default: snakemake says nothing about a job
+    until it starts one.
+
+    FAILED is sticky. A rule that failed and is retried would otherwise report
+    RUNNING again and lose the fact that it broke, and a node that has failed is
+    the one thing a person watching wants to keep seeing.
+    """
+
+    def __init__(self, node_ids, rule_name_for):
+        self._owners = {}
+        for node_id in node_ids:
+            self._owners.setdefault(rule_name_for(node_id), []).append(node_id)
+        self._status = {node_id: PENDING for node_id in node_ids}
+
+    def observe(self, line):
+        """Take one line of output. Returns True if anything changed."""
+        for pattern, state in ((_RULE_STARTS, RUNNING),
+                               (_RULE_DONE, COMPLETE),
+                               (_RULE_FAILED, FAILED)):
+            match = pattern.match(line.rstrip("\n"))
+            if not match:
+                continue
+            changed = False
+            # Every node sharing the rule name, because "a.b" and "a-b" collide
+            # and marking one of them would be a guess.
+            for node_id in self._owners.get(match.group(1), ()):
+                if self._status[node_id] == FAILED and state != FAILED:
+                    continue
+                if self._status[node_id] != state:
+                    self._status[node_id] = state
+                    changed = True
+            return changed
+        return False
+
+    def snapshot(self):
+        return dict(self._status)

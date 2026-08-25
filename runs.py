@@ -91,7 +91,8 @@ class Run:
         self.error = None
         self.stdout = ""
         self.stderr = ""
-        self.steps = {}
+        self.failed_steps = {}
+        self.step_status = {}
         self.pgid = None
         """The process group executing this run, once there is one.
 
@@ -112,7 +113,7 @@ class Run:
             "state": self.state.value,
             "stdout": self.stdout,
             "stderr": self.stderr,
-            "steps": self.steps,
+            "failed_steps": self.failed_steps,
         }
 
     def as_dict(self) -> dict:
@@ -125,6 +126,11 @@ class Run:
         is not one.
         """
         body = {"run_id": self.run_id, "state": self.state.value}
+        if self.step_status:
+            # What the editor paints on each node. Present as soon as the
+            # workflow starts, because the output is read as it arrives rather
+            # than at the end.
+            body["steps"] = dict(self.step_status)
         if self.error is not None:
             body["error"] = self.error
         if self.outputs is not None:
@@ -194,6 +200,17 @@ class RunStore:
             if run is not None:
                 run.pgid = pgid
 
+    def record_progress(self, run_id: str, step_status) -> None:
+        """Per-step status, replaced wholesale as it changes.
+
+        Called from the reader thread while the workflow is still running, so it
+        takes the lock like everything else here.
+        """
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is not None:
+                run.step_status = dict(step_status)
+
     def record_logs(self, run_id: str, stdout, stderr, steps) -> None:
         """Keep what the run printed, bounded, with failures already attributed.
 
@@ -208,7 +225,7 @@ class RunStore:
                 return
             run.stdout = clamp(stdout)
             run.stderr = clamp(stderr)
-            run.steps = steps
+            run.failed_steps = steps
 
     def detach(self, run_id: str) -> None:
         """Forget the process group, because it no longer exists.
