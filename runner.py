@@ -126,6 +126,16 @@ class Runner:
             # Demonstrated by making communicate() raise OSError: the group was
             # still alive and the only handle to it had just been cleared.
             _kill_group(pgid)
+            # Reaped as well as killed. SIGKILL ends the processes but leaves
+            # this one's direct child a zombie until it is waited for, and a
+            # zombie still occupies the process group -- so the group would
+            # outlive everything in it, which is both a leak and a number that
+            # cannot be reissued. CI caught this on Linux where the timing
+            # differs from a laptop's.
+            try:
+                process.wait(timeout=10)
+            except Exception:                    # noqa: BLE001
+                pass
             raise
         finally:
             # Reached by every path, and by now the group is either reaped or

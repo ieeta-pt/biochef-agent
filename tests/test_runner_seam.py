@@ -332,14 +332,27 @@ def test_an_unexpected_failure_does_not_leave_the_group_running(tmp_path,
 
     assert handed_out, "the run never started"
     pgid = handed_out[0]
+
+    # Polled rather than probed once. SIGKILL is asynchronous, and a killed
+    # child stays a zombie -- still occupying the group -- until it is reaped,
+    # so an immediate check can see a group that is on its way out. Probing
+    # once passed on macOS and failed in CI on Linux, which is the sort of
+    # difference that makes a test lie about which platform is wrong.
     alive = True
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        alive = False
-    finally:
-        if alive:                                  # do not leak from the test
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            alive = False
+            break
+        time.sleep(0.05)
+
+    if alive:                                      # do not leak from the test
+        try:
             os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
     assert not alive, (
         f"process group {pgid} is still running after run() failed, and its id "
