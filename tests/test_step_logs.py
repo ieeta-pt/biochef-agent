@@ -224,8 +224,21 @@ def test_a_failing_step_is_named(service, monkeypatch):
     assert "command exited with non-zero exit code" in step["stderr"]
 
 
-def test_logs_are_readable_while_the_run_is_still_going(service, monkeypatch):
-    """A fifteen-minute run should not have to end before anyone can look."""
+def test_logs_are_readable_before_the_run_reaches_a_terminal_state(
+        service, monkeypatch):
+    """Which is a narrower claim than it first looks, and worth stating exactly.
+
+    The logs are recorded as soon as the workflow process exits, so they can be
+    read while the run is still finishing -- collecting outputs, tidying up.
+    They are NOT available during execution itself: communicate() buffers until
+    the process ends, so nothing exists to read while the tools are running.
+
+    An earlier version of this test was called "while the run is still going"
+    and its docstring said a fifteen-minute run should not have to end before
+    anyone can look. That is not what it proves, and the README said the same
+    thing. Following a run as it goes means reading the pipes incrementally,
+    which this does not do.
+    """
     import threading
 
     from fastapi.testclient import TestClient
@@ -331,3 +344,45 @@ def test_output_larger_than_the_cap_is_cut_at_the_front_and_says_so():
 
 def test_output_within_the_cap_is_untouched():
     assert clamp("short", limit=1000) == "short"
+
+
+def test_the_regex_is_not_the_limit_on_which_names_can_be_attributed():
+    """Names it rejects are names the emitter cannot emit anyway.
+
+    A rule name becomes a Python identifier in the generated Snakefile, so a
+    node id starting with a digit, or containing a space or a plus, breaks
+    snakemake's parser before any of this is reached -- confirmed against 9.21,
+    which raises "invalid decimal literal" on `rule 1_tool:`.
+
+    Pinned so nobody loosens the pattern to admit names that cannot exist, and
+    concludes attribution is broken when it is the emitter that would be.
+    """
+    import subprocess
+    import shutil
+
+    from steplogs import _ERROR_IN_RULE
+
+    unmatchable = [convert.rule_name_for(n) for n in ("1-tool", "a b", "tool+1")]
+    for rule in unmatchable:
+        assert not _ERROR_IN_RULE.search(f"Error in rule {rule}:\n")
+
+    snakemake = shutil.which("snakemake")
+    if snakemake is None:
+        pytest.skip("snakemake is not on PATH")
+
+    import tempfile
+    directory = tempfile.mkdtemp()
+    try:
+        with open(os.path.join(directory, "Snakefile"), "w") as handle:
+            handle.write('rule 1_tool:\n    output: o_0="o.txt"\n'
+                         '    shell: "true"\n')
+        done = subprocess.run(
+            [snakemake, "-s", os.path.join(directory, "Snakefile"),
+             "-d", directory, "--cores", "1", "--dry-run"],
+            capture_output=True, text=True, timeout=120)
+        assert done.returncode != 0, (
+            "a digit-leading rule name parsed; the regex would then be the "
+            "thing standing between it and attribution"
+        )
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)

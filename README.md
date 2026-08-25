@@ -46,9 +46,14 @@ the outputs once it is `COMPLETE`. States are GA4GH WES's vocabulary verbatim �
 `SYSTEM_ERROR`, `CANCELING`, `CANCELED` — so exposing this as a WES endpoint
 later is an adapter rather than a rewrite.
 
-`GET /runs/{run_id}/logs` returns what the run has printed so far — while it is
-still going, not only at the end — plus `steps`, naming the nodes that **failed**
-and what snakemake said about each. A step that succeeded is not separated out:
+`GET /runs/{run_id}/logs` returns what the run printed, plus `steps`, naming the
+nodes that **failed** and what snakemake said about each.
+
+It is not a stream. The output is captured with `communicate()`, which buffers
+until the workflow process exits, so the logs appear once execution has finished
+— before the run reaches a terminal state, but not during the part that takes
+the time. Following a run as it goes would mean reading the pipes incrementally,
+which is a different piece of work. A step that succeeded is not separated out:
 its output is in `stdout` along with everything else's, and nothing in
 snakemake's output marks where one rule's writing ends. Splitting that needs a
 `log:` directive per rule, which is emitter work.
@@ -63,6 +68,12 @@ A cancelled run returns no outputs even if the work finished anyway.
 Runs are held in memory: nothing survives a restart, and nothing is shared
 between replicas. `BIOCHEF_MAX_RUNS` bounds how many are remembered, and a run
 still in flight is never forgotten.
+
+**Budget for that.** At the defaults the logs alone can reach 512 MiB —
+`BIOCHEF_MAX_RUNS` × `BIOCHEF_MAX_LOG_BYTES` × two streams — and each remembered
+run also holds its outputs, base64-encoded, bounded only by how many runs are
+kept. A deployment that returns large outputs should lower `BIOCHEF_MAX_RUNS`,
+`BIOCHEF_MAX_LOG_BYTES`, or both.
 
 Both take the same fields:
 
