@@ -65,8 +65,14 @@ from workspace import make_workspace
 # the interface, and what a third provider costs
 
 
-def test_both_current_sources_are_providers():
-    assert sorted(PROVIDERS) == ["localpath", "upload"]
+def test_the_current_sources_are_providers():
+    """Four, and two of them exist for D2 rather than for a client to choose.
+
+    `spooled` takes the file starlette already wrote to disk, and `handedover`
+    takes one this service wrote while a request was still open -- neither is a
+    path a caller supplies.
+    """
+    assert sorted(PROVIDERS) == ["handedover", "localpath", "spooled", "upload"]
     assert isinstance(get_sources(["upload"])["upload"], UploadSource)
 
 

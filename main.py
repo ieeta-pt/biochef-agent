@@ -1,9 +1,10 @@
 from convert import *
 from convert import rule_name_for
 import asyncio
+import tempfile
 import weakref
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from typing import List
 import json
@@ -18,6 +19,7 @@ from auth import AuthenticationMiddleware, NoAuth, get_auth
 from runs import (IllegalTransition, RunState, RunStore, TERMINAL,
                   UnknownRun)
 from datasource import DataSourceError, get_sources
+from retention import Retained
 from steplogs import Progress, failing_steps
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
 from runner import SubprocessRunner, get_runner
@@ -105,7 +107,8 @@ class BiochefWorkflow(BaseModel):
 
 
 def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
-                on_finish=None, on_logs=None, on_progress=None):
+                on_finish=None, on_logs=None, on_progress=None,
+                on_outputs=None, retain=None):
     """One run, start to finish, given its inputs already resolved.
 
     Split out of the handler so the synchronous endpoint and the asynchronous one
@@ -238,10 +241,16 @@ def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
         # Collect results: all data is base64-encoded. Read through the
         # workspace so a tool that replaced its own output with a symlink cannot
         # have the target's contents returned to the client (#41).
+        #
+        # Whole, and encoded, because that is the response contract the editor
+        # speaks. It is also why an output larger than memory cannot come back
+        # this way, and why /runs/{id}/outputs/... exists to stream instead.
         results = {}
+        catalogue = {}
         for node in workflow.nodes:
             if node.id not in results:
                 results[node.id] = {}
+                catalogue[node.id] = {}
 
             for output_name, output in node.outputs.items():
                 handle_name = output_name.split("-")[-1]
@@ -251,13 +260,29 @@ def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
                     encoded = base64.b64encode(raw).decode("ascii")
 
                 results[node.id][handle_name] = encoded
+                # What the streaming endpoint serves: the file inside the
+                # workspace, never a path the client supplies.
+                catalogue[node.id][handle_name] = output.file
+
+        if on_outputs is not None:
+            on_outputs(catalogue)
 
         return results
     finally:
         # The process was never moved, so there is no global state to restore --
-        # only a directory to remove, and it goes whether the run succeeded or
-        # not.
-        if not KEEP_WORKSPACE:
+        # only a directory to remove.
+        #
+        # Kept, if this run's outputs are to remain fetchable. Streaming an
+        # output means not having read it into the response, so the file has to
+        # still be here when the client asks -- and the alternative, copying
+        # everything somewhere on completion, is the same bytes moved twice for
+        # no gain. Retention is bounded by time and by count; when it declines,
+        # or is switched off, the workspace goes now as it always did.
+        if KEEP_WORKSPACE:
+            pass
+        elif retain is not None and retain(ws):
+            pass
+        else:
             ws.cleanup()
 
 
@@ -271,7 +296,10 @@ async def convert(
     Kept as it was because it is the contract the editor speaks today. /runs is
     the same work without the wait.
     """
-    inputs = [("upload", f.filename, await f.read()) for f in files]
+    # The spooled file itself, not its contents. Starlette has already written
+    # anything over a megabyte to disk; reading it back with await f.read()
+    # would undo that and put the whole input in memory.
+    inputs = [("spooled", f.filename, f.file) for f in files]
     return await run_in_threadpool(perform_run, biochef_workflow, inputs)
 
 
@@ -328,6 +356,14 @@ non-terminal, and be polled forever by a client waiting for an answer that is
 never coming.
 """
 
+RETAINED = Retained()
+"""Workspaces kept so their outputs can be streamed.
+
+Bounded by time and by count, because "stop deleting" is how a service fills a
+disk. Disabled by setting either bound to zero, which restores the old behaviour
+of removing a workspace the moment its run ends.
+"""
+
 RUNS = RunStore()
 """Runs this process is aware of.
 
@@ -360,6 +396,12 @@ async def _execute(run_id: str, biochef_workflow: str, inputs):
         # record_progress as if it were a per-step map.
         RUNS.record_progress(run_id, step_status)
 
+    def outputs(catalogue):
+        RUNS.record_outputs(run_id, catalogue)
+
+    def retain(ws):
+        return RETAINED.keep(run_id, ws)
+
     def logs(stdout, stderr, node_ids):
         # Attributed here, where the emitter is already imported, so the run
         # store does not have to reach for it.
@@ -378,7 +420,7 @@ async def _execute(run_id: str, biochef_workflow: str, inputs):
                 return
             results = await run_in_threadpool(
                 perform_run, biochef_workflow, inputs, progress, started,
-                finished, logs, step_progress)
+                finished, logs, step_progress, outputs, retain)
     except HTTPException as refusal:
         if _was_cancelled(run_id):
             _advance(run_id, RunState.CANCELED)
@@ -437,7 +479,23 @@ async def submit_run(
     difference between this and /convert, and the reason it cannot simply call
     the same handler in the background.
     """
-    inputs = [("upload", f.filename, await f.read()) for f in files]
+    # Read to disk here rather than kept as the request's own spooled file. The
+    # request is over long before the work starts, and starlette closes what it
+    # spooled when it ends -- so the asynchronous path has to take ownership of
+    # the bytes while it still can, without holding them in memory.
+    inputs = []
+    for f in files:
+        spooled = tempfile.NamedTemporaryFile(delete=False)
+        try:
+            while True:
+                chunk = await f.read(1024 * 1024)
+                if not chunk:
+                    break
+                spooled.write(chunk)
+        finally:
+            spooled.close()
+        inputs.append(("handedover", f.filename, spooled.name))
+
     run = RUNS.create()
     task = asyncio.create_task(_execute(run.run_id, biochef_workflow, inputs))
     # Held until it finishes, then dropped. See _running above: without this the
@@ -539,3 +597,77 @@ async def get_run_logs(run_id: str):
                    f"enough ago to have been forgotten",
         )
     return run.logs_as_dict()
+
+
+@app.get("/runs/{run_id}/outputs/{node_id}/{handle}")
+async def stream_output(run_id: str, node_id: str, handle: str):
+    """One output, streamed, without base64 and without holding it in memory.
+
+    The endpoint D2 needs. /convert and /runs still return everything encoded in
+    one response, because that is the contract the editor speaks -- but an
+    output larger than memory cannot come back that way, and this is how it
+    comes back instead.
+
+    A client names a node and a handle, never a path. What those mean is read
+    from what the run recorded, so nothing a caller sends decides which file is
+    opened, and the file is opened through the workspace -- so a tool that
+    replaced its own output with a symlink still cannot have the target's
+    contents served (#41).
+    """
+    try:
+        run = RUNS.get(run_id)
+    except UnknownRun:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no run {run_id!r}; it never existed, or it finished long "
+                   f"enough ago to have been forgotten",
+        )
+
+    filename = (run.output_files.get(node_id) or {}).get(handle)
+    if filename is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"run {run_id!r} has no output {handle!r} on node "
+                   f"{node_id!r}",
+        )
+
+    ws = RETAINED.workspace(run_id)
+    if ws is None:
+        raise HTTPException(
+            status_code=410,
+            detail={
+                "error": "outputs_expired",
+                "run_id": run_id,
+                "message": "this run's outputs are no longer on disk. They are "
+                           "kept for BIOCHEF_KEEP_OUTPUTS seconds and for the "
+                           "most recent BIOCHEF_MAX_RETAINED_RUNS runs.",
+            },
+        )
+
+    try:
+        handle_in = ws.open_read(filename)
+    except (FileNotFoundError, UnsafeName) as failure:
+        raise HTTPException(
+            status_code=404,
+            detail=f"output {handle!r} of {node_id!r} is not there: {failure}",
+        )
+
+    def chunks():
+        # Closed by the generator rather than a context manager, because the
+        # response outlives this function -- starlette iterates it after the
+        # handler has returned.
+        try:
+            while True:
+                chunk = handle_in.read(1024 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            handle_in.close()
+
+    return StreamingResponse(
+        chunks(),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition":
+                 f'attachment; filename="{node_id}-{handle}"'},
+    )
