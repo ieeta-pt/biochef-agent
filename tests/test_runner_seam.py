@@ -489,3 +489,49 @@ def test_output_still_in_flight_when_the_process_exits_is_not_lost(tmp_path):
         f"was built before the readers had finished"
     )
     assert "n-19" in result.stdout, "the tail was lost"
+
+
+def test_the_runners_own_capture_is_bounded(tmp_path, monkeypatch):
+    """A chatty tool decided how much memory the agent used.
+
+    Output was accumulated whole for the final result -- 8.9 MiB held for
+    4.3 MiB of output, with no ceiling -- while the store was only ever going
+    to keep MAX_LOG_BYTES of it. Nothing is lost that would have survived
+    being recorded.
+    """
+    import steplogs
+
+    monkeypatch.setattr(steplogs, "MAX_LOG_BYTES", 8192)
+
+    class _Chatty(Runner):
+        name = "chatty-bounded-for-test"
+
+        def command(self, ws):
+            return ["sh", "-c", "i=0; while [ $i -lt 4000 ]; do "
+                                "echo \"line-$i-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"; "
+                                "i=$((i+1)); done"]
+
+    result = _Chatty().run(_Workspace(tmp_path), timeout_s=120)
+
+    assert result.returncode == 0
+    assert len(result.stdout) < 8192 * 3, (
+        f"the runner returned {len(result.stdout)} bytes against an 8192 cap"
+    )
+    assert "line-3999" in result.stdout, "the tail was dropped instead of the head"
+    assert "earlier bytes dropped" in result.stdout, (
+        "output was truncated without saying so"
+    )
+
+
+def test_a_short_run_is_not_marked_as_truncated(tmp_path):
+    """The marker must mean something, so it cannot be always-on."""
+    class _Brief(Runner):
+        name = "brief-untruncated-for-test"
+
+        def command(self, ws):
+            return ["sh", "-c", "echo just-this"]
+
+    result = _Brief().run(_Workspace(tmp_path), timeout_s=30)
+
+    assert result.stdout == "just-this\n"
+    assert "dropped" not in result.stdout

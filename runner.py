@@ -3,8 +3,7 @@
 E2 asks for a second Runner provider. This is the first one, and the seam that
 makes a second possible.
 
-The split is deliberate and is the whole point of the file. Running a workflow is
-two things fused together in the version this replaces:
+The split is the whole point of the file. Running a workflow is two things:
 
   policy    the timeout, and killing the whole process group rather than the
             child. Every provider needs this, and it is the part that was hard
@@ -25,6 +24,8 @@ import signal
 import subprocess
 import threading
 from typing import List, NamedTuple
+
+from steplogs import TailBuffer
 
 
 def _kill_group(pgid):
@@ -115,7 +116,10 @@ class Runner:
         # Two threads, one per stream, because draining only one of them is the
         # deadlock communicate() exists to avoid: a tool that fills the other
         # pipe's buffer blocks forever waiting for someone to read it.
-        collected = {"stdout": [], "stderr": []}
+        # Bounded, so a chatty tool cannot decide how much memory the agent
+        # uses. Nothing is lost that would have survived being recorded: the
+        # store keeps MAX_LOG_BYTES of a stream either way.
+        collected = {"stdout": TailBuffer(), "stderr": TailBuffer()}
 
         def pump(stream, name):
             try:
@@ -170,10 +174,9 @@ class Runner:
                 pass
             raise
         finally:
-            # Reached by every path, and by now the group is either reaped or
-            # killed above. An earlier version of this comment said "both paths
-            # reach here, and both have reaped the child", which was true of the
-            # two paths it named and false of every other.
+            # Reached by every path, and by now the group is either reaped
+            # normally or killed above -- including the paths that raise, which
+            # is why the kill is in an except rather than only in the timeout.
             #
             # The readers are joined with a bound rather than indefinitely. A
             # grandchild that inherited the pipes and outlived its parent holds
@@ -185,12 +188,11 @@ class Runner:
             if on_finish is not None:
                 on_finish()
 
-        # The real code, not a constant. This used to return -SIGKILL literally
-        # on the timeout path, which reported the signal we meant to send rather
-        # than what happened.
+        # The process's real code, not a constant: reporting the signal we
+        # meant to send would claim SIGKILL however the process actually ended.
         return RunResult(process.returncode,
-                         "".join(collected["stdout"]),
-                         "".join(collected["stderr"]))
+                         collected["stdout"].text(),
+                         collected["stderr"].text())
 
 
 class SubprocessRunner(Runner):

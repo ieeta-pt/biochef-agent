@@ -23,7 +23,7 @@ from runs import (IllegalTransition, RunState, RunStore, TERMINAL,
                   UnknownRun)
 from datasource import DataSourceError, get_sources
 from retention import Retained
-from steplogs import Progress, failing_steps
+from steplogs import LiveLog, Progress, failing_steps
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
 from runner import SubprocessRunner, get_runner
 
@@ -257,19 +257,41 @@ def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
         if on_progress is not None:
             on_progress(progress.snapshot())
 
+        # Accumulated as it arrives so the logs can be read DURING a run, not
+        # only once the process has exited. Flushed in batches: a lock per line
+        # was the objection to this, and a lock twice a second is not.
+        node_ids = [node.id for node in workflow.nodes]
+        live = LiveLog(
+            on_flush=None if on_logs is None
+            else (lambda partial_out, partial_err:
+                  on_logs(partial_out, partial_err, node_ids)))
+
         def observe(stream, line):
+            live.add(stream, line)
             if progress.observe(line) and on_progress is not None:
                 on_progress(progress.snapshot())
 
-        code, out, err = run_snakemake(ws, on_start=on_start,
-                                       on_finish=on_finish,
-                                       on_line=observe if on_progress else None)
+        # Wired when either is wanted, since both are fed from the same lines.
+        wants_lines = on_progress is not None or on_logs is not None
+        try:
+            live.start()
+            code, out, err = run_snakemake(
+                ws, on_start=on_start, on_finish=on_finish,
+                on_line=observe if wants_lines else None)
+        finally:
+            # Always. The ticker is a thread per run, and a run that raised on
+            # its way out would otherwise leave one behind for every attempt.
+            live.close()
 
+        # The authoritative record, from the runner's own complete capture.
         # Recorded before the failure path raises, because a failed run is
         # exactly the one whose output someone needs. Reporting it only on
         # success, or only as a 2000-character tail, was the whole of #6.
+        #
+        # It replaces whatever the live flushes left, so a batch still in the
+        # buffer when the process exited costs nothing.
         if on_logs is not None:
-            on_logs(out, err, [node.id for node in workflow.nodes])
+            on_logs(out, err, node_ids)
 
         if code != 0:
             # Before raising. E5 asks for a manifest recording exit codes, and
@@ -439,10 +461,8 @@ async def _execute(run_id: str, biochef_workflow: str, inputs):
         RUNS.detach(run_id)
 
     def step_progress(step_status):
-        # Named apart from `progress` above, which reports RUN state. An earlier
-        # version called both of them progress, so the second definition
-        # shadowed the first and every state transition was handed to
-        # record_progress as if it were a per-step map.
+        # Named apart from `progress` above, which reports RUN state rather
+        # than per-step state. Two callbacks, two vocabularies.
         RUNS.record_progress(run_id, step_status)
 
     def outputs(catalogue):
