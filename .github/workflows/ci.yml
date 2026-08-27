@@ -166,6 +166,47 @@ jobs:
           name: junit-py${{ matrix.python }}
           path: results-${{ matrix.python }}.xml
 
+  stack:
+    name: the documented stack comes up
+    runs-on: ubuntu-latest
+    steps:
+      # Both into the workspace, as siblings. actions/checkout refuses a path
+      # outside GITHUB_WORKSPACE, so the repository cannot be checked out at the
+      # root and the editor at ../Biochef -- and this layout is the one
+      # docs/self-hosting.md tells a developer to create, which is the layout
+      # that has to be tested.
+      - uses: actions/checkout@v4
+        with:
+          path: biochef-agent
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ieeta-pt/Biochef
+          path: Biochef
+
+      - name: Bring up registry, agent and frontend
+        # E6's acceptance (#19) is that a new developer reaches a running stack
+        # by following the document alone, so this runs the document's own
+        # commands and then asks each service whether it is there.
+        #
+        # It asserts on the services rather than on docker's exit code:
+        # `compose up -d` returns once containers are CREATED, which is not the
+        # same as the agent being able to serve a request.
+        working-directory: biochef-agent
+        run: ./ci/stack_smoke.sh
+
+      - name: What the stack said, if it did not come up
+        if: failure()
+        working-directory: biochef-agent
+        run: docker compose logs --tail 100
+
+      - name: Stop it
+        if: always()
+        working-directory: biochef-agent
+        # Including the volumes, so a cached npm install or registry blob from
+        # one run cannot make the next one pass.
+        run: docker compose down -v
+
   catalogue:
     name: catalogue converts
     runs-on: ubuntu-latest

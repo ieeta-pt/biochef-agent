@@ -96,6 +96,12 @@ Configuration is by environment variable, and `example.env` lists them:
 4. `snakemake` runs it.
 5. Each declared output is read back and base64-encoded into the response.
 
+## Running the whole stack locally
+
+`docs/self-hosting.md` brings up a registry, this agent and the editor with one
+`docker compose up`, and explains what to do with them. It is a development
+stack — no authentication anywhere, plain HTTP — and the document says so.
+
 ## Before deploying this
 
 **It is not ready to be exposed.** There is no authentication of any kind, and
