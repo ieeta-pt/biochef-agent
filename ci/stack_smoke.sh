@@ -36,7 +36,15 @@ wait_for() {
 }
 
 echo "=== bringing the stack up ==="
-$COMPOSE up -d --build
+# Not `set -e` straight through: when a dependency exits, compose fails here and
+# the useful information is in the container's own log, not in compose's exit
+# code. Show it before giving up.
+if ! $COMPOSE up -d --build; then
+    echo "--- compose could not bring the stack up; container logs follow ---" >&2
+    $COMPOSE logs --no-color --tail 60 >&2 || true
+    $COMPOSE ps -a >&2 || true
+    fail "compose up did not succeed"
+fi
 
 echo "=== waiting for each service ==="
 wait_for registry "http://127.0.0.1:${REGISTRY_PORT}/v2/"

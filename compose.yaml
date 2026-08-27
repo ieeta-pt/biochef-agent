@@ -40,8 +40,13 @@ services:
       # file is a development stack and not a deployment.
       REGISTRY_INSECURE: "true"
       ORAS_AUTH_BACKEND: basic
-      REGISTRY_USERNAME: ""
-      REGISTRY_PASSWORD: ""
+      # Placeholders, and they must not be empty. oras's login() PROMPTS for a
+      # username it was not given -- `username = input("Username: ")` -- which
+      # in a container with no TTY is an immediate EOFError, so the agent exits
+      # before it serves anything. This registry has no authentication and
+      # ignores whatever is sent; what matters is that something is.
+      REGISTRY_USERNAME: biochef
+      REGISTRY_PASSWORD: local
     depends_on:
       registry:
         condition: service_healthy

@@ -66,6 +66,15 @@ knowing because it is the first thing to suspect if you adapt this file and the
 agent starts failing "randomly" — almost always it is starting before whatever
 it pulls from.
 
+## Credentials, which are not optional even without authentication
+
+The compose file sends a username and password the registry ignores. They have
+to be there: the ORAS client prompts for a username it was not given, and a
+container has no terminal to answer with, so an agent configured with empty
+credentials exits at startup rather than serving anything.
+
+If you point the agent at a registry that *does* authenticate, replace them.
+
 ## Publishing a tool to your local registry
 
 The stack comes up empty. The agent pulls tool bundles from the registry by the
