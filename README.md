@@ -65,6 +65,27 @@ endpoint answers `410 Gone` rather than pretending the run never existed.
 Retention is bounded in both directions because "stop deleting" is how a service
 fills a disk.
 
+`GET /runs/{run_id}/manifest` returns how the run was produced: the workflow by
+digest, each tool by the digests the registry stated for it, every input and
+output by content, the runner and image, and the exit code. It is also written
+into the run's own directory as `run.json`, beside the outputs it describes.
+
+The vocabulary is the hub's. It publishes `biochef.build-evidence.v1` alongside
+each bundle and signs artifacts as in-toto statements, so a run manifest carries
+that evidence forward by reference rather than restating the same facts in
+different words. A bundle built before that work still produces a manifest —
+provenance should not be a reason not to run something.
+
+A run that **failed** gets one too, with its real exit code and its outputs
+recorded as absent — that is the run whose exit code matters most. A run that has
+nowhere to put a manifest gets none: `/convert` deletes its workspace on the way
+out and has no run id to attach one to, and building it costs a second full read
+of every input and output.
+
+It records what was fixed. It does **not** promise reproducibility: a tool that
+reads the clock, the network, or a file the manifest cannot name will not
+reproduce, and that is a property of the tool rather than of this document.
+
 `GET /runs/{run_id}/logs` returns what the run printed, plus `failed_steps`,
 naming the nodes that failed and what snakemake said about each.
 

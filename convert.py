@@ -102,6 +102,9 @@ copy in whichever workspace needs it.
 
 tools = {}
 
+provenance = {}
+"""What each pulled bundle was, kept for the run manifest (#18)."""
+
 _fetch_locks = {}
 _fetch_locks_guard = threading.Lock()
 
@@ -341,8 +344,54 @@ def _fetch_tool_once(tool_id, repo):
         with open(os.path.join(outdir, "bundle.json"), "r") as f:
             bundle = json.load(f)
 
+        # Kept for the run manifest (#18). The registry publishes three
+        # artifacts per bundle and verify_against_manifest has just hashed all
+        # of them against the manifest -- so their identity is established here
+        # and was, until now, thrown away.
+        evidence = _bundle_evidence(outdir, manifest, target)
+
     tools[tool_id] = bundle
+    provenance[tool_id] = evidence
     return bundle
+
+
+def _bundle_evidence(directory, manifest, target):
+    """What this bundle is, in the terms the registry stated it.
+
+    Digests come from the MANIFEST rather than from hashing the files again.
+    They are the same numbers -- verify_against_manifest has just checked that --
+    but taking them from the manifest records what the registry asserted, which
+    is the thing a reader of the manifest would want to compare against.
+    """
+    artifacts = {}
+    for layer in manifest.get("layers") or []:
+        title = (layer.get("annotations") or {}).get(_ANNOTATION_TITLE)
+        if title and layer.get("digest"):
+            artifacts[title] = layer["digest"]
+
+    evidence = {"target": target, "artifacts": artifacts}
+
+    # The hub's own build evidence, if this bundle carries it. Referenced by
+    # digest AND summarised, so a manifest is readable without the registry
+    # while still saying exactly which document it means.
+    build = os.path.join(directory, "build-evidence.json")
+    if os.path.exists(build):
+        try:
+            with open(build, "r") as handle:
+                document = json.load(handle)
+        except (OSError, ValueError):
+            return evidence
+        evidence["build_evidence"] = {
+            "schema": document.get("schema"),
+            "generated_at": document.get("generated_at"),
+            "hub": document.get("hub"),
+            "recipe": {
+                key: (document.get("recipe") or {}).get(key)
+                for key in ("id", "name", "version", "digest")
+            },
+            "operation": document.get("operation"),
+        }
+    return evidence
 
 
 def _promote(staging, outdir, manifest, target, attempts=5):
