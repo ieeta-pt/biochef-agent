@@ -74,15 +74,17 @@ services:
       # be written back over the developer's own, which may have been installed
       # on a different platform.
       - frontend-modules:/app/node_modules
-    # --host 0.0.0.0 because the port is published out of the container, and
-    # NOT --open, which is in the repository's own start script and would have
-    # the dev server try to launch a browser that is not there.
+    # The repository's own start script, minus --open: that flag would have the
+    # dev server try to launch a browser that is not there. Host and port are
+    # left alone because its webpack config already sets host 0.0.0.0 and port
+    # 8082, and passing --port on the command line did not win against that.
     command: >
       sh -c "npm ci --no-audit --no-fund &&
-             npx webpack serve --mode development
-                  --host 0.0.0.0 --port 3000"
+             npx webpack serve --mode development"
+    # Uneven on purpose: 8082 is the editor's own port, and the published side
+    # is the round number the walkthrough tells people to open.
     ports:
-      - "${FRONTEND_PORT:-3000}:3000"
+      - "${FRONTEND_PORT:-3000}:8082"
     environment:
       # The address a BROWSER uses, so it is the published one: the editor runs
       # in the developer's browser, not inside the compose network.
