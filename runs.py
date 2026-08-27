@@ -92,6 +92,10 @@ class Run:
         self.stdout = ""
         self.stderr = ""
         self.failed_steps = {}
+        self.output_files = {}
+        """Which file in the workspace holds each output, once a run has made
+        them. What the streaming endpoint serves, so that a client never names a
+        path -- it names a node and a handle, and this says what that means."""
         self.step_status = {}
         self.pgid = None
         """The process group executing this run, once there is one.
@@ -199,6 +203,14 @@ class RunStore:
             run = self._runs.get(run_id)
             if run is not None:
                 run.pgid = pgid
+
+    def record_outputs(self, run_id: str, catalogue) -> None:
+        """What each output handle is called inside the workspace."""
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is not None:
+                run.output_files = {node: dict(handles)
+                                    for node, handles in catalogue.items()}
 
     def record_progress(self, run_id: str, step_status) -> None:
         """Per-step status, replaced wholesale as it changes.

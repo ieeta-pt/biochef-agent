@@ -53,6 +53,18 @@ reads its output as it arrives rather than at the end, so a node changes colour
 while the work is going on. A node nobody has mentioned is `PENDING`, which is
 what snakemake implies by saying nothing about a job until it starts it.
 
+`GET /runs/{run_id}/outputs/{node}/{handle}` streams one output as raw bytes —
+no base64, and never assembled in memory. This is how a file larger than memory
+comes back: the encoded response above costs a second copy plus a third again
+for the encoding, so a 4 GiB output would need roughly 14.7 GiB resident. A
+client names a node and a handle, never a path.
+
+Outputs stay fetchable for `BIOCHEF_KEEP_OUTPUTS` seconds and for the most
+recent `BIOCHEF_MAX_RETAINED_RUNS` runs, whichever runs out first; after that the
+endpoint answers `410 Gone` rather than pretending the run never existed.
+Retention is bounded in both directions because "stop deleting" is how a service
+fills a disk.
+
 `GET /runs/{run_id}/logs` returns what the run printed, plus `failed_steps`,
 naming the nodes that failed and what snakemake said about each.
 
@@ -155,6 +167,8 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_MAX_UPLOAD_BYTES` | `536870912` | largest request body accepted, in bytes |
 | `BIOCHEF_MAX_RUNS` | `256` | how many runs are remembered for polling |
 | `BIOCHEF_MAX_LOG_BYTES` | `1048576` | how much of a run's output is kept, tail first |
+| `BIOCHEF_KEEP_OUTPUTS` | `3600` | seconds a finished run's outputs stay fetchable; `0` deletes them at once |
+| `BIOCHEF_MAX_RETAINED_RUNS` | `32` | how many finished runs may keep outputs on disk |
 | `BIOCHEF_MAX_CONCURRENT_RUNS` | `4` | how many runs execute at once; the rest wait in `QUEUED` |
 | `BIOCHEF_AUTH` | `none` | who may call it: `none` or `bearer` |
 | `BIOCHEF_AUTH_TOKEN` | | the shared token, required when `BIOCHEF_AUTH=bearer` |

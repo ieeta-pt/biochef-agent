@@ -293,6 +293,62 @@
         },
         "summary": "Get Run Logs"
       }
+    },
+    "/runs/{run_id}/outputs/{node_id}/{handle}": {
+      "get": {
+        "description": "One output, streamed, without base64 and without holding it in memory.\n\nThe endpoint D2 needs. /convert and /runs still return everything encoded in\none response, because that is the contract the editor speaks -- but an\noutput larger than memory cannot come back that way, and this is how it\ncomes back instead.\n\nA client names a node and a handle, never a path. What those mean is read\nfrom what the run recorded, so nothing a caller sends decides which file is\nopened, and the file is opened through the workspace -- so a tool that\nreplaced its own output with a symlink still cannot have the target's\ncontents served (#41).",
+        "operationId": "stream_output_runs__run_id__outputs__node_id___handle__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "title": "Node Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "handle",
+            "required": true,
+            "schema": {
+              "title": "Handle",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stream Output"
+      }
     }
   }
 }
