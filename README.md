@@ -89,12 +89,19 @@ reproduce, and that is a property of the tool rather than of this document.
 `GET /runs/{run_id}/logs` returns what the run printed, plus `failed_steps`,
 naming the nodes that failed and what snakemake said about each.
 
-**The logs are not streamed, though the progress is.** They are recorded in one
-go when the workflow process exits — readable while the run is still finishing,
-but not during it. The two differ because progress is a handful of state
-transitions and the logs are unbounded output; flushing every line into the run
-store would take a lock per line. Following the output live is a separate piece
-of work. A step that succeeded is not separated out:
+The logs are live, like the progress. Output is read as it arrives and handed to
+the run twice a second, so a run that is still going can be read as it goes. A tool that prints once
+and then works silently is still visible: the flush is on a timer as well as a
+line count, because checking the clock only when a line arrives would show
+nothing for as long as the tool said nothing.
+
+What a poll returns mid-run is therefore a **partial** log, and bounded: nothing
+holds more than `BIOCHEF_MAX_LOG_BYTES` of a stream, oldest dropped first, and a
+truncated log says so rather than beginning mid-sentence. That ceiling applies to
+the runner's own capture as well — a chatty tool used to decide how much memory
+the agent used. The authoritative one is recorded when the process exits, from the
+runner's own complete capture, so anything trimmed or still buffered costs
+nothing in the end. A step that succeeded is not separated out:
 its output is in `stdout` along with everything else's, and nothing in
 snakemake's output marks where one rule's writing ends. Splitting that needs a
 `log:` directive per rule, which is emitter work.

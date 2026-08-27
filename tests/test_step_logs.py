@@ -386,3 +386,415 @@ def test_the_regex_is_not_the_limit_on_which_names_can_be_attributed():
         )
     finally:
         shutil.rmtree(directory, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# the logs while a run is happening, not only once it has ended
+
+
+def test_only_the_ticker_delivers_so_the_log_cannot_go_backwards():
+    """Two readers building snapshots can hand them over in the other order.
+
+    Measured on the version that let either reader deliver: sizes arrived
+    [22, 11], so a client polling twice saw LESS the second time. One
+    delivering thread cannot do that.
+    """
+    import threading
+    import time as _time
+
+    from steplogs import LiveLog
+
+    delivered = []
+    live = LiveLog(on_flush=lambda out, err: delivered.append(len(out)),
+                   every_seconds=0.05)
+    live.start()
+    try:
+        def write(tag):
+            for n in range(200):
+                live.add("stdout", f"{tag}-{n:04d}\n")
+                _time.sleep(0.001)
+
+        threads = [threading.Thread(target=write, args=(t,)) for t in "ab"]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        _time.sleep(0.2)
+    finally:
+        live.close()
+
+    assert len(delivered) > 1, "nothing was delivered while the writers ran"
+    assert delivered == sorted(delivered), (
+        f"the log went backwards: {delivered}"
+    )
+
+
+def test_adding_a_line_never_delivers_it_itself():
+    """So a reader draining the tool's pipes is never held up by a consumer.
+
+    If the readers stall the pipe fills and the tool blocks writing to it, so a
+    slow log consumer would stop the workflow.
+    """
+    from steplogs import LiveLog
+
+    delivered = []
+    live = LiveLog(on_flush=lambda out, err: delivered.append(out),
+                   every_seconds=10 ** 9)
+
+    for n in range(1000):
+        live.add("stdout", f"line-{n}\n")
+
+    assert delivered == [], (
+        "add() delivered on its own; only the ticker should"
+    )
+    assert live.snapshot()[0].count("\n") == 1000
+
+
+def test_a_quiet_tool_is_still_visible():
+    """The case the whole timer exists for.
+
+    A tool that prints "starting" and then works silently for ten minutes would
+    show nothing for ten minutes if the clock were only checked when a line
+    arrived.
+    """
+    import time as _time
+
+    from steplogs import LiveLog
+
+    seen = []
+    with LiveLog(on_flush=lambda out, err: seen.append(err),
+                 every_seconds=0.2) as live:
+        live.add("stderr", "starting analysis\n")
+        _time.sleep(0.7)
+
+    assert seen, "a tool that printed once and then went silent showed nothing"
+    assert "starting analysis" in seen[0]
+
+
+def test_the_buffer_is_bounded_by_what_the_store_would_keep():
+    """It held everything before: 12.4 MiB for 7.7 MiB of output, on top of the
+    runner's own copy, while the store was only ever going to keep a megabyte.
+
+    Bounding it also bounds the cost of joining, which grew with the log.
+    """
+    from steplogs import LiveLog
+
+    live = LiveLog(on_flush=None, max_bytes=4096, every_seconds=10 ** 9)
+    for n in range(5000):
+        live.add("stdout", f"{n:06d} " + "x" * 60 + "\n")
+
+    out, _ = live.snapshot()
+    assert len(out) <= 4096 * 2, f"the buffer grew to {len(out)} bytes"
+    assert "004999" in out, "the newest output was trimmed instead of the oldest"
+
+
+def test_one_line_longer_than_the_whole_budget_is_still_bounded():
+    """A tool that emits no newline arrives as a single enormous line.
+
+    A progress bar redrawing with \r, or binary written to stdout, produces one
+    "line" of whatever size. Refusing to trim the last line left the bound
+    meaningless: 4 MiB was held against a 1 KiB cap.
+    """
+    from steplogs import LiveLog
+
+    live = LiveLog(on_flush=None, max_bytes=1024, every_seconds=10 ** 9)
+    live.add("stdout", "x" * (4 * 1024 * 1024))
+
+    shown = live.snapshot()[0]
+    marker, _, content = shown.partition("\n")
+
+    assert len(content) <= 1024, f"{len(content)} bytes held against a 1024 cap"
+    assert "earlier bytes dropped" in marker, (
+        "the line was cut without saying so, which reads like a tool that "
+        "produced half a line"
+    )
+
+
+def test_the_tail_of_an_oversized_line_is_what_is_kept():
+    """Same reason the oldest lines go first: an error arrives at the end."""
+    from steplogs import LiveLog
+
+    live = LiveLog(on_flush=None, max_bytes=64, every_seconds=10 ** 9)
+    live.add("stderr", "A" * 500 + "THE ERROR")
+
+    assert "THE ERROR" in live.snapshot()[1]
+
+
+def test_a_stream_that_is_not_one_of_the_two_is_refused():
+    """It used to be accumulated into a bucket snapshot() never read.
+
+    Held forever and shown to nobody, which is the worst of both. There are
+    exactly two streams; anything else is a caller error.
+    """
+    import pytest as _pytest
+
+    from steplogs import LiveLog
+
+    live = LiveLog(on_flush=None, every_seconds=10 ** 9)
+    with _pytest.raises(KeyError):
+        live.add("other", "invisible\n")
+
+    # And nothing was kept. Asserting only that it raised was too weak: the
+    # version that accumulated appended the line and THEN raised on the byte
+    # count, so it raised the same KeyError while still holding the content
+    # forever.
+    assert not any(live._lines.get("other") or ()), (
+        "the line was buffered into a bucket nothing will ever read"
+    )
+    assert live.snapshot() == ("", "")
+
+
+def test_a_failed_delivery_is_offered_again():
+    """Otherwise a tool that fell quiet right after one would show nothing more.
+
+    The content is still buffered either way; what was missing was any reason
+    for the ticker to try it again before the next line arrived.
+    """
+    from steplogs import LiveLog
+
+    attempts = []
+
+    def sometimes_angry(out, err):
+        attempts.append(out)
+        if len(attempts) == 1:
+            raise RuntimeError("the consumer is briefly broken")
+
+    live = LiveLog(on_flush=sometimes_angry, every_seconds=10 ** 9)
+    live.add("stdout", "important\n")
+
+    try:
+        live.flush()
+    except RuntimeError:
+        pass
+    live.flush()                       # no new lines added
+
+    assert len(attempts) == 2, (
+        "the content was not offered again after a failed delivery"
+    )
+    assert "important" in attempts[1]
+
+
+def test_trimming_drops_the_oldest_first():
+    """The tail is what matters; an error arrives at the end."""
+    from steplogs import LiveLog
+
+    live = LiveLog(on_flush=None, max_bytes=100, every_seconds=10 ** 9)
+    for n in range(50):
+        live.add("stdout", f"line-{n:03d}\n")
+
+    out, _ = live.snapshot()
+    assert "line-049" in out
+    assert "line-000" not in out
+
+
+def test_both_streams_accumulate_separately():
+    from steplogs import LiveLog
+
+    live = LiveLog()
+    live.add("stdout", "out\n")
+    live.add("stderr", "err\n")
+
+    out, err = live.snapshot()
+    assert out == "out\n" and err == "err\n"
+
+
+def test_the_live_log_survives_two_threads_writing_at_once():
+    """Both reader threads call add(). It has a lock of its own for that."""
+    import threading
+
+    from steplogs import LiveLog
+
+    live = LiveLog(every_seconds=10 ** 9, max_bytes=10 ** 9)
+    barrier = threading.Barrier(2)
+
+    def write(stream):
+        barrier.wait()
+        for n in range(500):
+            live.add(stream, f"{stream}-{n}\n")
+
+    threads = [threading.Thread(target=write, args=(s,))
+               for s in ("stdout", "stderr")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    out, err = live.snapshot()
+    assert out.count("\n") == 500, f"{out.count(chr(10))} of 500 stdout lines"
+    assert err.count("\n") == 500, f"{err.count(chr(10))} of 500 stderr lines"
+
+
+def test_close_waits_for_a_flush_that_is_already_running():
+    """Otherwise a partial log can land after the complete one.
+
+    perform_run closes the live log and then records the authoritative output.
+    If close() only asked the ticker to stop and did not wait, a flush already
+    in progress could deliver its partial snapshot after that.
+    """
+    import threading
+    import time as _time
+
+    from steplogs import LiveLog
+
+    in_flush = threading.Event()
+    finished_flush = threading.Event()
+
+    def slow_flush(out, err):
+        in_flush.set()
+        _time.sleep(0.3)
+        finished_flush.set()
+
+    live = LiveLog(on_flush=slow_flush, every_seconds=0.05)
+    live.start()
+    try:
+        live.add("stdout", "something\n")
+        assert in_flush.wait(5), "the ticker never flushed"
+        live.close()
+        assert finished_flush.is_set(), (
+            "close() returned while a flush was still running; its partial "
+            "snapshot can land after the authoritative record"
+        )
+    finally:
+        live.close()
+
+
+def test_the_flush_callback_is_not_called_holding_the_lock():
+    """A slow consumer must not block anything that appends."""
+    from steplogs import LiveLog
+
+    held = []
+
+    def inspect_lock(out, err):
+        acquired = live._lock.acquire(blocking=False)
+        held.append(not acquired)
+        if acquired:
+            live._lock.release()
+
+    live = LiveLog(on_flush=inspect_lock, every_seconds=10 ** 9)
+    live.add("stdout", "a line\n")
+    live.flush()
+
+    assert held == [False], "the buffer lock was held while calling out"
+
+
+def test_logs_are_readable_while_the_tools_are_still_running(service,
+                                                             monkeypatch):
+    """What the README used to say was impossible.
+
+    Verified against real snakemake as well: a 4.34s two-step workflow flushed
+    at +0.87s, +1.98s and +3.12s, with the visible output growing each time.
+    """
+    import threading
+
+    from fastapi.testclient import TestClient
+
+    printed = threading.Event()
+    release = threading.Event()
+
+    def chatty(ws, timeout_s=None, on_start=None, on_finish=None, on_line=None):
+        on_line("stderr", "rule step_one:\n")
+        on_line("stdout", "the tool is talking\n")
+        printed.set()
+        release.wait(15)
+        with open(os.path.join(ws.path, "tn93.distance-1-out"), "wb") as f:
+            f.write(b"done")
+        return 0, "", "everything is fine\n"
+
+    monkeypatch.setattr(main, "run_snakemake", chatty)
+
+    with TestClient(main.app) as client:
+        run_id = _submit(client).json()["run_id"]
+        assert printed.wait(15), "the stub never ran"
+
+        # Give the flush a moment; it is batched, not synchronous.
+        deadline = time.time() + 10
+        body = {}
+        while time.time() < deadline:
+            body = client.get(f"/runs/{run_id}/logs").json()
+            if body.get("stdout"):
+                break
+            time.sleep(0.05)
+
+        assert body["state"] not in {s.value for s in TERMINAL_STATES}, (
+            "the run had already finished; this test proved nothing"
+        )
+        assert "the tool is talking" in body["stdout"], body
+
+        release.set()
+        _wait(service, run_id, TERMINAL_STATES)
+        final = client.get(f"/runs/{run_id}/logs").json()
+
+    # The authoritative record replaces the partial one.
+    assert final["stderr"] == "everything is fine\n", final["stderr"]
+
+
+def test_a_caller_wanting_logs_but_not_progress_still_gets_them():
+    """on_line used to be wired only when progress was wanted, so asking for
+    live logs alone got neither."""
+    import inspect
+
+    source = inspect.getsource(main.perform_run)
+    assert "on_progress is not None or on_logs is not None" in source
+    assert "on_line=observe if on_progress else None" not in source
+
+
+def test_a_run_does_not_leave_its_ticker_thread_behind(service, monkeypatch):
+    """One thread per run, and runs are the thing this service does most.
+
+    Verified by hand at first, which is not the same as covered: removing the
+    close() passed the whole suite. A service that leaks a thread per run
+    degrades slowly and blames the wrong thing.
+    """
+    import threading
+    import time as _time
+
+    from fastapi.testclient import TestClient
+
+    def quick(ws, timeout_s=None, on_start=None, on_finish=None, on_line=None):
+        on_line("stdout", "a line\n")
+        with open(os.path.join(ws.path, "tn93.distance-1-out"), "wb") as f:
+            f.write(b"done")
+        return 0, "", ""
+
+    monkeypatch.setattr(main, "run_snakemake", quick)
+
+    before = threading.active_count()
+    with TestClient(main.app) as client:
+        for _ in range(12):
+            run_id = _submit(client).json()["run_id"]
+            _wait(service, run_id, TERMINAL_STATES)
+
+    # The tickers wake on an interval, so give any survivor time to be counted.
+    _time.sleep(1.0)
+    leaked = threading.active_count() - before
+
+    assert leaked <= 1, (
+        f"{leaked} threads outlived 12 runs; the ticker is not being stopped"
+    )
+
+
+def test_the_ticker_is_stopped_even_when_the_run_fails(service, monkeypatch):
+    """The failure path is where a finally earns its keep."""
+    import threading
+    import time as _time
+
+    from fastapi.testclient import TestClient
+
+    def explodes(ws, timeout_s=None, on_start=None, on_finish=None, on_line=None):
+        on_line("stderr", "about to fail\n")
+        raise RuntimeError("the runner broke")
+
+    monkeypatch.setattr(main, "run_snakemake", explodes)
+
+    before = threading.active_count()
+    with TestClient(main.app) as client:
+        for _ in range(12):
+            run_id = _submit(client).json()["run_id"]
+            _wait(service, run_id, TERMINAL_STATES)
+
+    _time.sleep(1.0)
+    leaked = threading.active_count() - before
+
+    assert leaked <= 1, (
+        f"{leaked} threads outlived 12 failing runs"
+    )
