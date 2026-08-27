@@ -1,11 +1,14 @@
 from convert import *
 from convert import rule_name_for
+from convert import provenance as bundle_provenance
 import asyncio
+import provenance
 import tempfile
 import weakref
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
+from datetime import datetime, timezone
 from typing import List
 import json
 from pydantic import BaseModel
@@ -108,7 +111,8 @@ class BiochefWorkflow(BaseModel):
 
 def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
                 on_finish=None, on_logs=None, on_progress=None,
-                on_outputs=None, retain=None):
+                on_outputs=None, retain=None, on_manifest=None,
+                run_id=None):
     """One run, start to finish, given its inputs already resolved.
 
     Split out of the handler so the synchronous endpoint and the asynchronous one
@@ -207,6 +211,42 @@ def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
                 detail="an upload occupies a name this run needs: 'Snakefile'",
             )
 
+        started_at = datetime.now(timezone.utc).isoformat()
+
+        def record_manifest(code, catalogue):
+            """Write the manifest, if there is anywhere for it to be read.
+
+            Skipped when there is not, and that is not laziness: building it
+            digests every input and output, a second full read of each. The
+            synchronous path deletes its workspace on the way out and has no
+            run to attach a manifest to, so a manifest written there could
+            never be read.
+            """
+            if on_manifest is None and not KEEP_WORKSPACE:
+                return
+            document = provenance.build(
+                run_id=run_id,
+                workflow_document=workflow_dict,
+                workflow=workflow,
+                ws=ws,
+                inputs=expected,
+                outputs=catalogue,
+                # bundle_provenance, not convert.provenance: `from convert
+                # import *` is followed by `async def convert`, so the module
+                # name is bound to the handler in here.
+                bundles={node.id: bundle_provenance.get(
+                             check_name(node.id.split("-")[0]), {})
+                         for node in workflow.nodes},
+                exit_code=code,
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                runner=RUNNER.describe(),
+                image=getattr(RUNNER, "image", None),
+            )
+            provenance.write(ws, document)
+            if on_manifest is not None:
+                on_manifest(document)
+
         report(RunState.RUNNING)
 
         # Built here because this is where the workflow's nodes are known, and
@@ -232,6 +272,11 @@ def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
             on_logs(out, err, [node.id for node in workflow.nodes])
 
         if code != 0:
+            # Before raising. E5 asks for a manifest recording exit codes, and
+            # the run whose exit code matters most is the one that failed --
+            # which was the only kind that did not get one. Outputs that were
+            # never produced are recorded as absent rather than omitted.
+            record_manifest(code, {node.id: {} for node in workflow.nodes})
             raise HTTPException(
                 status_code=500,
                 detail={"error": "execution_failed", "exit_code": code,
@@ -266,6 +311,10 @@ def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
 
         if on_outputs is not None:
             on_outputs(catalogue)
+
+        # After the outputs exist and before the workspace is released,
+        # because it records the digest of every one of them (#18).
+        record_manifest(code, catalogue)
 
         return results
     finally:
@@ -399,6 +448,9 @@ async def _execute(run_id: str, biochef_workflow: str, inputs):
     def outputs(catalogue):
         RUNS.record_outputs(run_id, catalogue)
 
+    def manifest(document):
+        RUNS.record_manifest(run_id, document)
+
     def retain(ws):
         return RETAINED.keep(run_id, ws)
 
@@ -420,7 +472,8 @@ async def _execute(run_id: str, biochef_workflow: str, inputs):
                 return
             results = await run_in_threadpool(
                 perform_run, biochef_workflow, inputs, progress, started,
-                finished, logs, step_progress, outputs, retain)
+                finished, logs, step_progress, outputs, retain,
+                manifest, run_id)
     except HTTPException as refusal:
         if _was_cancelled(run_id):
             _advance(run_id, RunState.CANCELED)
@@ -671,3 +724,32 @@ async def stream_output(run_id: str, node_id: str, handle: str):
         headers={"Content-Disposition":
                  f'attachment; filename="{node_id}-{handle}"'},
     )
+
+
+@app.get("/runs/{run_id}/manifest")
+async def get_run_manifest(run_id: str):
+    """How this run was produced, in enough detail to attempt it again.
+
+    The workflow by digest, each tool by the digests the registry stated for it,
+    every input and output by content, the runner and image, and the exit code.
+
+    What it does not claim is that re-execution is guaranteed. A tool that reads
+    the clock or the network will not reproduce, and the manifest records what
+    was fixed rather than promising that was everything.
+    """
+    try:
+        run = RUNS.get(run_id)
+    except UnknownRun:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no run {run_id!r}; it never existed, or it finished long "
+                   f"enough ago to have been forgotten",
+        )
+
+    if not run.manifest:
+        raise HTTPException(
+            status_code=404,
+            detail=f"run {run_id!r} has no manifest; it did not finish, or it "
+                   f"failed before its outputs existed",
+        )
+    return run.manifest
