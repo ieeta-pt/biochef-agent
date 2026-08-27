@@ -75,6 +75,47 @@ credentials exits at startup rather than serving anything.
 
 If you point the agent at a registry that *does* authenticate, replace them.
 
+## Exercising the agent
+
+Not from the editor, today. The editor's "Run Workflow with Agent" path is
+commented out upstream — the button, the dialog that asks for the agent's URL,
+and the function that posts to it, all disabled together — so bringing this
+stack up does not give you a button to press. The editor is here so you can work
+on it against a live agent, not because the two are wired end to end yet.
+
+Drive the agent directly instead. It serves interactive documentation:
+
+```
+open http://localhost:8000/docs
+```
+
+or post a workflow and its inputs the way the editor would:
+
+```
+curl -F "biochef_workflow=<workflow.json" -F files=@input.fasta \
+     http://localhost:8000/convert -o results.zip
+```
+
+Both details in that first `-F` matter, and getting either wrong produces the
+same 422, which reads as though the agent is complaining about your workflow:
+
+- `<` and not `@`. The workflow is a form *field* whose value happens to live in
+  a file; the inputs are file *uploads*. `-F name=@file` sends a file part, and
+  the agent rejects it.
+- The **quotes**. Unquoted, the shell reads `<workflow.json` as a redirection
+  and curl never sees it, so the field arrives empty.
+
+Two things to know before re-enabling the editor's path:
+
+- It **hardcodes** `http://localhost:8000/convert` rather than reading any
+  environment variable, so changing `AGENT_PORT` moves the agent out from under
+  it. That is why this compose file sets no `AGENT_URL`: there is nothing to
+  read it.
+- The agent sends no CORS headers, and a browser on `localhost:3000` calling
+  `localhost:8000` is making a cross-origin request. The call will reach the
+  agent and run, but the browser will refuse to hand the response back to the
+  page. Whichever change re-enables that path has to add the headers too.
+
 ## Publishing a tool to your local registry
 
 The stack comes up empty. The agent pulls tool bundles from the registry by the
@@ -95,6 +136,7 @@ REGISTRY_INSECURE=true
 |---|---|
 | a different port | `AGENT_PORT=9000 docker compose up` — also `REGISTRY_PORT`, `FRONTEND_PORT` |
 | the editor elsewhere | `FRONTEND_CONTEXT=/path/to/Biochef docker compose up` |
+| reach it from another device | `BIND_HOST=0.0.0.0 docker compose up` — read the security note first |
 | agent logs | `docker compose logs -f agent` |
 | a shell in the agent | `docker compose exec agent sh` |
 | start over | `docker compose down -v` — the `-v` also drops the registry's contents |
@@ -112,4 +154,13 @@ the dev server reloads. Editing the agent's source does not — rebuild it with
   own.
 - **Plain HTTP**, so nothing here is safe across a network you do not control.
 
-Do not put this on an address other people can reach.
+Which is why every port binds to `127.0.0.1` and not to every interface, as
+docker would by default. The stack is reachable from this machine and nowhere
+else unless you say otherwise:
+
+```
+BIND_HOST=0.0.0.0 docker compose up      # reachable from your network
+```
+
+Do that only on a network you trust, and remember there is nothing asking who
+the caller is.

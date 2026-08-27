@@ -57,6 +57,15 @@ curl -fsS "http://127.0.0.1:${AGENT_PORT}/openapi.json" \
     || fail "the agent came up but does not serve /convert"
 echo "  /convert is in the served OpenAPI document"
 
+# Advertising a path in a schema and routing a request to it are different
+# claims, and only the second is the developer's problem. An empty POST reaches
+# the route and is rejected by validation -- 422, because both form fields are
+# required -- which cannot happen unless the endpoint is really mounted. A 404
+# here would mean the check above had passed vacuously.
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${AGENT_PORT}/convert")
+[ "$code" = "422" ] || fail "POST /convert returned $code, expected 422 (route not mounted?)"
+echo "  POST /convert is routed and validates its input (422 on an empty body)"
+
 echo "=== the agent can reach the registry it was configured with ==="
 # The agent logs in at import, so it would not be answering at all if it could
 # not reach the registry -- but say so explicitly, because that is the coupling

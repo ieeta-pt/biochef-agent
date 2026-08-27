@@ -1,5 +1,13 @@
 # A local BioChef stack: registry, agent, frontend.
 #
+# Every port is published on ${BIND_HOST}, which defaults to 127.0.0.1 rather
+# than to docker's default of every interface. This stack has no authentication
+# anywhere and the agent executes tool binaries pulled from a registry, so a
+# short "8000:8000" would put that on whatever network the machine is attached
+# to -- and the walkthrough would be telling you not to do the thing this file
+# had already done. Set BIND_HOST=0.0.0.0 to reach it from another device, and
+# mean it.
+#
 # The ordering is not cosmetic. The agent builds its ORAS client and logs in at
 # import, so it exits rather than retries if the registry is not answering yet;
 # depends_on with a healthcheck is what makes `up` deterministic instead of a
@@ -12,7 +20,7 @@ services:
     # anonymous push, which is what makes a local stack a five-minute exercise.
     image: registry:2.8.3
     ports:
-      - "${REGISTRY_PORT:-5000}:5000"
+      - "${BIND_HOST:-127.0.0.1}:${REGISTRY_PORT:-5000}:5000"
     environment:
       REGISTRY_STORAGE_DELETE_ENABLED: "true"
     volumes:
@@ -31,7 +39,7 @@ services:
     build:
       context: .
     ports:
-      - "${AGENT_PORT:-8000}:8000"
+      - "${BIND_HOST:-127.0.0.1}:${AGENT_PORT:-8000}:8000"
     environment:
       # In-cluster name and port, not the published one. A developer editing
       # AGENT_PORT should not have to know that this is different.
@@ -84,11 +92,12 @@ services:
     # Uneven on purpose: 8082 is the editor's own port, and the published side
     # is the round number the walkthrough tells people to open.
     ports:
-      - "${FRONTEND_PORT:-3000}:8082"
-    environment:
-      # The address a BROWSER uses, so it is the published one: the editor runs
-      # in the developer's browser, not inside the compose network.
-      AGENT_URL: "http://localhost:${AGENT_PORT:-8000}"
+      - "${BIND_HOST:-127.0.0.1}:${FRONTEND_PORT:-3000}:8082"
+    # Deliberately no AGENT_URL. The editor hardcodes http://localhost:8000
+    # where it would call the agent -- it reads no such variable -- so setting
+    # one here would look like configuration that works and would not. Changing
+    # AGENT_PORT therefore moves the agent out from under the editor; the
+    # walkthrough says so.
     depends_on:
       agent:
         condition: service_healthy
