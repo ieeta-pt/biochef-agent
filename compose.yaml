@@ -1,0 +1,91 @@
+# A local BioChef stack: registry, agent, frontend.
+#
+# The ordering is not cosmetic. The agent builds its ORAS client and logs in at
+# import, so it exits rather than retries if the registry is not answering yet;
+# depends_on with a healthcheck is what makes `up` deterministic instead of a
+# race the developer notices as an agent that "randomly" fails to start.
+
+services:
+  registry:
+    # The reference implementation, pinned. Anything speaking the OCI
+    # distribution API would do; this one needs no configuration to accept an
+    # anonymous push, which is what makes a local stack a five-minute exercise.
+    image: registry:2.8.3
+    ports:
+      - "${REGISTRY_PORT:-5000}:5000"
+    environment:
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+    volumes:
+      - registry-data:/var/lib/registry
+    healthcheck:
+      # Its own API, not a port check: a listening socket says the process
+      # started, not that it will answer a pull.
+      test: ["CMD", "/bin/sh", "-c",
+             "wget -q -O /dev/null http://127.0.0.1:5000/v2/ || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  agent:
+    build:
+      context: .
+    ports:
+      - "${AGENT_PORT:-8000}:8000"
+    environment:
+      # In-cluster name and port, not the published one. A developer editing
+      # AGENT_PORT should not have to know that this is different.
+      REGISTRY_URL: registry:5000
+      # Plain HTTP, because this registry has no certificate. It is why this
+      # file is a development stack and not a deployment.
+      REGISTRY_INSECURE: "true"
+      ORAS_AUTH_BACKEND: basic
+      REGISTRY_USERNAME: ""
+      REGISTRY_PASSWORD: ""
+    depends_on:
+      registry:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=5)"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  frontend:
+    # The editor, from its own repository, mounted rather than built into an
+    # image. It is a sibling checkout: the walkthrough says to clone it beside
+    # this one, and FRONTEND_CONTEXT points elsewhere if it is not.
+    #
+    # A plain node image and an explicit command, so the editor's repository
+    # needs no Dockerfile of its own -- adding one there would make bringing up
+    # this stack depend on a change landing in another repository first.
+    image: node:20-bookworm-slim
+    working_dir: /app
+    volumes:
+      - ${FRONTEND_CONTEXT:-../Biochef}:/app
+      # Kept out of the mount. node_modules built inside the container must not
+      # be written back over the developer's own, which may have been installed
+      # on a different platform.
+      - frontend-modules:/app/node_modules
+    # --host 0.0.0.0 because the port is published out of the container, and
+    # NOT --open, which is in the repository's own start script and would have
+    # the dev server try to launch a browser that is not there.
+    command: >
+      sh -c "npm ci --no-audit --no-fund &&
+             npx webpack serve --mode development
+                  --host 0.0.0.0 --port 3000"
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    environment:
+      # The address a BROWSER uses, so it is the published one: the editor runs
+      # in the developer's browser, not inside the compose network.
+      AGENT_URL: "http://localhost:${AGENT_PORT:-8000}"
+    depends_on:
+      agent:
+        condition: service_healthy
+
+volumes:
+  registry-data:
+  frontend-modules:
