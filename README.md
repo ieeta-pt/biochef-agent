@@ -90,6 +90,12 @@ Both take the same fields:
 | `biochef_workflow` | the editor's workflow JSON, as a string: `{"nodes": [...], "edges": [...]}` |
 | `files` | the input files, one part each |
 
+Inputs go through a `DataSource`. `upload` is the default and the only one
+enabled out of the box, so the request above is unchanged. `localpath` lets a
+workflow name a file already on the agent's host — see `BIOCHEF_DATA_SOURCES`
+below — and a provider writes into the run's workspace rather than returning
+bytes, so a large input is streamed rather than held whole.
+
 **Uploaded files must be named for the edge that carries them.** The converter
 names every intermediate file `{source_node_id}-{source_handle}`, so a file
 feeding the `out` handle of node `input-1` must be uploaded as `input-1-out`.
@@ -141,6 +147,8 @@ Configuration is by environment variable, and `example.env` lists them:
 | `REGISTRY_INSECURE` | `false` | allow a plain-HTTP registry |
 | `ORAS_AUTH_BACKEND` | `token` | ORAS authentication backend |
 | `BIOCHEF_TOOL_CACHE` | `tool-cache` | where pulled tool bundles are kept between runs |
+| `BIOCHEF_DATA_SOURCES` | `upload` | where inputs may come from: `upload`, `localpath` |
+| `BIOCHEF_LOCAL_ROOT` | | the only directory `localpath` may read from |
 | `BIOCHEF_RUN_ROOT` | the system temp directory | where a run's private directory is created |
 | `BIOCHEF_RUN_TIMEOUT` | `900` | seconds before a run's whole process group is killed |
 | `BIOCHEF_KEEP_WORKSPACE` | `false` | leave a run's directory behind, for debugging |
@@ -163,6 +171,18 @@ not identity -- every holder is the same caller -- but it is the difference
 between an open endpoint and a closed one. Selecting `bearer` without a token
 stops the service from starting rather than letting it run with a token nobody
 has to guess.
+
+`BIOCHEF_DATA_SOURCES` decides where a run's inputs may come from. It defaults
+to `upload` alone — bytes pushed in the request, which is what the editor does.
+Adding `localpath` lets a workflow name a file already on the agent's host, which
+is the ordinary case inside a TRE where the data is already on the machine.
+
+**`localpath` requires `BIOCHEF_LOCAL_ROOT`,** and refuses to start without it.
+The client chooses the path, so a source that could read anywhere would be an
+arbitrary-file-read with a workflow engine attached: a workflow naming
+`/etc/shadow` as an input would have it copied into a workspace and returned as a
+tool's output. Paths are resolved before being checked against the root, so a
+symlink inside it pointing outward is refused too.
 
 Three more decide how isolated a run is, and are worth reading twice before
 changing.

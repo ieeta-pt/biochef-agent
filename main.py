@@ -17,6 +17,7 @@ from workspace import UnsafeName, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
 from runs import (IllegalTransition, RunState, RunStore, TERMINAL,
                   UnknownRun)
+from datasource import DataSourceError, get_sources
 from steplogs import Progress, failing_steps
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
 from runner import SubprocessRunner, get_runner
@@ -27,6 +28,14 @@ app = FastAPI()
 # before the handler is entered, so a limit enforced in /convert would be
 # refusing bytes that are already on disk (#11).
 app.add_middleware(BodySizeLimitMiddleware)
+
+SOURCES = get_sources()
+"""Where this deployment permits inputs to come from.
+
+Resolved at import, like the runner and the auth provider, so a deployment
+naming a source that does not exist fails to start rather than refusing every
+submission that uses it.
+"""
 
 AUTH = get_auth(os.getenv("BIOCHEF_AUTH", NoAuth.name))
 """Who may ask this service to run something.
@@ -95,15 +104,18 @@ class BiochefWorkflow(BaseModel):
     edges: list
 
 
-def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None,
+def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
                 on_finish=None, on_logs=None, on_progress=None):
-    """One run, start to finish, given the uploads already read.
+    """One run, start to finish, given its inputs already resolved.
 
     Split out of the handler so the synchronous endpoint and the asynchronous one
-    execute the same code rather than two copies that drift. The uploads arrive
-    as (name, bytes) because the asynchronous path has to read them while the
-    request is still open -- by the time the work runs, there is no request left
-    to read them from.
+    execute the same code rather than two copies that drift.
+
+    `inputs` is a list of (source, name, spec). The spec is whatever that source
+    needs -- bytes for an upload, a path for localpath -- and uploads arrive
+    already read because the asynchronous path has to consume them while the
+    request is still open; by the time the work runs there is no request left to
+    read from.
 
     Synchronous on purpose: every step here blocks, and both callers hand it to a
     worker thread. `progress` is called with each RunState as it is entered, and
@@ -137,22 +149,35 @@ def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None,
         # output does not exist yet.
         expected = expected_uploads(workflow)
         seen = set()
-        for filename, content in uploads:
+        for source_name, filename, spec in inputs:
             name = check_name(filename)
             if name not in expected:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"upload {name!r} is not an input of this workflow; "
+                    detail=f"input {name!r} is not an input of this workflow; "
                            f"it expects {sorted(expected)}",
                 )
+            # Which names are legitimate is settled here, against the workflow,
+            # before any provider is asked. A source deciding its own
+            # destination is how a fetch becomes a write to somewhere else.
+            source = SOURCES.get(source_name)
+            if source is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"input {name!r} names source {source_name!r}, which "
+                           f"this deployment does not permit; it allows "
+                           f"{sorted(SOURCES)}",
+                )
             try:
-                ws.write_bytes(name, content)
+                source.fetch(ws, name, spec)
             except FileExistsError:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"upload {name!r} was sent twice, or shadows a "
+                    detail=f"input {name!r} was supplied twice, or shadows a "
                            f"file this run already created",
                 )
+            except DataSourceError as failure:
+                raise HTTPException(status_code=400, detail=str(failure))
             seen.add(name)
 
         if expected - seen:
@@ -246,8 +271,8 @@ async def convert(
     Kept as it was because it is the contract the editor speaks today. /runs is
     the same work without the wait.
     """
-    uploads = [(f.filename, await f.read()) for f in files]
-    return await run_in_threadpool(perform_run, biochef_workflow, uploads)
+    inputs = [("upload", f.filename, await f.read()) for f in files]
+    return await run_in_threadpool(perform_run, biochef_workflow, inputs)
 
 
 MAX_CONCURRENT_RUNS = int(os.getenv("BIOCHEF_MAX_CONCURRENT_RUNS", "4"))
@@ -312,7 +337,7 @@ is its own piece of work.
 """
 
 
-async def _execute(run_id: str, biochef_workflow: str, uploads):
+async def _execute(run_id: str, biochef_workflow: str, inputs):
     """Do the run, and record how it ended.
 
     Every path out of here reaches a terminal state. A run stuck in RUNNING
@@ -352,7 +377,7 @@ async def _execute(run_id: str, biochef_workflow: str, uploads):
                 _advance(run_id, RunState.CANCELED)
                 return
             results = await run_in_threadpool(
-                perform_run, biochef_workflow, uploads, progress, started,
+                perform_run, biochef_workflow, inputs, progress, started,
                 finished, logs, step_progress)
     except HTTPException as refusal:
         if _was_cancelled(run_id):
@@ -412,9 +437,9 @@ async def submit_run(
     difference between this and /convert, and the reason it cannot simply call
     the same handler in the background.
     """
-    uploads = [(f.filename, await f.read()) for f in files]
+    inputs = [("upload", f.filename, await f.read()) for f in files]
     run = RUNS.create()
-    task = asyncio.create_task(_execute(run.run_id, biochef_workflow, uploads))
+    task = asyncio.create_task(_execute(run.run_id, biochef_workflow, inputs))
     # Held until it finishes, then dropped. See _running above: without this the
     # task can be collected mid-run and the run never reaches a terminal state.
     _running.add(task)

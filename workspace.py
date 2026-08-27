@@ -139,6 +139,27 @@ class Workspace:
         with self.open_write(name, exclusive=exclusive) as fh:
             return fh.write(data)
 
+    def write_stream(self, name: str, source, *, exclusive: bool = True,
+                     chunk_size: int = 1024 * 1024) -> int:
+        """Copy a readable into the workspace without holding it in memory.
+
+        Through the same descriptor as write_bytes, so a streamed input gets the
+        identical O_EXCL and O_NOFOLLOW treatment -- the difference is how much
+        of it exists at once, not where it lands or what it may overwrite.
+
+        This is what lets a data source hand over a multi-gigabyte file. A
+        provider returning bytes would put every input through memory whole,
+        which is the ceiling D2 exists to lift.
+        """
+        written = 0
+        with self.open_write(name, exclusive=exclusive) as fh:
+            while True:
+                chunk = source.read(chunk_size)
+                if not chunk:
+                    break
+                written += fh.write(chunk)
+        return written
+
     def place_executable(self, source_path: str, name: str) -> str:
         """Copy a tool binary in and make it executable.
 
@@ -146,7 +167,7 @@ class Workspace:
         written through the same descriptor as everything else.
         """
         with open(source_path, "rb") as src:
-            self.write_bytes(name, src.read())
+            self.write_stream(name, src)
         os.chmod(name, 0o700, dir_fd=self._fd)
         return os.path.join(self.path, name)
 
