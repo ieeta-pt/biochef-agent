@@ -363,3 +363,68 @@ def test_the_check_happens_before_the_manifest_is_used_for_anything(monkeypatch)
         "the signature is checked after the cache decision, which already "
         "trusted the manifest"
     )
+
+
+# --- the acceptance criterion itself ----------------------------------------
+
+class _RefusingRegistry(_RawRegistry):
+    """A registry whose blobs must never be asked for."""
+
+    def __init__(self, body):
+        super().__init__(body)
+        self.pulled = False
+
+    def pull(self, **kwargs):
+        self.pulled = True
+        raise AssertionError("the bundle was pulled despite a refused signature")
+
+
+def test_strict_stops_a_bundle_before_it_is_ever_pulled(tmp_path, monkeypatch):
+    """#14's acceptance, driven through fetch_tool rather than around it.
+
+    Everything above tests signing.check in isolation, which proves what that
+    function decides and nothing about whether the decision reaches the fetch.
+    That is the gap this suite had: a verification function nobody wired up
+    passes every unit test it has.
+
+    The registry here raises if its blobs are requested, so a refusal that
+    happened too late would fail rather than pass quietly.
+    """
+    cosign = _stub_cosign(tmp_path, 1, "no matching signatures")
+    registry = _RefusingRegistry(json.dumps({"layers": []}).encode())
+
+    monkeypatch.setattr(convert, "client", registry)
+    monkeypatch.setattr(convert, "REGISTRY_URL", "reg.test")
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("BIOCHEF_SIGNING_MODE", "strict")
+    monkeypatch.setenv("BIOCHEF_SIGNING_POLICY",
+                       _policy_file(tmp_path, registry_prefix="reg.test/plugins-"))
+    monkeypatch.setenv("BIOCHEF_COSIGN", cosign)
+
+    with pytest.raises(signing.SignatureError):
+        convert.fetch_tool("samtools", "plugins-samtools.view:1.0")
+
+    assert not registry.pulled, "the refusal came after the bundle was fetched"
+    assert not (tmp_path / "cache").exists(), (
+        "a cache directory was created for a bundle that was refused"
+    )
+
+
+def test_off_still_pulls_so_the_test_above_is_not_passing_for_the_wrong_reason(
+        tmp_path, monkeypatch):
+    """Guard against the refusal being someone else's error.
+
+    If fetch_tool failed here for an unrelated reason -- a malformed manifest,
+    a missing container -- the test above would pass without the signature check
+    having done anything. With verification off, the same call must get far
+    enough to reach the pull.
+    """
+    registry = _RefusingRegistry(json.dumps({"layers": []}).encode())
+    monkeypatch.setattr(convert, "client", registry)
+    monkeypatch.setattr(convert, "REGISTRY_URL", "reg.test")
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("BIOCHEF_SIGNING_MODE", "off")
+
+    with pytest.raises(AssertionError, match="pulled despite"):
+        convert.fetch_tool("samtools", "plugins-samtools.view:1.0")
+    assert registry.pulled
