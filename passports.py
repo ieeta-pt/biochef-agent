@@ -158,16 +158,31 @@ def jwks_url_for(issuer, fetch=None):
 def verify(token, keyset, *, issuer, audience=None):
     """One JWT, checked against one key set. Returns its claims.
 
-    `audience` may be None, which means the token is not required to name one.
-    That is a real configuration for some deployments and a bad default for
-    most, which is why auth.py requires it to be set deliberately.
+    `audience` may be None, meaning the token is not required to name one. That
+    is a real configuration for issuers that mint audience-less tokens and a bad
+    default for everyone else, because without the check a token the same issuer
+    minted for a DIFFERENT service can be replayed here. auth.py therefore makes
+    it a required setting with `any` as the written-out opt-out -- an earlier
+    version of this docstring claimed that and it was not true, which is exactly
+    the sort of thing a comment can assert and a reader will believe.
     """
     try:
         header = jwt.get_unverified_header(token)
     except jwt.PyJWTError as exc:
         raise PassportError(f"not a usable token: {exc}") from exc
 
-    key = keyset.key_for(header.get("kid"))
+    try:
+        key = keyset.key_for(header.get("kid"))
+    except PassportError:
+        raise
+    except Exception as exc:
+        # Anything the key fetch throws -- a reset connection, a DNS failure, a
+        # timeout, a proxy returning HTML -- becomes a refusal here rather than
+        # escaping as a 500. It refuses either way, so this is about the shape of
+        # the answer and not about safety; but an outage at the identity
+        # provider should read as "not authenticated", not as this service
+        # having crashed.
+        raise PassportError(f"the issuer's keys could not be fetched: {exc}") from exc
     options = {"require": ["exp", "iss"], "verify_aud": audience is not None}
     try:
         return jwt.decode(

@@ -13,6 +13,7 @@ consults would be worse than the gap.
 import hmac
 import json
 import os
+import threading
 from typing import Optional
 
 from fastapi import HTTPException, Request
@@ -142,7 +143,22 @@ class PassportAuth(AuthProvider):
                 "rather than accept a token from anywhere."
             )
 
-        self._audience = _setting(audience, "BIOCHEF_PASSPORT_AUDIENCE") or None
+        # Required, with a spelled-out way to opt out. Without an audience
+        # check, a passport the same issuer minted for a DIFFERENT service is
+        # accepted here -- the caller never intended this service to see it, and
+        # whoever holds it can replay it against us. That is a real deployment
+        # for issuers that mint audience-less tokens, so it stays possible; it
+        # just has to be typed out rather than reached by leaving a box empty.
+        audience_setting = _setting(audience, "BIOCHEF_PASSPORT_AUDIENCE")
+        if not audience_setting:
+            raise ValueError(
+                "BIOCHEF_AUTH=passport needs BIOCHEF_PASSPORT_AUDIENCE set to "
+                "the audience this service is named by, so a token minted for "
+                "another service cannot be replayed here. Set it to 'any' if "
+                "the issuer genuinely mints tokens without an audience, and "
+                "understand that any token from that issuer will be accepted."
+            )
+        self._audience = None if audience_setting == "any" else audience_setting
 
         raw_issuers = _setting(visa_issuers, "BIOCHEF_PASSPORT_VISA_ISSUERS")
         self._visa_issuers = frozenset(
@@ -170,7 +186,7 @@ class PassportAuth(AuthProvider):
             _setting(jwks_url, "BIOCHEF_PASSPORT_JWKS_URL") or None, self._issuer
         )
         self._visa_keysets = {}
-        self._lock = __import__("threading").Lock()
+        self._lock = threading.Lock()
 
     def _keyset_for(self, issuer):
         with self._lock:

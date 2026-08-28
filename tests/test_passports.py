@@ -440,7 +440,8 @@ def test_requiring_a_visa_without_naming_issuers_refuses_to_start(broker):
     the very visa being required.
     """
     with pytest.raises(ValueError) as caught:
-        auth.PassportAuth(issuer=BROKER, required_visa="ControlledAccessGrants",
+        auth.PassportAuth(issuer=BROKER, audience=AUDIENCE,
+                          required_visa="ControlledAccessGrants",
                           visa_issuers="",
                           keyset_factory=lambda url, issuer: keyset_for(broker))
     assert "VISA_ISSUERS" in str(caught.value)
@@ -471,3 +472,49 @@ def test_every_passport_setting_is_documented():
         text = (REPO_ROOT / path).read_text()
         for name in names:
             assert name in text, f"{name} is read by the code but absent from {path}"
+
+
+def test_no_audience_refuses_to_start(broker, monkeypatch):
+    """Without it, a token the same issuer minted for ANOTHER service is
+    accepted here -- the caller never intended us to see it, and whoever holds
+    it can replay it against us."""
+    monkeypatch.delenv("BIOCHEF_PASSPORT_AUDIENCE", raising=False)
+    with pytest.raises(ValueError) as caught:
+        auth.PassportAuth(issuer=BROKER,
+                          keyset_factory=lambda url, issuer: keyset_for(broker))
+    assert "AUDIENCE" in str(caught.value)
+    assert "'any'" in str(caught.value), "the message must say how to opt out"
+
+
+def test_the_opt_out_is_spelled_out_rather_than_reached_by_an_empty_box(broker):
+    """`any` is a real deployment for issuers that mint audience-less tokens.
+    It stays possible; it just has to be typed."""
+    provider = auth.PassportAuth(
+        issuer=BROKER, audience="any",
+        keyset_factory=lambda url, issuer: keyset_for(broker))
+    assert provider._audience is None
+    token = broker.sign(passport_claims(aud="some-entirely-other-service"))
+    assert provider.authenticate(_Request(f"Bearer {token}")) == f"{BROKER}#user-1"
+
+
+def test_a_configured_audience_refuses_a_token_minted_for_someone_else(broker):
+    provider = auth.PassportAuth(
+        issuer=BROKER, audience=AUDIENCE,
+        keyset_factory=lambda url, issuer: keyset_for(broker))
+    token = broker.sign(passport_claims(aud="some-entirely-other-service"))
+    with pytest.raises(auth.Unauthenticated):
+        provider.authenticate(_Request(f"Bearer {token}"))
+
+
+def test_a_jwks_outage_is_a_refusal_and_not_a_crash(broker):
+    """A transient network failure must not escape as a 500. It refuses either
+    way, so this is about the shape of the answer rather than about safety."""
+    class _Down:
+        def key_for(self, kid):
+            raise ConnectionResetError("connection reset by peer")
+
+    provider = auth.PassportAuth(
+        issuer=BROKER, audience=AUDIENCE,
+        keyset_factory=lambda url, issuer: _Down())
+    with pytest.raises(auth.Unauthenticated):
+        provider.authenticate(_Request(f"Bearer {broker.sign(passport_claims())}"))
