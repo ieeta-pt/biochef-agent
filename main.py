@@ -3,6 +3,7 @@ from convert import rule_name_for
 from convert import provenance as bundle_provenance
 import asyncio
 import provenance
+import wes
 import tempfile
 import weakref
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
@@ -751,6 +752,109 @@ async def stream_output(run_id: str, node_id: str, handle: str):
         headers={"Content-Disposition":
                  f'attachment; filename="{node_id}-{handle}"'},
     )
+
+
+# --- the GA4GH WES surface (#24) --------------------------------------------
+#
+# A mapping, not a second implementation. Every endpoint below reads the same
+# RunStore the bespoke API reads, and a run submitted through either is the same
+# run -- which is why B1 took the WES RunState vocabulary and put cancel at
+# WES's path in the first place.
+
+
+@app.get(f"{wes.BASE}/service-info")
+async def wes_service_info():
+    """What this server is, and what it will refuse."""
+    return wes.service_info(RUNS.state_counts(), auth_provider=AUTH.name)
+
+
+@app.get(f"{wes.BASE}/runs")
+async def wes_list_runs(page_size: int = None, page_token: str = None):
+    """Every run still held.
+
+    page_size and page_token are accepted and ignored, which service-info says
+    under not_implemented. Refusing them would fail conformant clients that send
+    a page size by default; pretending to honour them would silently return a
+    different set than was asked for.
+    """
+    return wes.run_list(RUNS.all())
+
+
+@app.post(f"{wes.BASE}/runs", status_code=200)
+async def wes_run_workflow(
+    request: Request,
+    workflow_type: str = Form(...),
+    workflow_url: str = Form(...),
+    workflow_params: str = Form("{}"),
+    workflow_type_version: str = Form(""),
+    workflow_attachment: List[UploadFile] = File(default=[]),
+    tags: str = Form("{}"),
+):
+    """WES's submission, mapped onto the same machinery as POST /runs.
+
+    Answers 200 with a run_id, which is what WES specifies -- the bespoke
+    endpoint answers 202, and the difference is the specification's rather than
+    a disagreement about what happened.
+    """
+    try:
+        wes.check_type(workflow_type, workflow_type_version)
+    except wes.UnsupportedWorkflow as refusal:
+        raise HTTPException(status_code=400, detail=str(refusal))
+
+    attachments = []
+    for f in workflow_attachment:
+        spooled = tempfile.NamedTemporaryFile(delete=False)
+        try:
+            while True:
+                chunk = await f.read(1024 * 1024)
+                if not chunk:
+                    break
+                spooled.write(chunk)
+        finally:
+            spooled.close()
+        attachments.append((f.filename, spooled.name))
+
+    try:
+        (_, workflow_path), inputs = wes.select_workflow(workflow_url, attachments)
+    except wes.MissingWorkflow as refusal:
+        raise HTTPException(status_code=400, detail=str(refusal))
+
+    with open(workflow_path, "r") as handle:
+        document = handle.read()
+
+    state = getattr(request, "scope", {}).get("state") or {}
+    run = RUNS.create(caller=state.get("caller"),
+                      authenticated_by=state.get("authenticated_by"))
+    handed = [("handedover", name, path) for name, path in inputs]
+    task = asyncio.create_task(_execute(run.run_id, document, handed))
+    _running.add(task)
+    task.add_done_callback(_running.discard)
+    return {"run_id": run.run_id}
+
+
+@app.get(f"{wes.BASE}/runs/{{run_id}}/status")
+async def wes_run_status(run_id: str):
+    try:
+        return wes.run_status(RUNS.get(run_id))
+    except UnknownRun:
+        raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
+
+
+@app.get(f"{wes.BASE}/runs/{{run_id}}")
+async def wes_run_log(run_id: str):
+    try:
+        return wes.run_log(RUNS.get(run_id))
+    except UnknownRun:
+        raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
+
+
+@app.post(f"{wes.BASE}/runs/{{run_id}}/cancel")
+async def wes_cancel_run(run_id: str):
+    """The same cancellation the bespoke endpoint performs, called rather than
+    repeated: two implementations of stopping a process group would be two
+    things to keep correct, and the second is the one that gets forgotten."""
+    await cancel_run(run_id)
+    return {"run_id": run_id}
 
 
 @app.get("/runs/{run_id}/manifest")
