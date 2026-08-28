@@ -94,6 +94,9 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_CONTAINER_IMAGE` | `docker://debian:stable-slim` | image each step runs in, under the `apptainer` runner |
 | `BIOCHEF_APPTAINER_CACHE` | `apptainer-cache` | where pulled container images are kept between runs |
 | `BIOCHEF_APPTAINER_ARGS` | `--contain` | extra flags for apptainer itself |
+| `BIOCHEF_SIGNING_MODE` | `off` | `off`, `warn`, or `strict` — whether a bundle must be signed to run |
+| `BIOCHEF_SIGNING_POLICY` | *(unset)* | path to the Hub's `biochef.signing-policy.v1` document |
+| `BIOCHEF_COSIGN` | `cosign` | the cosign executable to verify with |
 
 Three of those decide how isolated a run is, and are worth reading twice before
 changing.
@@ -103,6 +106,19 @@ as the user this service runs as**. `apptainer` runs each step in a container
 instead. The container is the boundary between an untrusted tool binary and the
 machine, so on any deployment holding data that matters, `apptainer` is the
 setting you want.
+
+`BIOCHEF_SIGNING_MODE` defaults to `off`, which is what this service did before
+it could verify anything and is named so that it reads as a decision. The Hub
+signs and attests every bundle it publishes; `strict` makes a bundle that does
+not carry a signature this policy accepts refuse to run, which is what a TRE
+needs. `warn` verifies and reports but runs anyway, which is how you find out
+what your catalogue actually looks like before switching it on.
+
+`strict` fails closed in every direction: no cosign on `PATH`, no policy, an
+unreadable policy, a reference outside the policy's own registry prefix, or a
+manifest whose digest could not be established are all refusals. A verification
+step that passes when it could not run is worse than none, because it is
+believed.
 
 `BIOCHEF_CONTAINER_IMAGE` must carry a scheme — `docker://`, `oras://`,
 `library://`, `shub://`, `http://`, `https://` — or be an absolute path to a

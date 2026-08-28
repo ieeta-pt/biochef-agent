@@ -10,6 +10,7 @@ from enum import Enum
 
 from dotenv import load_dotenv
 
+import signing
 from workspace import check_name
 
 load_dotenv()
@@ -214,6 +215,56 @@ def verify_against_manifest(target, staging, manifest=None):
             )
 
 
+# Taken from oras rather than restated: a manifest media type oras would accept
+# must not be refused here just because this file has an older list.
+try:
+    import oras.defaults
+    _MANIFEST_TYPES = ", ".join(oras.defaults.default_manifest_accepted_media_types)
+except Exception:  # pragma: no cover - a stubbed oras in the test suite
+    _MANIFEST_TYPES = "application/vnd.oci.image.manifest.v1+json"
+
+
+def fetch_manifest(target):
+    """The manifest and the digest that names it, from a single fetch.
+
+    oras parses the response and throws it away, so the manifest digest -- which
+    is defined as the hash of the exact bytes served, not of anything we could
+    re-serialise -- is not recoverable from what get_manifest returns. Signature
+    verification needs that digest, and needs it to name the same artifact the
+    blobs are pulled from, so the request happens here and both are kept.
+
+    The digest is computed from the bytes rather than taken from the registry's
+    Docker-Content-Digest header. The header is advisory and comes from the same
+    party as the manifest; if both are present and disagree, that is refused,
+    because a registry answering one thing and labelling it another is not a
+    situation to pick a winner in.
+
+    Falls back to oras's own accessor for any client that cannot do a raw
+    request, returning no digest -- which strict mode refuses, so the fallback
+    cannot quietly become a way to skip verification.
+    """
+    container = client.get_container(target)
+    if not (hasattr(client, "do_request") and hasattr(client, "prefix")):
+        return client.get_manifest(container), None
+
+    url = f"{client.prefix}://{container.manifest_url()}"
+    response = client.do_request(url, "GET", headers={"Accept": _MANIFEST_TYPES})
+    if response.status_code != 200:
+        raise ToolIntegrityError(
+            f"{target}: the registry answered {response.status_code} for its manifest"
+        )
+
+    body = response.content
+    digest = "sha256:" + hashlib.sha256(body).hexdigest()
+    advertised = response.headers.get("Docker-Content-Digest")
+    if advertised and advertised != digest:
+        raise ToolIntegrityError(
+            f"{target}: the registry served a manifest whose digest is {digest} "
+            f"but labelled it {advertised}"
+        )
+    return json.loads(body), digest
+
+
 def fetch_tool(tool_id, repo):
     """Pull a bundle into the shared cache and return it.
 
@@ -227,11 +278,18 @@ def fetch_tool(tool_id, repo):
     outdir = os.path.join(TOOL_CACHE, tool_id)
     target = f"{REGISTRY_URL}/{repo}"
 
-    # Fetched once, and used for both the cache check and the verification of
-    # anything pulled, so the two are talking about the same artifact. Two
-    # separate fetches made an ordinary push to the same tag, mid-pull, look
-    # exactly like tampering.
-    manifest = client.get_manifest(client.get_container(target))
+    # Fetched once, and used for the signature check, the cache check and the
+    # verification of anything pulled, so all three are talking about the same
+    # artifact. Two separate fetches made an ordinary push to the same tag,
+    # mid-pull, look exactly like tampering.
+    manifest, manifest_digest = fetch_manifest(target)
+
+    # Before the manifest is used for anything else, because everything else
+    # trusts it. cache_matches decides whether the cached bundle is still good
+    # by comparing against this manifest, and verify_against_manifest checks
+    # pulled blobs against the digests this manifest declares -- so a manifest
+    # nobody vouched for makes both of those self-consistent and meaningless.
+    signing.check(target, manifest_digest, log=print)
 
     # On EVERY call, not only on a miss. The cache is what materialise_tools
     # copies into a run and chmods 0700, so verifying only the pull that created
