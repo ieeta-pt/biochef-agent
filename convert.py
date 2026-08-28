@@ -21,8 +21,11 @@ load_dotenv()
 # tools run in a container.
 #
 # .env is treated as something the operator set, so it wins over the profile.
-_PROFILE = profiles.apply()
-print(profiles.describe(_PROFILE))
+# Applied here, reported by main. Importing this module must not print: the
+# catalogue converter and the test suite both import it, and a module that
+# writes to stdout as a side effect of being imported interleaves with whatever
+# its importer was saying.
+PROFILE = profiles.apply()
 
 REGISTRY_URL = os.getenv("REGISTRY_URL", "registry.biochef.app")
 REGISTRY_USERNAME = os.getenv("REGISTRY_USERNAME", " ")

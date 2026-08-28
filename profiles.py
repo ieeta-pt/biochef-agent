@@ -47,8 +47,13 @@ PROFILES = {
         "BIOCHEF_KEEP_WORKSPACE": "false",
         "REGISTRY_INSECURE": "false",
     },
-    # A trusted research environment. Everything `server` has, and the intent
-    # that nothing leaves except to the registry.
+    # A trusted research environment. Byte for byte the same as `server` today,
+    # and that is worth stating rather than leaving to be discovered: with the
+    # settings this service currently has there is nothing further to tighten.
+    # What distinguishes a TRE is the egress expectation below, which nothing
+    # here enforces. When a setting exists that does distinguish them -- signing
+    # mode, once #75 lands; a network policy later -- this is where it goes, and
+    # the test that tre is never weaker than server is what keeps that true.
     TRE: {
         "BIOCHEF_AUTH": "bearer",
         "BIOCHEF_RUNNER": "apptainer",
@@ -74,10 +79,13 @@ class ProfileError(Exception):
 class Applied:
     """What a profile actually did, as opposed to what it describes."""
 
-    def __init__(self, name, applied, overridden):
+    def __init__(self, name, applied, overridden, environ=None):
         self.name = name
         self.applied = applied
         self.overridden = overridden
+        # Kept so describe() can report what the configuration MEANS from what
+        # actually took effect, rather than from what the profile asked for.
+        self.environ = environ
 
     def __bool__(self):
         return True
@@ -110,7 +118,40 @@ def apply(environ=None):
             continue
         environ[key] = value
         applied.append((key, value))
-    return Applied(name, applied, overridden)
+    return Applied(name, applied, overridden, environ)
+
+
+# What a setting means, for the values where the meaning is the whole point. Read
+# from the EFFECTIVE environment rather than from the profile, because the case
+# worth catching is the one where they differ: a profile asking for bearer while
+# something already set none has to report that this service answers anybody.
+CONSEQUENCES = {
+    ("BIOCHEF_AUTH", "none"):
+        "this service will answer anybody who can reach it",
+    ("BIOCHEF_RUNNER", "subprocess"):
+        "tools run on the host as this service's user, with no container "
+        "between them and the machine",
+    ("REGISTRY_INSECURE", "true"):
+        "registry traffic is plain HTTP",
+    ("BIOCHEF_KEEP_WORKSPACE", "true"):
+        "run directories are kept after a run finishes",
+}
+
+
+def consequences(environ=None):
+    """The effective configuration, said in terms of what it permits.
+
+    The README's complaint about the defaults is that nothing tells an operator
+    which service they are running. Printing BIOCHEF_AUTH=none does not fix
+    that: it repeats the value they already typed. This says what it means.
+    """
+    environ = os.environ if environ is None else environ
+    found = []
+    for (key, value), meaning in sorted(CONSEQUENCES.items()):
+        current = (environ.get(key) or "").strip().lower()
+        if current == value:
+            found.append(meaning)
+    return found
 
 
 def describe(result):
@@ -122,7 +163,9 @@ def describe(result):
     rather than counted.
     """
     if result is None:
-        return "No profile selected; every setting is its own default."
+        lines = ["No profile selected; every setting is its own default."]
+        lines += [f"  {meaning}" for meaning in consequences()]
+        return "\n".join(lines)
 
     lines = [f"Profile {result.name!r}:"]
     for key, value in result.applied:
@@ -132,6 +175,11 @@ def describe(result):
             f"  {key}={existing}   (profile asks for {value}; "
             f"the environment already set this and wins)"
         )
+    said = consequences(result.environ)
+    if said:
+        lines.append("  which means:")
+        lines += [f"    - {meaning}" for meaning in said]
+
     if result.name == TRE:
         lines.append("  egress is expected to be restricted to:")
         for entry in TRE_EGRESS_ALLOWLIST:

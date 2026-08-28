@@ -133,11 +133,31 @@ Profile 'tre':
   BIOCHEF_RUNNER=apptainer
   REGISTRY_INSECURE=false
   BIOCHEF_AUTH=none   (profile asks for bearer; the environment already set this and wins)
+  which means:
+    - this service will answer anybody who can reach it
+  egress is expected to be restricted to:
+    - the OCI registry named by REGISTRY_URL, for pulling tool bundles
+  which this service states and does NOT enforce.
 ```
 
 Selecting `tre` and having authentication off is something you might genuinely
 want and something you might do by accident. Those are indistinguishable unless
 startup says so.
+
+The **which means** lines are the point. `BIOCHEF_AUTH=none` only repeats the
+value you already typed; what you need to know is that it means this service
+answers anybody. Those lines are read from what actually took effect, not from
+what the profile asked for — so the example above says the service is open even
+though it says `tre` two lines earlier, which is exactly the situation worth
+seeing.
+
+### `server` and `tre` are currently identical
+
+Not an oversight. With the settings this service has today there is nothing
+further to tighten for a TRE; what distinguishes it is the egress expectation
+below, which nothing here enforces. A test asserts `tre` is never *weaker* than
+`server`, because the tempting way to differentiate them later is to relax
+something in `server`.
 
 An unrecognised profile name refuses to start rather than falling back to a
 default nobody chose.

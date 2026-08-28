@@ -57,6 +57,79 @@ def test_every_profile_is_documented():
         assert f"`{name}`" in readme, f"profile {name!r} is not in README.md"
 
 
+def test_the_setting_that_selects_a_profile_is_itself_documented():
+    """It escapes the guard that covers every other setting.
+
+    test_settings_are_documented scans for `getenv("NAME")`, and this one is
+    read as environ.get so that apply() can be given a dictionary. So the
+    variable that turns the whole feature on is the one variable that scan does
+    not cover, and renaming it would break nothing and be noticed by nobody.
+    """
+    for path in ("README.md", "example.env"):
+        text = (REPO_ROOT / path).read_text()
+        assert "BIOCHEF_PROFILE" in text, f"BIOCHEF_PROFILE is absent from {path}"
+
+
+def test_tre_is_never_weaker_than_server():
+    """They are identical today, and the direction of any future difference.
+
+    With the settings this service currently has there is nothing in tre left to
+    tighten; what distinguishes it is an egress expectation nothing here
+    enforces. That is worth pinning rather than leaving as an accident, because
+    the tempting way to differentiate them later is to relax something in server.
+    """
+    server = profiles.PROFILES[profiles.SERVER]
+    tre = profiles.PROFILES[profiles.TRE]
+    for key, value in server.items():
+        assert key in tre, f"tre drops {key}, which server sets"
+        assert tre[key] == value or key in ("BIOCHEF_APPTAINER_ARGS",), (
+            f"tre sets {key}={tre[key]!r} where server sets {value!r}; if that "
+            f"is deliberate, tre must be the stricter of the two"
+        )
+
+
+def test_the_report_says_what_the_configuration_means_not_what_was_typed():
+    """The README's own complaint, applied to its own output.
+
+    Printing BIOCHEF_AUTH=none repeats the value the operator typed. The thing
+    they need to know is that it means this service answers anybody.
+    """
+    text = profiles.describe(profiles.apply({"BIOCHEF_PROFILE": "dev"}))
+    assert "answer anybody" in text
+    assert "on the host" in text
+
+
+def test_the_meaning_is_read_from_what_took_effect_not_from_the_profile():
+    """The case the whole feature exists for.
+
+    A profile asking for bearer while something already set none must report
+    that this service answers anybody -- reading the meaning off the profile's
+    intent would print the exact opposite of the truth, next to the word `tre`.
+    """
+    text = profiles.describe(
+        profiles.apply({"BIOCHEF_PROFILE": "tre", "BIOCHEF_AUTH": "none"})
+    )
+    assert "answer anybody" in text
+
+
+def test_a_hardened_profile_reports_no_consequences_to_warn_about():
+    text = profiles.describe(profiles.apply({"BIOCHEF_PROFILE": "tre"}))
+    assert "answer anybody" not in text
+    assert "which means" not in text
+
+
+def test_importing_convert_does_not_print():
+    """A module that writes to stdout when imported interleaves with whatever
+    its importer was saying. The catalogue converter imports this."""
+    body = (REPO_ROOT / "convert.py").read_text()
+    code = "\n".join(line.split("#", 1)[0] for line in body.splitlines())
+    assert "profiles.apply(" in code, "convert no longer applies the profile"
+    assert "profiles.describe(" not in code, (
+        "convert prints the profile report at import time"
+    )
+    assert "profiles.describe(" in (REPO_ROOT / "main.py").read_text()
+
+
 def test_no_profile_selected_changes_nothing():
     """Adding this must not change what an existing deployment does."""
     environ = {"BIOCHEF_RUNNER": "subprocess"}
