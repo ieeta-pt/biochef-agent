@@ -518,3 +518,39 @@ def test_a_jwks_outage_is_a_refusal_and_not_a_crash(broker):
         keyset_factory=lambda url, issuer: _Down())
     with pytest.raises(auth.Unauthenticated):
         provider.authenticate(_Request(f"Bearer {broker.sign(passport_claims())}"))
+
+
+def test_auth_imports_without_the_passport_dependencies():
+    """A deployment using none or bearer must not need PyJWT or cryptography.
+
+    This is pinned because it is exactly the property a tidy-up removes without
+    noticing. One did: moving `import passports` to the top of auth.py looked
+    like cleaning up a function-level import, and quietly made every deployment
+    fail to start without a dependency it never uses.
+
+    Run in a subprocess with those modules blocked, because auth is already
+    imported in this process and re-importing it would find the cached module.
+    """
+    import subprocess
+
+    program = (
+        "import builtins, sys\n"
+        "real = builtins.__import__\n"
+        "def blocked(name, *a, **k):\n"
+        "    if name.split('.')[0] in ('jwt', 'cryptography'):\n"
+        "        raise ImportError(name)\n"
+        "    return real(name, *a, **k)\n"
+        "builtins.__import__ = blocked\n"
+        "sys.path.insert(0, %r)\n"
+        "import auth\n"
+        "assert auth.get_auth('none')\n"
+        "assert 'passport' in auth.PROVIDERS\n"
+        "print('ok')\n" % str(REPO_ROOT)
+    )
+    done = subprocess.run([sys.executable, "-c", program],
+                          capture_output=True, text=True)
+    assert done.returncode == 0, (
+        f"auth.py cannot be imported without the passport dependencies:\n"
+        f"{done.stderr[-800:]}"
+    )
+    assert "ok" in done.stdout

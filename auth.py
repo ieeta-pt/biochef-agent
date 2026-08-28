@@ -14,8 +14,6 @@ import hmac
 import json
 import os
 import threading
-
-import passports
 from typing import Optional
 
 from fastapi import HTTPException, Request
@@ -197,6 +195,18 @@ class PassportAuth(AuthProvider):
             return self._visa_keysets[issuer]
 
     def authenticate(self, request: Request) -> Optional[str]:
+        # Imported here, and NOT because of a circular import -- passports does
+        # not import this module. It is imported late so that this file can be
+        # imported at all without PyJWT and cryptography present, because the
+        # none and bearer providers do not need them and a deployment using
+        # either should not fail to start over a dependency it never uses.
+        #
+        # An earlier commit moved this to the top as tidying, on the grounds
+        # that a function-level import looks like it is working around
+        # something. It was working around something; the comment saying so was
+        # what was missing.
+        import passports
+
         header = request.headers.get("authorization")
         if not header:
             raise Unauthenticated("no credentials were presented")
@@ -242,6 +252,8 @@ def _setting(value, name):
 
 
 def _default_keyset_factory(jwks_url, issuer):
+    import passports
+
     return passports.KeySet(jwks_url or passports.jwks_url_for(issuer))
 
 
