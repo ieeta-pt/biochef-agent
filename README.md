@@ -92,6 +92,12 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_MAX_UPLOAD_BYTES` | `536870912` | largest request body accepted, in bytes |
 | `BIOCHEF_AUTH` | `none` | who may call it: `none` or `bearer` |
 | `BIOCHEF_AUTH_TOKEN` | | the shared token, required when `BIOCHEF_AUTH=bearer` |
+| `BIOCHEF_PASSPORT_ISSUER` | *(unset)* | the issuer whose passports are accepted, when `BIOCHEF_AUTH=passport` |
+| `BIOCHEF_PASSPORT_AUDIENCE` | *(unset)* | the audience a passport must name |
+| `BIOCHEF_PASSPORT_JWKS_URL` | *(discovered)* | override the issuer's published key set URL |
+| `BIOCHEF_PASSPORT_VISA_ISSUERS` | *(unset)* | comma-separated issuers whose visas count |
+| `BIOCHEF_PASSPORT_REQUIRE_VISA` | *(unset)* | a visa type a caller must hold to be let in |
+| `BIOCHEF_PASSPORT_REQUIRE_VISA_VALUE` | *(unset)* | the exact value that visa must carry |
 | `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess` or `apptainer` |
 | `BIOCHEF_CONTAINER_IMAGE` | `docker://debian:stable-slim` | image each step runs in, under the `apptainer` runner |
 | `BIOCHEF_APPTAINER_CACHE` | `apptainer-cache` | where pulled container images are kept between runs |
@@ -136,6 +142,37 @@ binds the host's `/tmp` into the container, and that is where a run's directory
 lives unless `BIOCHEF_RUN_ROOT` says otherwise. Without it, a containerised tool
 is walled off from `/usr` and `/etc` while still able to read **every other
 run's data**. Emptying this variable turns that off deliberately.
+
+## Passports
+
+`BIOCHEF_AUTH=passport` accepts a GA4GH Passport instead of a shared secret, and
+names the caller `<issuer>#<subject>` — with the issuer, because two brokers can
+each have a subject `12345` and recording only the second half would merge two
+people into one caller.
+
+**A visa is signed separately from the passport carrying it**, usually by
+somebody else: a broker authenticates you, and a data controller independently
+asserts what you may see. So verifying the access token tells you *nothing*
+about its visas. Each one is verified on its own, against its own issuer's keys,
+and only from issuers named in `BIOCHEF_PASSPORT_VISA_ISSUERS`.
+
+Without that list the feature would be worse than absent — anyone could stand up
+an issuer, mint themselves the very visa being required, and be admitted by a
+service that believes it is checking credentials. Setting
+`BIOCHEF_PASSPORT_REQUIRE_VISA` without it **refuses to start**.
+
+A visa here is a condition of being let in, not an authorisation model. What a
+named caller may then do is still undecided, deliberately: returning roles
+nobody consults would be worse than the gap.
+
+Visas from issuers not on the list are **ignored, not fatal** — a passport
+legitimately carries visas about institutions this service knows nothing about,
+and refusing the request because of one would make a caller's unrelated
+affiliations break their access here.
+
+Refusals do not say which check failed. Whether it was the signature, the
+issuer, the audience or the expiry is a fact about this deployment's
+configuration, and telling an unauthenticated caller is telling them how to aim.
 
 ## How a request is served
 

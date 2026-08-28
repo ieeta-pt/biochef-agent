@@ -115,6 +115,122 @@ class BearerAuth(AuthProvider):
         return "bearer-token"
 
 
+class PassportAuth(AuthProvider):
+    """A GA4GH Passport, and the visas it carries, checked one at a time.
+
+    The third provider auth.py's docstring anticipated, and it keeps to the same
+    narrow job: it names a caller or it refuses. A required visa is a condition
+    of being let in, not an authorisation model -- what a named caller may then
+    do is still undecided, and still deliberately so.
+
+    Configuration is deliberately explicit and fails at startup rather than on
+    the first request, exactly as bearer does. A deployment that asked for
+    passports and named no issuer would otherwise start, look configured, and
+    either refuse everything or -- far worse -- accept tokens from anywhere.
+    """
+
+    name = "passport"
+
+    def __init__(self, issuer=None, audience=None, jwks_url=None,
+                 visa_issuers=None, required_visa=None, required_value=None,
+                 keyset_factory=None):
+        self._issuer = _setting(issuer, "BIOCHEF_PASSPORT_ISSUER")
+        if not self._issuer:
+            raise ValueError(
+                "BIOCHEF_AUTH=passport needs BIOCHEF_PASSPORT_ISSUER set to the "
+                "issuer whose tokens this service accepts. Refusing to start "
+                "rather than accept a token from anywhere."
+            )
+
+        self._audience = _setting(audience, "BIOCHEF_PASSPORT_AUDIENCE") or None
+
+        raw_issuers = _setting(visa_issuers, "BIOCHEF_PASSPORT_VISA_ISSUERS")
+        self._visa_issuers = frozenset(
+            entry.strip() for entry in (raw_issuers or "").split(",") if entry.strip()
+        )
+
+        self._required_visa = _setting(required_visa,
+                                       "BIOCHEF_PASSPORT_REQUIRE_VISA") or None
+        self._required_value = _setting(required_value,
+                                        "BIOCHEF_PASSPORT_REQUIRE_VISA_VALUE") or None
+
+        # Requiring a visa without saying whose visas count is the configuration
+        # that looks strictest and is weakest: every issuer on the internet
+        # becomes an authority, and a caller can mint their own.
+        if self._required_visa and not self._visa_issuers:
+            raise ValueError(
+                "BIOCHEF_PASSPORT_REQUIRE_VISA is set but "
+                "BIOCHEF_PASSPORT_VISA_ISSUERS is empty. A visa is only worth "
+                "anything if its issuer is one you named in advance -- otherwise "
+                "anybody can mint themselves the visa you are requiring."
+            )
+
+        self._factory = keyset_factory or _default_keyset_factory
+        self._token_keyset = self._factory(
+            _setting(jwks_url, "BIOCHEF_PASSPORT_JWKS_URL") or None, self._issuer
+        )
+        self._visa_keysets = {}
+        self._lock = __import__("threading").Lock()
+
+    def _keyset_for(self, issuer):
+        with self._lock:
+            if issuer not in self._visa_keysets:
+                self._visa_keysets[issuer] = self._factory(None, issuer)
+            return self._visa_keysets[issuer]
+
+    def authenticate(self, request: Request) -> Optional[str]:
+        import passports
+
+        header = request.headers.get("authorization")
+        if not header:
+            raise Unauthenticated("no credentials were presented")
+        scheme, _, presented = header.partition(" ")
+        if scheme.lower() != "bearer" or not presented:
+            raise Unauthenticated("expected an Authorization: Bearer <passport>")
+
+        try:
+            claims = passports.verify(presented, self._token_keyset,
+                                      issuer=self._issuer,
+                                      audience=self._audience)
+        except passports.PassportError as refusal:
+            # The reason is not echoed back. Which of signature, issuer,
+            # audience or expiry failed is a fact about our configuration, and
+            # telling an unauthenticated caller is telling them how to aim.
+            raise Unauthenticated("the passport presented was not accepted")
+
+        subject = claims.get("sub")
+        if not subject:
+            raise Unauthenticated("the passport names no subject")
+
+        if self._required_visa:
+            accepted, _ = passports.verify_visas(
+                passports.raw_visas(claims),
+                trusted_issuers=self._visa_issuers,
+                keyset_for=self._keyset_for,
+            )
+            if not passports.satisfies(accepted, self._required_visa,
+                                       self._required_value):
+                raise Unauthenticated(
+                    "the passport carries no visa this service requires")
+
+        # The issuer travels with the subject. Two brokers can each have a
+        # subject "12345", and an audit trail recording only the second half
+        # would merge two people into one caller.
+        return f"{self._issuer}#{subject}"
+
+
+def _setting(value, name):
+    if value is not None:
+        return value
+    return (os.getenv(name, "") or "").strip()
+
+
+def _default_keyset_factory(jwks_url, issuer):
+    import passports
+
+    return passports.KeySet(jwks_url or passports.jwks_url_for(issuer))
+
+
 class AuthenticationMiddleware:
     """Refuse before the body is read, not after.
 
@@ -156,6 +272,7 @@ class AuthenticationMiddleware:
 
 
 PROVIDERS = {
+    PassportAuth.name: PassportAuth,
     NoAuth.name: NoAuth,
     BearerAuth.name: BearerAuth,
 }
