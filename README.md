@@ -294,6 +294,38 @@ If the trail cannot be written, the run fails rather than proceeding unrecorded.
 A deployment that believes it is auditing and is not is in a worse position than
 one that knows it is not.
 
+## The GA4GH WES surface
+
+The same runs, at the standard path, so third parties do not have to learn this
+service's own API:
+
+```
+GET  /ga4gh/wes/v1/service-info
+GET  /ga4gh/wes/v1/runs
+POST /ga4gh/wes/v1/runs
+GET  /ga4gh/wes/v1/runs/{run_id}
+GET  /ga4gh/wes/v1/runs/{run_id}/status
+POST /ga4gh/wes/v1/runs/{run_id}/cancel
+```
+
+It is a mapping, not a second implementation: every endpoint reads the same run
+store the bespoke API reads, and a run submitted through either is the same run.
+That is why the run states are WES's `RunState` vocabulary and why cancel was
+already at WES's path. The bespoke endpoints stay — the editor uses them.
+
+**The declared workflow type is `BIOCHEF`, not `CWL`.** This service runs
+BioChef workflow documents converted to Snakemake; it cannot run CWL, and saying
+otherwise would make every conformant client discover this server, upload its
+data, and then fail. `service-info` exists so a client can find that out before
+it commits, so a submission naming another type is refused by name with a
+message saying what would have been accepted.
+
+`service-info` also lists, under `tags.not_implemented`, where the standard
+surface stops: `workflow_url` may only name an attachment (a remote URL is not
+fetched, which would mean executing a document from wherever a caller pointed
+this service), run listing is not paginated, and `task_logs` carries one entry
+per workflow step without per-task commands.
+
 ## How a request is served
 
 1. A private directory is created for this run, and uploaded files are written
