@@ -36,7 +36,6 @@ import json
 import threading
 import time
 import urllib.request
-from datetime import timezone
 
 import jwt
 from jwt import PyJWKSet

@@ -14,6 +14,8 @@ import hmac
 import json
 import os
 import threading
+
+import passports
 from typing import Optional
 
 from fastapi import HTTPException, Request
@@ -195,8 +197,6 @@ class PassportAuth(AuthProvider):
             return self._visa_keysets[issuer]
 
     def authenticate(self, request: Request) -> Optional[str]:
-        import passports
-
         header = request.headers.get("authorization")
         if not header:
             raise Unauthenticated("no credentials were presented")
@@ -242,8 +242,6 @@ def _setting(value, name):
 
 
 def _default_keyset_factory(jwks_url, issuer):
-    import passports
-
     return passports.KeySet(jwks_url or passports.jwks_url_for(issuer))
 
 
