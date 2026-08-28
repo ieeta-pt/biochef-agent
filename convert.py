@@ -10,9 +10,22 @@ from enum import Enum
 
 from dotenv import load_dotenv
 
+import profiles
 from workspace import check_name
 
 load_dotenv()
+
+# After the .env file and before the first getenv below, because every setting
+# in this service is read at import. A profile that arrived later would be
+# describing a service that had already decided who may call it and whether
+# tools run in a container.
+#
+# .env is treated as something the operator set, so it wins over the profile.
+# Applied here, reported by main. Importing this module must not print: the
+# catalogue converter and the test suite both import it, and a module that
+# writes to stdout as a side effect of being imported interleaves with whatever
+# its importer was saying.
+PROFILE = profiles.apply()
 
 REGISTRY_URL = os.getenv("REGISTRY_URL", "registry.biochef.app")
 REGISTRY_USERNAME = os.getenv("REGISTRY_USERNAME", " ")

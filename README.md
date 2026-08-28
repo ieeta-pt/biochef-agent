@@ -88,6 +88,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_TOOL_CACHE` | `tool-cache` | where pulled tool bundles are kept between runs |
 | `BIOCHEF_RUN_ROOT` | the system temp directory | where a run's private directory is created |
 | `BIOCHEF_RUN_TIMEOUT` | `900` | seconds before a run's whole process group is killed |
+| `BIOCHEF_PROFILE` | *(unset)* | a named starting point: `dev`, `server` or `tre` |
 | `BIOCHEF_KEEP_WORKSPACE` | `false` | leave a run's directory behind, for debugging |
 | `BIOCHEF_MAX_UPLOAD_BYTES` | `536870912` | largest request body accepted, in bytes |
 | `BIOCHEF_AUTH` | `none` | who may call it: `none` or `bearer` |
@@ -105,6 +106,72 @@ not identity -- every holder is the same caller -- but it is the difference
 between an open endpoint and a closed one. Selecting `bearer` without a token
 stops the service from starting rather than letting it run with a token nobody
 has to guess.
+
+## Profiles
+
+Sixteen settings is more than anyone configures correctly from scratch, and the
+two that decide how exposed a run is both default to the unguarded option.
+`BIOCHEF_PROFILE` names a starting point:
+
+| profile | for | authentication | tools run |
+|---|---|---|---|
+| `dev` | a laptop | none | on the host |
+| `server` | somewhere other people can reach | bearer token | in a container, `--contain` |
+| `tre` | a trusted research environment | bearer token | in a container, `--contain` |
+
+A profile sets **defaults**. Anything already in the environment — including
+anything in `.env` — wins, because a configuration system that silently discards
+what an operator explicitly set is worse than one that makes them set more.
+
+That means a profile can be undone by a stray variable, so startup prints what
+actually took effect and names every setting the profile did not get to decide:
+
+```
+Profile 'tre':
+  BIOCHEF_APPTAINER_ARGS=--contain
+  BIOCHEF_KEEP_WORKSPACE=false
+  BIOCHEF_RUNNER=apptainer
+  REGISTRY_INSECURE=false
+  BIOCHEF_AUTH=none   (profile asks for bearer; the environment already set this and wins)
+  which means:
+    - this service will answer anybody who can reach it
+  egress is expected to be restricted to:
+    - the OCI registry named by REGISTRY_URL, for pulling tool bundles
+  which this service states and does NOT enforce.
+```
+
+Selecting `tre` and having authentication off is something you might genuinely
+want and something you might do by accident. Those are indistinguishable unless
+startup says so.
+
+The **which means** lines are the point. `BIOCHEF_AUTH=none` only repeats the
+value you already typed; what you need to know is that it means this service
+answers anybody. Those lines are read from what actually took effect, not from
+what the profile asked for — so the example above says the service is open even
+though it says `tre` two lines earlier, which is exactly the situation worth
+seeing.
+
+### `server` and `tre` are currently identical
+
+Not an oversight. With the settings this service has today there is nothing
+further to tighten for a TRE; what distinguishes it is the egress expectation
+below, which nothing here enforces. A test asserts `tre` is never *weaker* than
+`server`, because the tempting way to differentiate them later is to relax
+something in `server`.
+
+An unrecognised profile name refuses to start rather than falling back to a
+default nobody chose.
+
+### What `tre` does not do
+
+`tre` states an egress allowlist — outbound traffic is expected to reach only
+the OCI registry named by `REGISTRY_URL` — and **does not enforce it**.
+Enforcement at this stage is an external proxy, a systemd unit or a network
+policy. The profile exists so whatever does enforce it has a written list to be
+checked against; a Python dictionary does not constrain outbound traffic, and
+documentation implying otherwise would be the dangerous kind.
+
+## The settings that decide isolation
 
 Three more decide how isolated a run is, and are worth reading twice before
 changing.
