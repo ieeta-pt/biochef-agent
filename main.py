@@ -5,7 +5,7 @@ import asyncio
 import provenance
 import tempfile
 import weakref
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from datetime import datetime, timezone
@@ -542,6 +542,7 @@ def _advance(run_id, state, **detail):
 
 @app.post("/runs", status_code=202)
 async def submit_run(
+    request: Request,
     biochef_workflow: str = Form(...),
     files: List[UploadFile] = File(...)
 ):
@@ -569,7 +570,13 @@ async def submit_run(
             spooled.close()
         inputs.append(("handedover", f.filename, spooled.name))
 
-    run = RUNS.create()
+    # Whatever the authentication provider knew about the caller, which for the
+    # bearer provider is nothing. Recorded as None rather than as a guess: the
+    # audit trail says which provider authorised the request, so "we do not know
+    # who" reads as a fact about the deployment and not as a hole in the log.
+    state = getattr(request, "scope", {}).get("state") or {}
+    run = RUNS.create(caller=state.get("caller"),
+                      authenticated_by=state.get("authenticated_by"))
     task = asyncio.create_task(_execute(run.run_id, biochef_workflow, inputs))
     # Held until it finishes, then dropped. See _running above: without this the
     # task can be collected mid-run and the run never reaches a terminal state.

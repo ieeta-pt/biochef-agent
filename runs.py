@@ -14,6 +14,8 @@ persistent store is its own piece of work.
 import os
 import threading
 import uuid
+
+import audit
 from collections import OrderedDict
 from enum import Enum
 
@@ -157,8 +159,10 @@ class RunStore:
         self._lock = threading.Lock()
         self._max = MAX_RUNS if max_runs is None else max_runs
 
-    def create(self) -> Run:
+    def create(self, caller=None, authenticated_by=None) -> Run:
         run = Run(uuid.uuid4().hex)
+        run.caller = caller
+        run.authenticated_by = authenticated_by
         with self._lock:
             self._evict_if_needed()
             self._runs[run.run_id] = run
@@ -193,6 +197,23 @@ class RunStore:
                 )
 
             run.state = state
+            # Here rather than at each call site, because this is the only place
+            # a state changes. A hook at the call sites is one a new transition
+            # forgets to add, and the gap in an audit trail is invisible from
+            # inside the thing that should have written it.
+            audit.record(
+                "run.state",
+                run_id=run_id,
+                # .value, not str(): this is a str-Enum, and str() gives
+                # "RunState.RUNNING" rather than the WES term "RUNNING". #64
+                # adopted that vocabulary precisely so the states would be
+                # legible to something that is not this service, and an
+                # exported trail is exactly that reader.
+                state=state.value,
+                caller=getattr(run, "caller", None),
+                authenticated_by=getattr(run, "authenticated_by", None),
+                error=error,
+            )
             if outputs is not None:
                 run.outputs = outputs
             if error is not None:
