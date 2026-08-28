@@ -140,7 +140,15 @@ class AuthenticationMiddleware:
             return
 
         try:
-            self.provider.authenticate(Request(scope))
+            # Kept, not discarded. authenticate() is documented to return an
+            # identity, and until now nothing held onto it -- so the audit trail
+            # had no way to say who, and a provider that knows more about the
+            # caller had nowhere to put it. None is a real answer here and is
+            # recorded as one: the bearer provider has no identity to give.
+            scope.setdefault("state", {})["caller"] = (
+                self.provider.authenticate(Request(scope))
+            )
+            scope["state"]["authenticated_by"] = self.provider.name
         except HTTPException as refusal:
             body = json.dumps({"detail": refusal.detail}).encode()
             headers = [(b"content-type", b"application/json"),

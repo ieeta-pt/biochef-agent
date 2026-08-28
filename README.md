@@ -191,6 +191,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_LOCAL_ROOT` | | the only directory `localpath` may read from |
 | `BIOCHEF_RUN_ROOT` | the system temp directory | where a run's private directory is created |
 | `BIOCHEF_RUN_TIMEOUT` | `900` | seconds before a run's whole process group is killed |
+| `BIOCHEF_AUDIT_LOG` | *(unset)* | path to an append-only JSONL audit trail; unset writes none |
 | `BIOCHEF_KEEP_WORKSPACE` | `false` | leave a run's directory behind, for debugging |
 | `BIOCHEF_MAX_UPLOAD_BYTES` | `536870912` | largest request body accepted, in bytes |
 | `BIOCHEF_MAX_RUNS` | `256` | how many runs are remembered for polling |
@@ -256,6 +257,42 @@ binds the host's `/tmp` into the container, and that is where a run's directory
 lives unless `BIOCHEF_RUN_ROOT` says otherwise. Without it, a containerised tool
 is walled off from `/usr` and `/etc` while still able to read **every other
 run's data**. Emptying this variable turns that off deliberately.
+
+## The audit trail
+
+`BIOCHEF_AUDIT_LOG` names a file that records every state a run reaches — who
+asked, which run, which state, when, and the error if one ended it. One JSON
+object per line, appended and never rewritten. Unset writes nothing, which is
+the existing behaviour and stays the default.
+
+```json
+{"schema":"biochef.audit-event.v1","event":"run.state","at":"2026-08-28T10:11:12+00:00","authenticated_by":"bearer","caller":null,"error":null,"run_id":"9f3c…","state":"COMPLETE"}
+```
+
+The record is written at the single point where a run's state changes, not at
+each call site, because a hook per call site is one a new transition forgets —
+and a gap in an audit trail is invisible from inside the thing that should have
+written it.
+
+Three things it deliberately does not claim:
+
+- **It is append-only, not immutable.** Anything that can write the file can
+  truncate it. Immutability is the filesystem's job: ship the file somewhere
+  append-only, or set the append-only attribute. Claiming otherwise would be the
+  dangerous kind of assurance.
+- **`caller` is whatever the authentication provider knew**, which for `bearer`
+  is nothing — a shared secret is not an identity and every holder is the same
+  caller. The event records which provider authorised the request, so "we do not
+  know who" reads as a fact about the deployment rather than a hole in the log.
+  A provider that carries identity lights this field up without the format
+  changing.
+- **There is no endpoint that serves it.** An audit trail reachable over the
+  same API it audits is a thing an attacker reads to find out what you noticed.
+  Export it from the filesystem.
+
+If the trail cannot be written, the run fails rather than proceeding unrecorded.
+A deployment that believes it is auditing and is not is in a worse position than
+one that knows it is not.
 
 ## How a request is served
 
