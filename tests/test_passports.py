@@ -554,3 +554,57 @@ def test_auth_imports_without_the_passport_dependencies():
         f"{done.stderr[-800:]}"
     )
     assert "ok" in done.stdout
+
+
+def test_an_unreachable_issuer_does_not_stop_the_service_starting(monkeypatch):
+    """The same outage, answered the same way whichever side of startup it falls.
+
+    Building the key set in the constructor meant asking the issuer for its
+    discovery document at boot, so a provider that was briefly unreachable
+    stopped this service from starting and an orchestrator then restart-looped
+    it. That outage during a request was already a 401, and there is no reason
+    for the answer to depend on when the network happened to fail.
+    """
+    def unreachable(url):
+        raise OSError("identity provider unreachable")
+
+    monkeypatch.setattr(passports, "_fetch_json", unreachable)
+    provider = auth.PassportAuth(issuer=BROKER, audience=AUDIENCE)
+    assert provider.name == "passport"
+
+
+def test_an_unreachable_issuer_is_a_401_on_the_first_request(broker, monkeypatch):
+    def unreachable(url):
+        raise OSError("identity provider unreachable")
+
+    monkeypatch.setattr(passports, "_fetch_json", unreachable)
+    provider = auth.PassportAuth(issuer=BROKER, audience=AUDIENCE)
+    with pytest.raises(auth.Unauthenticated):
+        provider.authenticate(_Request(f"Bearer {broker.sign(passport_claims())}"))
+
+
+def test_misconfiguration_is_still_fatal_at_startup():
+    """Laziness applies to the network, not to configuration.
+
+    A missing issuer, or a visa requirement with no trusted issuers, is a
+    mistake nobody should discover from a 401 at three in the morning.
+    """
+    with pytest.raises(ValueError):
+        auth.PassportAuth(issuer="", audience=AUDIENCE)
+    with pytest.raises(ValueError):
+        auth.PassportAuth(issuer=BROKER, audience="")
+    with pytest.raises(ValueError):
+        auth.PassportAuth(issuer=BROKER, audience=AUDIENCE,
+                          required_visa="ControlledAccessGrants", visa_issuers="")
+
+
+def test_a_bug_in_this_file_is_not_disguised_as_a_refusal(broker):
+    """`except Exception` would turn a TypeError of ours into a routine 401."""
+    class _Broken:
+        def key_for(self, kid):
+            raise AttributeError("a bug, not a failed credential")
+
+    provider = auth.PassportAuth(issuer=BROKER, audience=AUDIENCE,
+                                 keyset_factory=lambda url, issuer: _Broken())
+    with pytest.raises(AttributeError):
+        provider.authenticate(_Request(f"Bearer {broker.sign(passport_claims())}"))

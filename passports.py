@@ -174,13 +174,18 @@ def verify(token, keyset, *, issuer, audience=None):
         key = keyset.key_for(header.get("kid"))
     except PassportError:
         raise
-    except Exception as exc:
-        # Anything the key fetch throws -- a reset connection, a DNS failure, a
-        # timeout, a proxy returning HTML -- becomes a refusal here rather than
-        # escaping as a 500. It refuses either way, so this is about the shape of
-        # the answer and not about safety; but an outage at the identity
-        # provider should read as "not authenticated", not as this service
-        # having crashed.
+    except (OSError, ValueError) as exc:
+        # What the key fetch legitimately throws: OSError for a reset
+        # connection, a DNS failure or a timeout, ValueError for a proxy
+        # answering HTML where JSON was expected. Those become a refusal rather
+        # than escaping as a 500 -- it refuses either way, so this is about the
+        # shape of the answer, but an outage at the identity provider should
+        # read as "not authenticated" and not as this service having crashed.
+        #
+        # NOT `except Exception`, which is what this said first. A TypeError or
+        # an AttributeError from our own code would have been turned into a
+        # routine-looking 401, which is the most effective way to hide a bug
+        # that exists.
         raise PassportError(f"the issuer's keys could not be fetched: {exc}") from exc
     options = {"require": ["exp", "iss"], "verify_aud": audience is not None}
     try:

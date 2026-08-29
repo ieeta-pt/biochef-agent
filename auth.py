@@ -182,11 +182,27 @@ class PassportAuth(AuthProvider):
             )
 
         self._factory = keyset_factory or _default_keyset_factory
-        self._token_keyset = self._factory(
-            _setting(jwks_url, "BIOCHEF_PASSPORT_JWKS_URL") or None, self._issuer
-        )
+        self._jwks_url = _setting(jwks_url, "BIOCHEF_PASSPORT_JWKS_URL") or None
+        # Resolved on first use, not here. Building it now means asking the
+        # issuer for its discovery document at startup, so an identity provider
+        # that is briefly unreachable stops this service from starting at all --
+        # and an orchestrator then restart-loops it. The same outage DURING a
+        # request is already a 401, and there is no reason for the answer to
+        # depend on which side of startup the network happened to fail.
+        #
+        # Configuration is still checked above, and still fatal. A missing
+        # issuer or a visa requirement with no trusted issuers is a mistake
+        # nobody should discover from a 401 at three in the morning; an
+        # unreachable host is not that kind of mistake.
+        self._token_keyset = None
         self._visa_keysets = {}
         self._lock = threading.Lock()
+
+    def _token_keys(self):
+        with self._lock:
+            if self._token_keyset is None:
+                self._token_keyset = self._factory(self._jwks_url, self._issuer)
+            return self._token_keyset
 
     def _keyset_for(self, issuer):
         with self._lock:
@@ -215,11 +231,21 @@ class PassportAuth(AuthProvider):
             raise Unauthenticated("expected an Authorization: Bearer <passport>")
 
         try:
-            claims = passports.verify(presented, self._token_keyset,
+            claims = passports.verify(presented, self._token_keys(),
                                       issuer=self._issuer,
                                       audience=self._audience)
-        except passports.PassportError as refusal:
-            # The reason is not echoed back. Which of signature, issuer,
+        except (passports.PassportError, OSError, ValueError):
+            # PassportError covers the token itself. OSError and ValueError
+            # cover resolving where the issuer keeps its keys, which is now done
+            # on first use and can fail for every reason a network call can.
+            # Both end the same way, because "we could not establish the key"
+            # and "the key says no" are both "not authenticated" to a caller.
+            #
+            # Deliberately not `except Exception`. A TypeError or an
+            # AttributeError in this file is a bug of ours, and turning it into
+            # a 401 would hide it behind an answer that looks routine.
+            #
+            # The reason is not echoed back either. Which of signature, issuer,
             # audience or expiry failed is a fact about our configuration, and
             # telling an unauthenticated caller is telling them how to aim.
             raise Unauthenticated("the passport presented was not accepted")
