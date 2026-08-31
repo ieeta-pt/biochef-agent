@@ -167,6 +167,28 @@ def discover(issuer, fetch=None):
     return document
 
 
+# The port each scheme implies, so a broker that writes it in one place and
+# omits it in the other is not refused for saying the same thing twice over.
+DEFAULT_PORTS = {"https": 443, "http": 80}
+
+
+def _host_of(url):
+    """Host and port, with a redundant default port removed.
+
+    Comparing netloc directly made https://b.test:443/oidc and
+    https://b.test/oidc/jwk look like different hosts, which is a conformant
+    broker refused over punctuation.
+    """
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return ""
+    port = parsed.port
+    if port is None or port == DEFAULT_PORTS.get(parsed.scheme.lower()):
+        return host
+    return f"{host}:{port}"
+
+
 def _same_host_as(issuer, url, what):
     """Refuse an endpoint the issuer's own document points elsewhere.
 
@@ -182,8 +204,8 @@ def _same_host_as(issuer, url, what):
     them sets BIOCHEF_PASSPORT_JWKS_URL or BIOCHEF_PASSPORT_USERINFO_URL and
     says so out loud.
     """
-    issuer_host = urllib.parse.urlparse(issuer).netloc.lower()
-    url_host = urllib.parse.urlparse(url).netloc.lower()
+    issuer_host = _host_of(issuer)
+    url_host = _host_of(url)
     if not url_host or url_host != issuer_host:
         raise PassportError(
             f"{issuer} publishes a {what} at {url_host or 'no host'}, which is "

@@ -15,6 +15,7 @@ import json
 import os
 import threading
 import time
+import urllib.parse
 from typing import Optional
 
 from fastapi import HTTPException, Request
@@ -172,6 +173,19 @@ class PassportAuth(AuthProvider):
                 "understand that any token from that issuer will be accepted."
             )
         self._audience = None if audience_setting == "any" else audience_setting
+
+        # Validated here, not left to produce puzzling refusals later. An issuer
+        # that is not an https URL with a host cannot have its discovery
+        # document fetched, so every request would fail for a reason that has
+        # nothing to do with the credential presented -- and a plain-http issuer
+        # would be one whose keys can be replaced in transit.
+        parsed = urllib.parse.urlparse(self._issuer)
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise ValueError(
+                f"BIOCHEF_PASSPORT_ISSUER is {self._issuer!r}, which is not an "
+                f"https URL with a host. Refusing to start rather than refuse "
+                f"every request for a reason that looks like the caller's fault."
+            )
 
         raw_issuers = _setting(visa_issuers, "BIOCHEF_PASSPORT_VISA_ISSUERS")
         self._visa_issuers = frozenset(

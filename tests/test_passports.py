@@ -1191,3 +1191,40 @@ def test_every_passport_setting_including_the_newest_is_documented():
         text = (REPO_ROOT / path).read_text()
         for name in names:
             assert name in text, f"{name} is read by the code but absent from {path}"
+
+
+def test_a_redundant_default_port_is_not_a_different_host():
+    """Comparing netloc directly refused a conformant broker over punctuation:
+    https://b.test:443/oidc and https://b.test/oidc/jwk are the same host."""
+    for issuer, url in (
+        ("https://b.test:443/oidc", "https://b.test/oidc/jwk"),
+        ("https://b.test/oidc", "https://b.test:443/oidc/jwk"),
+        ("https://b.test:8443/oidc", "https://b.test:8443/oidc/jwk"),
+    ):
+        assert passports.jwks_url_for(issuer, fetch=lambda u: {"jwks_uri": url}) == url
+
+
+def test_a_genuinely_different_port_is_still_a_different_host():
+    with pytest.raises(passports.PassportError):
+        passports.jwks_url_for(
+            "https://b.test:8443/oidc",
+            fetch=lambda url: {"jwks_uri": "https://b.test:9999/jwk"})
+
+
+def test_an_issuer_that_is_not_an_https_url_refuses_to_start():
+    """Configuration mistakes are startup mistakes, the same as a missing
+    audience. An issuer whose discovery document can never be fetched would
+    otherwise refuse every request for a reason that looks like the caller's
+    fault, and a plain-http issuer is one whose keys can be replaced in transit.
+    """
+    for bad in ("not-a-url", "http://b.test/oidc", "b.test", "https:///oidc"):
+        with pytest.raises(ValueError) as caught:
+            auth.PassportAuth(issuer=bad, audience=AUDIENCE,
+                              keyset_factory=lambda url, issuer: None)
+        assert "ISSUER" in str(caught.value)
+
+
+def test_the_real_lsaai_issuer_is_accepted():
+    provider = auth.PassportAuth(issuer=LSAAI, audience=AUDIENCE,
+                                 keyset_factory=lambda url, issuer: None)
+    assert provider.name == "passport"
