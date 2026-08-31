@@ -267,8 +267,19 @@ class PassportAuth(AuthProvider):
             waiting.wait(timeout=DISCOVERY_WAIT_SECONDS)
             with self._lock:
                 keyset = self._keysets.get(issuer)
+                failed = (time.monotonic() - self._failures.get(issuer, 0.0)
+                          < DISCOVERY_RETRY_SECONDS)
             if keyset is not None:
                 return keyset
+            # Woken by a failure and woken by the timeout are different events,
+            # and saying the second when it was the first sends whoever is
+            # reading the log looking for a slow provider when the provider was
+            # returning errors instantly.
+            if failed:
+                raise OSError(
+                    f"the key set for {issuer} could not be resolved by the "
+                    f"caller that was already trying"
+                )
             raise OSError(
                 f"another caller is resolving the key set for {issuer} and it "
                 f"did not finish within {DISCOVERY_WAIT_SECONDS}s"

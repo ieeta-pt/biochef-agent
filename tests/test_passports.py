@@ -953,3 +953,38 @@ def test_the_provider_answers_through_the_real_middleware(broker):
     # A scheme is case-insensitive per RFC 9110, and a header name always is.
     assert client.get("/who", headers={"authorization": f"bearer {token}"}).status_code == 200
     assert client.get("/who", headers={"Authorization": "Bearer nonsense"}).status_code == 401
+
+
+def test_a_waiter_woken_by_a_failure_is_not_told_it_timed_out(broker):
+    """Two different events, and reporting the wrong one costs somebody an
+    afternoon looking for a slow provider that was in fact failing instantly."""
+    import threading as _threading
+
+    def slow_then_fail(url, issuer):
+        time.sleep(0.3)
+        raise OSError("provider down")
+
+    provider = auth.PassportAuth(issuer=BROKER, audience=AUDIENCE,
+                                 keyset_factory=slow_then_fail)
+    messages = []
+
+    def call():
+        try:
+            provider._resolve(BROKER, None)
+        except OSError as exc:
+            messages.append(str(exc))
+
+    threads = [_threading.Thread(target=call) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(messages) == 3
+    waiters = [m for m in messages if "provider down" not in m]
+    assert waiters, "expected callers that waited on the first one"
+    for message in waiters:
+        assert "did not finish within" not in message, (
+            f"a waiter woken by a failure was told it timed out: {message}"
+        )
+        assert "could not be resolved" in message
