@@ -811,10 +811,91 @@ def test_a_resolver_torn_down_does_not_wedge_authentication_permanently(broker):
     first.start()
     first.join()
 
-    assert provider._resolving is None, "the in-flight marker was left set"
+    assert not provider._resolving, "the in-flight marker was left set"
 
     started = time.monotonic()
     call()
     assert time.monotonic() - started < 1.0, (
         "a later caller waited for a resolver that had already died"
     )
+
+
+def _passport_with_visa(broker, controller):
+    return broker.sign(passport_claims(**{
+        passports.PASSPORT_CLAIM: [controller.sign(visa_claims())]}))
+
+
+def test_an_unreachable_visa_issuer_is_a_refusal_and_not_a_crash(broker, controller):
+    """The visa path was a second, simpler copy of the token path, so three
+    fixes made on one side never reached the other. This is the one that
+    mattered most: an unreachable data controller came out as a 500."""
+    def factory(url, issuer):
+        if issuer == BROKER:
+            return keyset_for(broker)
+        raise OSError("visa issuer unreachable")
+
+    provider = auth.PassportAuth(
+        issuer=BROKER, audience=AUDIENCE, visa_issuers=CONTROLLER,
+        required_visa="ControlledAccessGrants", keyset_factory=factory)
+    with pytest.raises(auth.Unauthenticated):
+        provider.authenticate(
+            _Request(f"Bearer {_passport_with_visa(broker, controller)}"))
+
+
+def test_a_dead_visa_issuer_is_not_asked_once_per_request(broker, controller):
+    """Same amplification guard as the token issuer, which the visa path did
+    not have."""
+    import threading as _threading
+
+    calls = []
+    counter = _threading.Lock()
+
+    def factory(url, issuer):
+        if issuer == BROKER:
+            return keyset_for(broker)
+        with counter:
+            calls.append(1)
+        time.sleep(0.1)
+        raise OSError("unreachable")
+
+    provider = auth.PassportAuth(
+        issuer=BROKER, audience=AUDIENCE, visa_issuers=CONTROLLER,
+        required_visa="ControlledAccessGrants", keyset_factory=factory)
+    token = f"Bearer {_passport_with_visa(broker, controller)}"
+
+    def hit():
+        try:
+            provider.authenticate(_Request(token))
+        except auth.Unauthenticated:
+            pass
+
+    threads = [_threading.Thread(target=hit) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(calls) == 1, f"{len(calls)} outbound calls at a dead visa issuer"
+
+
+def test_two_visa_issuers_resolve_in_parallel(broker):
+    """The lock used to be held across the visa keyset construction, so two
+    different data controllers could not be resolved at the same time -- and a
+    slow one blocked the token issuer too, since they shared the lock."""
+    import threading as _threading
+
+    def slow(url, issuer):
+        time.sleep(0.3)
+        return keyset_for(broker)
+
+    provider = auth.PassportAuth(issuer=BROKER, audience=AUDIENCE,
+                                 visa_issuers="https://c1.test,https://c2.test",
+                                 keyset_factory=slow)
+    started = time.monotonic()
+    threads = [_threading.Thread(target=provider._keyset_for, args=(f"https://c{i}.test",))
+               for i in (1, 2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.5, f"two issuers took {elapsed:.1f}s, serialised"

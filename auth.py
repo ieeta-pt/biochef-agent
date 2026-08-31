@@ -207,96 +207,87 @@ class PassportAuth(AuthProvider):
         # issuer or a visa requirement with no trusted issuers is a mistake
         # nobody should discover from a 401 at three in the morning; an
         # unreachable host is not that kind of mistake.
-        self._token_keyset = None
-        self._last_failure = 0.0
-        self._resolving = None
-        self._visa_keysets = {}
+        # All keyed by issuer, the token issuer included. Keeping the visa
+        # keysets in a separate, simpler structure is what let three fixes to
+        # the token path never reach the visa path.
+        self._keysets = {}
+        self._failures = {}
+        self._resolving = {}
         self._lock = threading.Lock()
 
     def _token_keys(self):
-        """The issuer's key set, resolved once and kept.
+        return self._resolve(self._issuer, self._jwks_url)
 
-        Two things this must not do while the issuer is unreachable, and the
-        first version did both.
+    def _keyset_for(self, issuer):
+        return self._resolve(issuer, None)
 
-        It must not ask again on every request. KeySet rate-limits its own
-        refetches, but that guard lives INSIDE a KeySet, and there is no KeySet
-        yet when discovery is what failed -- so a provider outage turned every
-        arriving request into an outbound request at the provider. Same
-        amplification the refetch interval exists to prevent, one layer up.
+    def _resolve(self, issuer, jwks_url):
+        """One issuer's key set, resolved once however many callers want it.
 
-        It must not hold the lock across the network call. Holding it made four
-        concurrent requests behind a 0.4s fetch take 1.6s, and a real fetch has
-        a ten second timeout, so one hanging call stalled every other caller's
-        authentication behind it.
+        The token issuer is just another issuer here, and that is the point. The
+        visa path used to be a second, simpler copy of this logic, so every fix
+        made on the token side had to be found again on the visa side, and never
+        was: holding the lock across the network call, no limit on retrying a
+        dead issuer, and a failure escaping as a 500 instead of a refusal all
+        survived there after being fixed here.
+
+        Three properties, each absent at some point and each costing something.
+
+        The clock counts FAILURES, not attempts. Timing the attempt made a
+        resolution still in flight look like a fresh failure, so a healthy cold
+        start with concurrent traffic refused every caller but one.
+
+        One resolution at a time per issuer, others waiting on an event.
+        Letting each caller start its own bounded outage amplification by
+        concurrency rather than by anything, and real traffic is concurrent.
+
+        The network call is outside the lock and the cleanup is in a finally.
+        Holding the lock across a ten second fetch stalled every other caller,
+        and clearing the marker only on Exception meant a thread torn down
+        mid-resolution wedged authentication until a restart.
         """
         with self._lock:
-            if self._token_keyset is not None:
-                return self._token_keyset
-            # FAILED recently, not ATTEMPTED recently. Timing the attempt meant
-            # a resolution still in flight looked like a fresh failure, so on a
-            # healthy cold start with concurrent traffic one request built the
-            # key set and every other one was told 401.
-            if time.monotonic() - self._last_failure < DISCOVERY_RETRY_SECONDS:
-                # OSError rather than a bespoke type: authenticate already
-                # treats that as "could not establish the key", which is
-                # exactly what this is, and raising it needs no import.
+            keyset = self._keysets.get(issuer)
+            if keyset is not None:
+                return keyset
+            if time.monotonic() - self._failures.get(issuer, 0.0) < DISCOVERY_RETRY_SECONDS:
+                # OSError rather than a bespoke type: the callers already treat
+                # it as "could not establish the key", which is what it is.
                 raise OSError(
-                    f"the issuer's key set could not be resolved, and the last "
-                    f"attempt failed less than {DISCOVERY_RETRY_SECONDS}s ago"
+                    f"the key set for {issuer} could not be resolved, and the "
+                    f"last attempt failed less than {DISCOVERY_RETRY_SECONDS}s ago"
                 )
-            waiting = self._resolving
+            waiting = self._resolving.get(issuer)
             if waiting is None:
-                # One resolution at a time. Letting every caller start its own
-                # bounded the outage amplification by concurrency rather than
-                # by anything: twenty-five simultaneous requests against a dead
-                # provider made twenty-five outbound calls, where twenty-five
-                # sequential ones made one.
-                self._resolving = threading.Event()
-                mine = self._resolving
+                mine = threading.Event()
+                self._resolving[issuer] = mine
 
         if waiting is not None:
-            # Waiting on the event, NOT holding the lock, so the rest of the
-            # service carries on. Nothing is fetched here; that is the whole
-            # point.
+            # Waiting on the event, not holding the lock, and fetching nothing.
             waiting.wait(timeout=DISCOVERY_WAIT_SECONDS)
             with self._lock:
-                if self._token_keyset is not None:
-                    return self._token_keyset
+                keyset = self._keysets.get(issuer)
+            if keyset is not None:
+                return keyset
             raise OSError(
-                "another caller is resolving the issuer's key set and it did "
-                f"not finish within {DISCOVERY_WAIT_SECONDS}s"
+                f"another caller is resolving the key set for {issuer} and it "
+                f"did not finish within {DISCOVERY_WAIT_SECONDS}s"
             )
 
         try:
-            keyset = self._factory(self._jwks_url, self._issuer)
+            keyset = self._factory(jwks_url, issuer)
         except Exception:
             with self._lock:
-                self._last_failure = time.monotonic()
+                self._failures[issuer] = time.monotonic()
             raise
         else:
             with self._lock:
-                self._token_keyset = keyset
+                self._keysets[issuer] = keyset
             return keyset
         finally:
-            # In a finally, so it happens for anything that leaves this frame
-            # and not only for Exception. A BaseException here -- SystemExit
-            # during a shutdown, KeyboardInterrupt, a thread being torn down --
-            # used to leave _resolving set and the event unsignalled, and from
-            # then on EVERY request waited the full fifteen seconds and was then
-            # refused. Permanently, with no way back short of a restart.
-            #
-            # Woken on every path too, so waiters find out immediately rather
-            # than sitting out the timeout for an answer that already exists.
             with self._lock:
-                self._resolving = None
+                self._resolving.pop(issuer, None)
             mine.set()
-
-    def _keyset_for(self, issuer):
-        with self._lock:
-            if issuer not in self._visa_keysets:
-                self._visa_keysets[issuer] = self._factory(None, issuer)
-            return self._visa_keysets[issuer]
 
     def authenticate(self, request: Request) -> Optional[str]:
         # Imported here, and NOT because of a circular import -- passports does
@@ -343,11 +334,17 @@ class PassportAuth(AuthProvider):
             raise Unauthenticated("the passport names no subject")
 
         if self._required_visa:
-            accepted, _ = passports.verify_visas(
-                passports.raw_visas(claims),
-                trusted_issuers=self._visa_issuers,
-                keyset_for=self._keyset_for,
-            )
+            # Wrapped for the same reason the token verification is. Resolving a
+            # visa issuer's keys reaches the network, and until an audit looked,
+            # an unreachable data controller came out of here as a 500.
+            try:
+                accepted, _ = passports.verify_visas(
+                    passports.raw_visas(claims),
+                    trusted_issuers=self._visa_issuers,
+                    keyset_for=self._keyset_for,
+                )
+            except (passports.PassportError, OSError, ValueError):
+                raise Unauthenticated("the passport presented was not accepted")
             if not passports.satisfies(accepted, self._required_visa,
                                        self._required_value):
                 raise Unauthenticated(
