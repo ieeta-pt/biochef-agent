@@ -273,17 +273,24 @@ class PassportAuth(AuthProvider):
         except Exception:
             with self._lock:
                 self._last_failure = time.monotonic()
-                self._resolving = None
-            # Woken either way, so waiters find out now rather than sitting
-            # until the timeout for an answer that already exists.
-            mine.set()
             raise
-
-        with self._lock:
-            self._token_keyset = keyset
-            self._resolving = None
-        mine.set()
-        return keyset
+        else:
+            with self._lock:
+                self._token_keyset = keyset
+            return keyset
+        finally:
+            # In a finally, so it happens for anything that leaves this frame
+            # and not only for Exception. A BaseException here -- SystemExit
+            # during a shutdown, KeyboardInterrupt, a thread being torn down --
+            # used to leave _resolving set and the event unsignalled, and from
+            # then on EVERY request waited the full fifteen seconds and was then
+            # refused. Permanently, with no way back short of a restart.
+            #
+            # Woken on every path too, so waiters find out immediately rather
+            # than sitting out the timeout for an answer that already exists.
+            with self._lock:
+                self._resolving = None
+            mine.set()
 
     def _keyset_for(self, issuer):
         with self._lock:

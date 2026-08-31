@@ -781,3 +781,40 @@ def test_waiting_callers_do_not_each_fetch_on_a_healthy_cold_start(broker):
 
     assert len(built) == 1, f"{len(built)} resolutions for one cold start"
     assert not [o for o in outcomes if o is None], "a legitimate caller was refused"
+
+
+def test_a_resolver_torn_down_does_not_wedge_authentication_permanently(broker):
+    """`except Exception` does not catch a thread being torn down.
+
+    A SystemExit during a shutdown, a KeyboardInterrupt, or anything else
+    deriving from BaseException left the in-flight marker set and the event
+    unsignalled. From then on every request waited the full fifteen seconds and
+    was refused, permanently, with no way back short of a restart. The cleanup
+    is in a finally so it happens for anything that leaves the frame.
+    """
+    import threading as _threading
+
+    def torn_down(url, issuer):
+        raise BaseException("thread torn down")
+
+    provider = auth.PassportAuth(issuer=BROKER, audience=AUDIENCE,
+                                 keyset_factory=torn_down)
+    token = f"Bearer {broker.sign(passport_claims())}"
+
+    def call():
+        try:
+            provider.authenticate(_Request(token))
+        except BaseException:
+            pass
+
+    first = _threading.Thread(target=call)
+    first.start()
+    first.join()
+
+    assert provider._resolving is None, "the in-flight marker was left set"
+
+    started = time.monotonic()
+    call()
+    assert time.monotonic() - started < 1.0, (
+        "a later caller waited for a resolver that had already died"
+    )
