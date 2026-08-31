@@ -40,6 +40,12 @@ class Unauthenticated(HTTPException):
 # this service happens to be receiving.
 DISCOVERY_RETRY_SECONDS = 30
 
+# How long a caller waits for another caller's resolution rather than starting
+# one of its own. Comfortably longer than the ten second fetch timeout inside
+# passports, so a slow but successful discovery is waited out instead of being
+# turned into a refusal -- which is the mistake this replaced.
+DISCOVERY_WAIT_SECONDS = 15
+
 AUTH_TOKEN = os.getenv("BIOCHEF_AUTH_TOKEN", "")
 """The shared secret, when BIOCHEF_AUTH=bearer.
 
@@ -203,6 +209,7 @@ class PassportAuth(AuthProvider):
         # unreachable host is not that kind of mistake.
         self._token_keyset = None
         self._last_failure = 0.0
+        self._resolving = None
         self._visa_keysets = {}
         self._lock = threading.Lock()
 
@@ -227,35 +234,56 @@ class PassportAuth(AuthProvider):
             if self._token_keyset is not None:
                 return self._token_keyset
             # FAILED recently, not ATTEMPTED recently. Timing the attempt meant
-            # a construction still in flight looked like a fresh failure, so on
-            # a perfectly healthy cold start with concurrent traffic one request
-            # built the key set and every other one was told 401. Refusing a
-            # legitimate caller because of an internal race is a far worse
-            # answer than a redundant fetch.
+            # a resolution still in flight looked like a fresh failure, so on a
+            # healthy cold start with concurrent traffic one request built the
+            # key set and every other one was told 401.
             if time.monotonic() - self._last_failure < DISCOVERY_RETRY_SECONDS:
                 # OSError rather than a bespoke type: authenticate already
-                # treats that as "could not establish the key", which is exactly
-                # what this is, and raising it here needs no import.
+                # treats that as "could not establish the key", which is
+                # exactly what this is, and raising it needs no import.
                 raise OSError(
                     f"the issuer's key set could not be resolved, and the last "
                     f"attempt failed less than {DISCOVERY_RETRY_SECONDS}s ago"
                 )
+            waiting = self._resolving
+            if waiting is None:
+                # One resolution at a time. Letting every caller start its own
+                # bounded the outage amplification by concurrency rather than
+                # by anything: twenty-five simultaneous requests against a dead
+                # provider made twenty-five outbound calls, where twenty-five
+                # sequential ones made one.
+                self._resolving = threading.Event()
+                mine = self._resolving
 
-        # Outside the lock, so one slow call cannot stall every other caller.
-        # Callers arriving together may each build one; the first to finish is
-        # kept and the rest are discarded. That costs a duplicated fetch on a
-        # cold start and buys back the 401s above.
+        if waiting is not None:
+            # Waiting on the event, NOT holding the lock, so the rest of the
+            # service carries on. Nothing is fetched here; that is the whole
+            # point.
+            waiting.wait(timeout=DISCOVERY_WAIT_SECONDS)
+            with self._lock:
+                if self._token_keyset is not None:
+                    return self._token_keyset
+            raise OSError(
+                "another caller is resolving the issuer's key set and it did "
+                f"not finish within {DISCOVERY_WAIT_SECONDS}s"
+            )
+
         try:
             keyset = self._factory(self._jwks_url, self._issuer)
         except Exception:
             with self._lock:
                 self._last_failure = time.monotonic()
+                self._resolving = None
+            # Woken either way, so waiters find out now rather than sitting
+            # until the timeout for an answer that already exists.
+            mine.set()
             raise
 
         with self._lock:
-            if self._token_keyset is None:
-                self._token_keyset = keyset
-            return self._token_keyset
+            self._token_keyset = keyset
+            self._resolving = None
+        mine.set()
+        return keyset
 
     def _keyset_for(self, issuer):
         with self._lock:

@@ -713,3 +713,71 @@ def test_a_healthy_cold_start_does_not_refuse_concurrent_callers(broker):
         f"refused during a successful cold start"
     )
     assert all(o == f"{BROKER}#user-1" for o in outcomes)
+
+
+def test_a_concurrent_burst_against_a_dead_issuer_makes_one_call(broker):
+    """Sequential traffic was already bounded to one attempt. Concurrent was
+    bounded by nothing, which is the shape real traffic has: twenty-five
+    simultaneous requests made twenty-five outbound calls at a provider that
+    was already having a bad day."""
+    import threading as _threading
+
+    attempts = []
+    counter = _threading.Lock()
+
+    def failing(url, issuer):
+        with counter:
+            attempts.append(1)
+        time.sleep(0.15)
+        raise OSError("unreachable")
+
+    provider = auth.PassportAuth(issuer=BROKER, audience=AUDIENCE,
+                                 keyset_factory=failing)
+    token = f"Bearer {broker.sign(passport_claims())}"
+
+    def hit():
+        try:
+            provider.authenticate(_Request(token))
+        except auth.Unauthenticated:
+            pass
+
+    threads = [_threading.Thread(target=hit) for _ in range(25)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(attempts) == 1, f"{len(attempts)} outbound calls for one outage"
+
+
+def test_waiting_callers_do_not_each_fetch_on_a_healthy_cold_start(broker):
+    """The same single-flight property, on the path that succeeds."""
+    import threading as _threading
+
+    built = []
+    counter = _threading.Lock()
+
+    def slow_but_fine(url, issuer):
+        with counter:
+            built.append(1)
+        time.sleep(0.4)
+        return keyset_for(broker)
+
+    provider = auth.PassportAuth(issuer=BROKER, audience=AUDIENCE,
+                                 keyset_factory=slow_but_fine)
+    token = f"Bearer {broker.sign(passport_claims())}"
+    outcomes = []
+
+    def hit():
+        try:
+            outcomes.append(provider.authenticate(_Request(token)))
+        except auth.Unauthenticated:
+            outcomes.append(None)
+
+    threads = [_threading.Thread(target=hit) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(built) == 1, f"{len(built)} resolutions for one cold start"
+    assert not [o for o in outcomes if o is None], "a legitimate caller was refused"
