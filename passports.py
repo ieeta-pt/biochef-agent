@@ -61,6 +61,18 @@ LEEWAY_SECONDS = 30
 CACHE_SECONDS = 300
 REFETCH_INTERVAL_SECONDS = 30
 
+# How many visas a passport may carry before it is refused outright. Every visa
+# from a trusted issuer costs a signature verification, and nothing else bounds
+# how many a caller can send -- two thousand cost about a quarter of a second of
+# CPU, which an authenticated caller could repeat.
+#
+# Refused rather than truncated. Silently examining the first N would mean a
+# legitimate passport whose relevant visa sits past the cut is denied for a
+# reason nobody can see, and a wrong answer that looks like a right one is worse
+# than an error. The number is generous because a researcher may hold one visa
+# per dataset.
+MAX_VISAS = 128
+
 
 class PassportError(Exception):
     """A passport or visa could not be accepted."""
@@ -213,6 +225,11 @@ def raw_visas(claims):
     carried = claims.get(PASSPORT_CLAIM) or []
     if not isinstance(carried, list):
         raise PassportError(f"{PASSPORT_CLAIM} is not a list")
+    if len(carried) > MAX_VISAS:
+        raise PassportError(
+            f"the passport carries {len(carried)} visas and the limit is "
+            f"{MAX_VISAS}"
+        )
     return [entry for entry in carried if isinstance(entry, str)]
 
 

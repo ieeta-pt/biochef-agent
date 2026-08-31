@@ -899,3 +899,57 @@ def test_two_visa_issuers_resolve_in_parallel(broker):
         t.join()
     elapsed = time.monotonic() - started
     assert elapsed < 0.5, f"two issuers took {elapsed:.1f}s, serialised"
+
+
+def test_a_passport_carrying_too_many_visas_is_refused(broker, controller):
+    """Every visa from a trusted issuer costs a signature verification, and
+    nothing else bounds how many a caller can send.
+
+    Refused rather than truncated: examining the first N silently would deny a
+    legitimate passport whose relevant visa sits past the cut, for a reason
+    nobody could see. A wrong answer that looks right is worse than an error.
+    """
+    one = controller.sign(visa_claims())
+    claims = passport_claims(**{passports.PASSPORT_CLAIM: [one] * (passports.MAX_VISAS + 1)})
+    with pytest.raises(passports.PassportError) as caught:
+        passports.raw_visas(claims)
+    assert str(passports.MAX_VISAS) in str(caught.value)
+
+
+def test_a_passport_at_the_limit_is_still_accepted(broker, controller):
+    one = controller.sign(visa_claims())
+    claims = passport_claims(**{passports.PASSPORT_CLAIM: [one] * passports.MAX_VISAS})
+    assert len(passports.raw_visas(claims)) == passports.MAX_VISAS
+
+
+def test_the_provider_answers_through_the_real_middleware(broker):
+    """Everything else here builds a fake request whose headers are a plain
+    dict. The middleware constructs a Starlette Request from an ASGI scope, and
+    a provider that works against the stub and not against that would look
+    entirely tested.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    provider = auth.PassportAuth(
+        issuer=BROKER, audience=AUDIENCE,
+        keyset_factory=lambda url, issuer: keyset_for(broker))
+
+    app = FastAPI()
+
+    @app.get("/who")
+    async def who():
+        return {"ok": True}
+
+    app.add_middleware(auth.AuthenticationMiddleware, provider=provider)
+    client = TestClient(app)
+    token = broker.sign(passport_claims())
+
+    refused = client.get("/who")
+    assert refused.status_code == 401
+    assert refused.headers.get("www-authenticate") == "Bearer"
+
+    assert client.get("/who", headers={"Authorization": f"Bearer {token}"}).status_code == 200
+    # A scheme is case-insensitive per RFC 9110, and a header name always is.
+    assert client.get("/who", headers={"authorization": f"bearer {token}"}).status_code == 200
+    assert client.get("/who", headers={"Authorization": "Bearer nonsense"}).status_code == 401

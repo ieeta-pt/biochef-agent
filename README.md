@@ -170,6 +170,10 @@ legitimately carries visas about institutions this service knows nothing about,
 and refusing the request because of one would make a caller's unrelated
 affiliations break their access here.
 
+A passport carrying more than 128 visas is refused outright rather than having
+the first 128 examined, because a legitimate passport whose relevant visa sat
+past a silent cut would be denied for a reason nobody could see.
+
 Refusals do not say which check failed. Whether it was the signature, the
 issuer, the audience or the expiry is a fact about this deployment's
 configuration, and telling an unauthenticated caller is telling them how to aim.
