@@ -608,3 +608,68 @@ def test_a_bug_in_this_file_is_not_disguised_as_a_refusal(broker):
                                  keyset_factory=lambda url, issuer: _Broken())
     with pytest.raises(AttributeError):
         provider.authenticate(_Request(f"Bearer {broker.sign(passport_claims())}"))
+
+
+def test_an_outage_is_not_amplified_by_however_much_traffic_we_have(broker):
+    """KeySet rate-limits its own refetches, but that guard lives inside a
+    KeySet, and there is none yet when discovery is what failed. Without a limit
+    here, a provider outage turned every arriving request into an outbound
+    request at the provider."""
+    attempts = []
+
+    def failing(url, issuer):
+        attempts.append(1)
+        raise OSError("unreachable")
+
+    provider = auth.PassportAuth(issuer=BROKER, audience=AUDIENCE,
+                                 keyset_factory=failing)
+    for _ in range(25):
+        with pytest.raises(auth.Unauthenticated):
+            provider.authenticate(_Request(f"Bearer {broker.sign(passport_claims())}"))
+    assert len(attempts) == 1, f"{len(attempts)} discovery attempts for 25 requests"
+
+
+def test_a_slow_discovery_does_not_serialise_every_other_caller(broker):
+    """A real fetch has a ten second timeout. Holding the lock across it stalled
+    every other caller's authentication behind one hanging call."""
+    import threading as _threading
+
+    def slow(url, issuer):
+        time.sleep(0.3)
+        raise OSError("slow, then unreachable")
+
+    provider = auth.PassportAuth(issuer=BROKER, audience=AUDIENCE,
+                                 keyset_factory=slow)
+    token = f"Bearer {broker.sign(passport_claims())}"
+
+    def hit():
+        try:
+            provider.authenticate(_Request(token))
+        except auth.Unauthenticated:
+            pass
+
+    started = time.monotonic()
+    threads = [_threading.Thread(target=hit) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.9, (
+        f"4 concurrent requests took {elapsed:.1f}s; serialised behind the lock"
+    )
+
+
+def test_the_keyset_is_built_once_when_the_issuer_answers(broker):
+    built = []
+
+    def counting(url, issuer):
+        built.append(1)
+        return keyset_for(broker)
+
+    provider = auth.PassportAuth(issuer=BROKER, audience=AUDIENCE,
+                                 keyset_factory=counting)
+    token = f"Bearer {broker.sign(passport_claims())}"
+    for _ in range(5):
+        assert provider.authenticate(_Request(token)) == f"{BROKER}#user-1"
+    assert len(built) == 1

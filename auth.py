@@ -14,6 +14,7 @@ import hmac
 import json
 import os
 import threading
+import time
 from typing import Optional
 
 from fastapi import HTTPException, Request
@@ -32,6 +33,12 @@ class Unauthenticated(HTTPException):
         super().__init__(status_code=401, detail=detail,
                          headers={"WWW-Authenticate": scheme})
 
+
+# How long to wait before asking an unreachable issuer where its keys are
+# again. Mirrors passports.REFETCH_INTERVAL_SECONDS, and for the same reason:
+# without it an outage at the provider is amplified by however much traffic
+# this service happens to be receiving.
+DISCOVERY_RETRY_SECONDS = 30
 
 AUTH_TOKEN = os.getenv("BIOCHEF_AUTH_TOKEN", "")
 """The shared secret, when BIOCHEF_AUTH=bearer.
@@ -195,13 +202,50 @@ class PassportAuth(AuthProvider):
         # nobody should discover from a 401 at three in the morning; an
         # unreachable host is not that kind of mistake.
         self._token_keyset = None
+        self._last_discovery = 0.0
         self._visa_keysets = {}
         self._lock = threading.Lock()
 
     def _token_keys(self):
+        """The issuer's key set, resolved once and kept.
+
+        Two things this must not do while the issuer is unreachable, and the
+        first version did both.
+
+        It must not ask again on every request. KeySet rate-limits its own
+        refetches, but that guard lives INSIDE a KeySet, and there is no KeySet
+        yet when discovery is what failed -- so a provider outage turned every
+        arriving request into an outbound request at the provider. Same
+        amplification the refetch interval exists to prevent, one layer up.
+
+        It must not hold the lock across the network call. Holding it made four
+        concurrent requests behind a 0.4s fetch take 1.6s, and a real fetch has
+        a ten second timeout, so one hanging call stalled every other caller's
+        authentication behind it.
+        """
+        with self._lock:
+            if self._token_keyset is not None:
+                return self._token_keyset
+            now = time.monotonic()
+            if now - self._last_discovery < DISCOVERY_RETRY_SECONDS:
+                # OSError rather than a bespoke type: authenticate already
+                # treats that as "could not establish the key", which is exactly
+                # what this is, and raising it here needs no import.
+                raise OSError(
+                    f"the issuer's key set could not be resolved, and was tried "
+                    f"less than {DISCOVERY_RETRY_SECONDS}s ago"
+                )
+            self._last_discovery = now
+
+        # Outside the lock. Two callers arriving together may both build one,
+        # which wastes a fetch and is harmless -- one of them wins below. That
+        # is a far better trade than serialising every request in the service
+        # behind a single slow call.
+        keyset = self._factory(self._jwks_url, self._issuer)
+
         with self._lock:
             if self._token_keyset is None:
-                self._token_keyset = self._factory(self._jwks_url, self._issuer)
+                self._token_keyset = keyset
             return self._token_keyset
 
     def _keyset_for(self, issuer):
