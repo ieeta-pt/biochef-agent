@@ -147,7 +147,7 @@ class PassportAuth(AuthProvider):
 
     def __init__(self, issuer=None, audience=None, jwks_url=None,
                  visa_issuers=None, required_visa=None, required_value=None,
-                 keyset_factory=None):
+                 keyset_factory=None, userinfo_fetch=None, userinfo_url=None):
         self._issuer = _setting(issuer, "BIOCHEF_PASSPORT_ISSUER")
         if not self._issuer:
             raise ValueError(
@@ -195,6 +195,13 @@ class PassportAuth(AuthProvider):
             )
 
         self._factory = keyset_factory or _default_keyset_factory
+        # Injected so tests can stand in for the broker's UserInfo endpoint
+        # without a network, the same way keyset_factory does for its keys.
+        self._userinfo_fetch = userinfo_fetch
+        # Normally discovered from the issuer alongside its keys. Settable so a
+        # deployment behind a broker with a non-discoverable endpoint, and a
+        # test, can say where it is without a network round trip.
+        self._userinfo_url = _setting(userinfo_url, "BIOCHEF_PASSPORT_USERINFO_URL") or None
         self._jwks_url = _setting(jwks_url, "BIOCHEF_PASSPORT_JWKS_URL") or None
         # Resolved on first use, not here. Building it now means asking the
         # issuer for its discovery document at startup, so an identity provider
@@ -221,7 +228,24 @@ class PassportAuth(AuthProvider):
     def _keyset_for(self, issuer):
         return self._resolve(issuer, None)
 
-    def _resolve(self, issuer, jwks_url):
+    def _userinfo(self):
+        """Where the broker will exchange an access token for a passport.
+
+        Resolved through the same single-flight path as a key set, so an
+        unreachable broker is not asked once per request and a slow discovery
+        does not stall every caller.
+        """
+        import passports
+
+        if self._userinfo_url:
+            return self._userinfo_url
+        return self._resolve(
+            f"userinfo:{self._issuer}",
+            None,
+            build=lambda: passports.userinfo_url_for(self._issuer),
+        )
+
+    def _resolve(self, issuer, jwks_url, build=None):
         """One issuer's key set, resolved once however many callers want it.
 
         The token issuer is just another issuer here, and that is the point. The
@@ -286,7 +310,7 @@ class PassportAuth(AuthProvider):
             )
 
         try:
-            keyset = self._factory(jwks_url, issuer)
+            keyset = build() if build is not None else self._factory(jwks_url, issuer)
         except Exception:
             with self._lock:
                 self._failures[issuer] = time.monotonic()
@@ -345,12 +369,22 @@ class PassportAuth(AuthProvider):
             raise Unauthenticated("the passport names no subject")
 
         if self._required_visa:
-            # Wrapped for the same reason the token verification is. Resolving a
-            # visa issuer's keys reaches the network, and until an audit looked,
-            # an unreachable data controller came out of here as a 500.
+            # The passport comes from the broker's UserInfo endpoint, not from
+            # the access token. The AAI profile is explicit that "access tokens
+            # MUST NOT contain GA4GH Claims directly", so the token is the
+            # credential used to fetch the visas rather than the thing carrying
+            # them. Reading them off the token -- which is what this did first
+            # -- finds nothing at a conformant broker, so every caller holding a
+            # perfectly good passport was refused.
+            #
+            # Wrapped for the same reason the token verification is: this
+            # reaches the network twice, for discovery and for UserInfo, and
+            # either failing is a refusal rather than a 500.
             try:
+                carried = passports.fetch_passport(
+                    self._userinfo(), presented, fetch=self._userinfo_fetch)
                 accepted, _ = passports.verify_visas(
-                    passports.raw_visas(claims),
+                    carried,
                     trusted_issuers=self._visa_issuers,
                     keyset_for=self._keyset_for,
                 )

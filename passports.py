@@ -149,6 +149,65 @@ def _fetch_json(url):
         return json.loads(response.read())
 
 
+def discover(issuer, fetch=None):
+    """An issuer's OIDC discovery document, checked to be one."""
+    fetch = fetch or _fetch_json
+    base = issuer.rstrip("/")
+    document = fetch(f"{base}/.well-known/openid-configuration")
+    # Checked rather than assumed to be an object. A captive portal or a proxy
+    # answering with a JSON string reached .get on a str and raised
+    # AttributeError, which nothing catches on the way out, so it arrived as a
+    # 500 rather than as a refusal.
+    if not isinstance(document, dict):
+        raise PassportError(
+            f"{issuer} answered its discovery request with "
+            f"{type(document).__name__}, not an object"
+        )
+    return document
+
+
+def userinfo_url_for(issuer, fetch=None):
+    """Where an issuer's UserInfo endpoint is.
+
+    This is where a Passport actually lives. The AAI profile is explicit that
+    "access tokens MUST NOT contain GA4GH Claims directly", so a downstream
+    service holding a passport-scoped access token calls back to the broker to
+    exchange it for the visas. Reading them out of the token, which is what this
+    did first, finds nothing at a conformant broker.
+    """
+    url = discover(issuer, fetch).get("userinfo_endpoint")
+    if not url or not isinstance(url, str):
+        raise PassportError(f"{issuer} publishes no usable userinfo_endpoint")
+    return url
+
+
+def fetch_passport(userinfo_url, access_token, fetch=None):
+    """The visas a broker will hand over for this access token.
+
+    Not cached. A passport is a statement about what the holder may see right
+    now, and the whole point of the visa having its own expiry is that it can
+    stop being true between one request and the next.
+    """
+    fetch = fetch or _fetch_authorised_json
+    document = fetch(userinfo_url, access_token)
+    if not isinstance(document, dict):
+        raise PassportError(
+            f"{userinfo_url} answered with {type(document).__name__}, "
+            f"not an object"
+        )
+    return raw_visas(document)
+
+
+def _fetch_authorised_json(url, access_token):
+    if not url.startswith("https://"):
+        raise PassportError(f"refusing to send a token over an insecure URL: {url}")
+    request = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {access_token}",
+                      "Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.loads(response.read())
+
+
 def jwks_url_for(issuer, fetch=None):
     """Where an issuer says its keys are.
 
@@ -157,20 +216,7 @@ def jwks_url_for(issuer, fetch=None):
     silently wrong for the rest -- and "silently wrong" here means refusing every
     valid token.
     """
-    fetch = fetch or _fetch_json
-    base = issuer.rstrip("/")
-    document = fetch(f"{base}/.well-known/openid-configuration")
-    # Checked rather than assumed to be an object. `(document or {}).get(...)`
-    # reads as defensive and only covers None and empty containers: a captive
-    # portal or a proxy answering with a JSON string reached .get on a str and
-    # raised AttributeError, which is not caught anywhere on the way out and so
-    # arrived as a 500 rather than as a refusal.
-    if not isinstance(document, dict):
-        raise PassportError(
-            f"{issuer} answered its discovery request with "
-            f"{type(document).__name__}, not an object"
-        )
-    url = document.get("jwks_uri")
+    url = discover(issuer, fetch).get("jwks_uri")
     if not url or not isinstance(url, str):
         raise PassportError(f"{issuer} publishes no usable jwks_uri")
     return url
@@ -229,8 +275,8 @@ def raw_visas(claims):
     """The visa JWTs a passport carries, unverified.
 
     Named `raw` because that is what they are at this point: strings out of a
-    token, signed by whoever, and worth exactly nothing until each has been
-    verified on its own.
+    UserInfo response, signed by whoever, and worth exactly nothing until each
+    has been verified on its own.
     """
     carried = claims.get(PASSPORT_CLAIM) or []
     if not isinstance(carried, list):

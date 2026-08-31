@@ -95,6 +95,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_PASSPORT_ISSUER` | *(unset)* | the issuer whose passports are accepted, when `BIOCHEF_AUTH=passport` |
 | `BIOCHEF_PASSPORT_AUDIENCE` | *(required)* | the audience a passport must name; `any` to accept tokens minted for other services |
 | `BIOCHEF_PASSPORT_JWKS_URL` | *(discovered)* | override the issuer's published key set URL |
+| `BIOCHEF_PASSPORT_USERINFO_URL` | *(discovered)* | override the issuer's published UserInfo endpoint |
 | `BIOCHEF_PASSPORT_VISA_ISSUERS` | *(unset)* | comma-separated issuers whose visas count |
 | `BIOCHEF_PASSPORT_REQUIRE_VISA` | *(unset)* | a visa type a caller must hold to be let in |
 | `BIOCHEF_PASSPORT_REQUIRE_VISA_VALUE` | *(unset)* | the exact value that visa must carry |
@@ -149,6 +150,12 @@ run's data**. Emptying this variable turns that off deliberately.
 names the caller `<issuer>#<subject>` — with the issuer, because two brokers can
 each have a subject `12345` and recording only the second half would merge two
 people into one caller.
+
+**The visas do not come from the access token.** The GA4GH AAI profile is
+explicit that "access tokens MUST NOT contain GA4GH Claims directly": the token
+is the credential this service presents to the broker's UserInfo endpoint to
+fetch the passport. LS AAI works exactly this way, handing a passport-scoped
+access token to a downstream service which calls back to obtain the visas.
 
 **A visa is signed separately from the passport carrying it**, usually by
 somebody else: a broker authenticates you, and a data controller independently

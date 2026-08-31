@@ -47,6 +47,7 @@ import passports
 BROKER = "https://broker.test"
 CONTROLLER = "https://controller.test"
 AUDIENCE = "biochef-agent"
+USERINFO = "https://broker.test/oidc/userinfo"
 
 
 class Signer:
@@ -346,6 +347,19 @@ def test_a_requirement_with_no_value_matches_any_value_of_that_type(controller):
 
 # --- the provider ------------------------------------------------------------
 
+def userinfo_returning(*visas):
+    """Stands in for the broker's UserInfo endpoint.
+
+    This is where a passport actually comes from. Embedding visas in the access
+    token, which every test here used to do, tested a shape the AAI profile
+    forbids: "access tokens MUST NOT contain GA4GH Claims directly".
+    """
+    def fetch(url, access_token):
+        assert access_token, "UserInfo must be called with the access token"
+        return {passports.PASSPORT_CLAIM: list(visas)}
+    return fetch
+
+
 def _provider(broker, controller, **kwargs):
     return auth.PassportAuth(
         issuer=BROKER, audience=AUDIENCE,
@@ -391,9 +405,9 @@ def test_requiring_a_visa_admits_a_caller_who_has_it(broker, controller):
     provider = _provider(broker, controller,
                          visa_issuers=CONTROLLER,
                          required_visa="ControlledAccessGrants",
-                         required_value="https://datasets.test/1")
-    token = broker.sign(passport_claims(**{
-        passports.PASSPORT_CLAIM: [controller.sign(visa_claims())]}))
+                         required_value="https://datasets.test/1",
+                         userinfo_url=USERINFO, userinfo_fetch=userinfo_returning(controller.sign(visa_claims())))
+    token = broker.sign(passport_claims())
     assert provider.authenticate(_Request(f"Bearer {token}")) == f"{BROKER}#user-1"
 
 
@@ -401,8 +415,9 @@ def test_requiring_a_visa_refuses_a_caller_without_it(broker, controller):
     provider = _provider(broker, controller,
                          visa_issuers=CONTROLLER,
                          required_visa="ControlledAccessGrants",
-                         required_value="https://datasets.test/1")
-    token = broker.sign(passport_claims())  # a valid passport, carrying nothing
+                         required_value="https://datasets.test/1",
+                         userinfo_url=USERINFO, userinfo_fetch=userinfo_returning())
+    token = broker.sign(passport_claims())  # a valid token, no visas at UserInfo
     with pytest.raises(auth.Unauthenticated):
         provider.authenticate(_Request(f"Bearer {token}"))
 
@@ -417,9 +432,10 @@ def test_a_self_minted_visa_does_not_get_the_caller_in(broker):
         required_visa="ControlledAccessGrants",
         keyset_factory=lambda url, issuer: keyset_for(
             broker if issuer == BROKER else attacker),
+        userinfo_url=USERINFO, userinfo_fetch=userinfo_returning(
+            attacker.sign(visa_claims(issuer="https://attacker.test"))),
     )
-    token = broker.sign(passport_claims(**{
-        passports.PASSPORT_CLAIM: [attacker.sign(visa_claims(issuer="https://attacker.test"))]}))
+    token = broker.sign(passport_claims())
     with pytest.raises(auth.Unauthenticated):
         provider.authenticate(_Request(f"Bearer {token}"))
 
@@ -821,8 +837,8 @@ def test_a_resolver_torn_down_does_not_wedge_authentication_permanently(broker):
 
 
 def _passport_with_visa(broker, controller):
-    return broker.sign(passport_claims(**{
-        passports.PASSPORT_CLAIM: [controller.sign(visa_claims())]}))
+    """A valid access token. The visas come from UserInfo, not from here."""
+    return broker.sign(passport_claims())
 
 
 def test_an_unreachable_visa_issuer_is_a_refusal_and_not_a_crash(broker, controller):
@@ -836,7 +852,8 @@ def test_an_unreachable_visa_issuer_is_a_refusal_and_not_a_crash(broker, control
 
     provider = auth.PassportAuth(
         issuer=BROKER, audience=AUDIENCE, visa_issuers=CONTROLLER,
-        required_visa="ControlledAccessGrants", keyset_factory=factory)
+        required_visa="ControlledAccessGrants", keyset_factory=factory,
+        userinfo_url=USERINFO, userinfo_fetch=userinfo_returning(controller.sign(visa_claims())))
     with pytest.raises(auth.Unauthenticated):
         provider.authenticate(
             _Request(f"Bearer {_passport_with_visa(broker, controller)}"))
@@ -860,7 +877,8 @@ def test_a_dead_visa_issuer_is_not_asked_once_per_request(broker, controller):
 
     provider = auth.PassportAuth(
         issuer=BROKER, audience=AUDIENCE, visa_issuers=CONTROLLER,
-        required_visa="ControlledAccessGrants", keyset_factory=factory)
+        required_visa="ControlledAccessGrants", keyset_factory=factory,
+        userinfo_url=USERINFO, userinfo_fetch=userinfo_returning(controller.sign(visa_claims())))
     token = f"Bearer {_passport_with_visa(broker, controller)}"
 
     def hit():
@@ -1034,3 +1052,85 @@ def test_a_discovery_document_that_is_not_a_document_is_refused():
     for answer in (None, [], "not a document"):
         with pytest.raises(passports.PassportError):
             passports.jwks_url_for("https://b.test", fetch=lambda url: answer)
+
+
+def test_a_visa_embedded_in_the_access_token_is_not_consulted(broker, controller):
+    """The defect this whole change fixes, pinned so it cannot come back.
+
+    The AAI profile says "access tokens MUST NOT contain GA4GH Claims directly",
+    so a conformant broker never puts visas there. Reading them off the token
+    meant every caller holding a perfectly good passport was refused, while the
+    tests passed because they minted tokens with the claim embedded, according
+    to the same misunderstanding as the code.
+
+    Here the token carries a visa that WOULD satisfy the requirement, and
+    UserInfo carries nothing. The caller must be refused.
+    """
+    provider = auth.PassportAuth(
+        issuer=BROKER, audience=AUDIENCE, visa_issuers=CONTROLLER,
+        required_visa="ControlledAccessGrants",
+        keyset_factory=lambda url, issuer: keyset_for(
+            broker if issuer == BROKER else controller),
+        userinfo_url=USERINFO, userinfo_fetch=userinfo_returning())
+    token = broker.sign(passport_claims(**{
+        passports.PASSPORT_CLAIM: [controller.sign(visa_claims())]}))
+    with pytest.raises(auth.Unauthenticated):
+        provider.authenticate(_Request(f"Bearer {token}"))
+
+
+def test_userinfo_is_called_with_the_access_token(broker, controller):
+    """The token is the credential for fetching the passport, which is its
+    entire role in this flow."""
+    seen = {}
+
+    def fetch(url, access_token):
+        seen["url"] = url
+        seen["token"] = access_token
+        return {passports.PASSPORT_CLAIM: [controller.sign(visa_claims())]}
+
+    provider = auth.PassportAuth(
+        issuer=BROKER, audience=AUDIENCE, visa_issuers=CONTROLLER,
+        required_visa="ControlledAccessGrants",
+        keyset_factory=lambda url, issuer: keyset_for(
+            broker if issuer == BROKER else controller),
+        userinfo_url=USERINFO, userinfo_fetch=fetch)
+    token = broker.sign(passport_claims())
+    assert provider.authenticate(_Request(f"Bearer {token}")) == f"{BROKER}#user-1"
+    assert seen["url"] == USERINFO
+    assert seen["token"] == token
+
+
+def test_the_passport_is_fetched_fresh_for_every_request(broker, controller):
+    """A passport says what the holder may see now. A visa carries its own
+    expiry precisely because that can stop being true between one request and
+    the next, so caching it here would outlive the statement."""
+    calls = []
+
+    def fetch(url, access_token):
+        calls.append(1)
+        return {passports.PASSPORT_CLAIM: [controller.sign(visa_claims())]}
+
+    provider = auth.PassportAuth(
+        issuer=BROKER, audience=AUDIENCE, visa_issuers=CONTROLLER,
+        required_visa="ControlledAccessGrants",
+        keyset_factory=lambda url, issuer: keyset_for(
+            broker if issuer == BROKER else controller),
+        userinfo_url=USERINFO, userinfo_fetch=fetch)
+    token = f"Bearer {broker.sign(passport_claims())}"
+    for _ in range(3):
+        provider.authenticate(_Request(token))
+    assert len(calls) == 3
+
+
+def test_a_userinfo_answer_that_is_not_an_object_is_refused():
+    with pytest.raises(passports.PassportError):
+        passports.fetch_passport(USERINFO, "tok", fetch=lambda u, t: "nope")
+
+
+def test_the_userinfo_url_comes_from_discovery():
+    document = {"userinfo_endpoint": "https://b.test/oidc/userinfo",
+                "jwks_uri": "https://b.test/oidc/jwk"}
+    assert passports.userinfo_url_for("https://b.test/", fetch=lambda u: document) \
+        == "https://b.test/oidc/userinfo"
+    with pytest.raises(passports.PassportError):
+        passports.userinfo_url_for("https://b.test", fetch=lambda u: {})
