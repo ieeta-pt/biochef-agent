@@ -1134,3 +1134,60 @@ def test_the_userinfo_url_comes_from_discovery():
         == "https://b.test/oidc/userinfo"
     with pytest.raises(passports.PassportError):
         passports.userinfo_url_for("https://b.test", fetch=lambda u: {})
+
+
+LSAAI = "https://login.aai.lifescience-ri.eu/oidc/"
+LSAAI_DISCOVERY = {
+    "jwks_uri": "https://login.aai.lifescience-ri.eu/oidc/jwk",
+    "userinfo_endpoint": "https://login.aai.lifescience-ri.eu/oidc/userinfo",
+}
+
+
+def test_the_real_lsaai_endpoints_are_accepted():
+    """Taken from the live discovery document. The keys are at /oidc/jwk and
+    not at any conventional path, which is why they are read from the issuer
+    rather than assembled."""
+    assert passports.jwks_url_for(LSAAI, fetch=lambda url: LSAAI_DISCOVERY) \
+        == LSAAI_DISCOVERY["jwks_uri"]
+    assert passports.userinfo_url_for(LSAAI, fetch=lambda url: LSAAI_DISCOVERY) \
+        == LSAAI_DISCOVERY["userinfo_endpoint"]
+
+
+def test_a_keys_url_on_another_host_is_refused():
+    """The worse of the two, and a complete authentication bypass.
+
+    Keys fetched from a host the issuer named validate tokens. Anything able to
+    influence that document -- a misconfiguration, a stale copy, a compromised
+    broker -- would have this service trusting an attacker's signing key.
+    """
+    document = {"jwks_uri": "https://attacker.example/keys"}
+    with pytest.raises(passports.PassportError) as caught:
+        passports.jwks_url_for(LSAAI, fetch=lambda url: document)
+    assert "attacker.example" in str(caught.value)
+
+
+def test_a_userinfo_url_on_another_host_is_refused():
+    """This one sends every caller's access token to whoever is listening."""
+    document = {"userinfo_endpoint": "https://attacker.example/collect"}
+    with pytest.raises(passports.PassportError):
+        passports.userinfo_url_for(LSAAI, fetch=lambda url: document)
+
+
+def test_a_relative_or_hostless_endpoint_is_refused():
+    for value in ("/oidc/jwk", "jwk", ""):
+        with pytest.raises(passports.PassportError):
+            passports.jwks_url_for(LSAAI, fetch=lambda url: {"jwks_uri": value})
+
+
+def test_every_passport_setting_including_the_newest_is_documented():
+    """The explicit list has to grow with the settings, or the guard covers the
+    six that existed when it was written and none since."""
+    import re
+
+    source = (REPO_ROOT / "auth.py").read_text()
+    names = sorted(set(re.findall(r'"(BIOCHEF_PASSPORT_[A-Z_]+)"', source)))
+    assert len(names) >= 7, names
+    for path in ("README.md", "example.env"):
+        text = (REPO_ROOT / path).read_text()
+        for name in names:
+            assert name in text, f"{name} is read by the code but absent from {path}"

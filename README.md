@@ -181,6 +181,13 @@ A passport carrying more than 128 visas is refused outright rather than having
 the first 128 examined, because a legitimate passport whose relevant visa sat
 past a silent cut would be denied for a reason nobody could see.
 
+Both the key set and the UserInfo endpoint are required to be on the **issuer's
+own host**. They are read from a document and then trusted completely, and a
+`jwks_uri` pointing elsewhere is a full authentication bypass, since keys fetched
+from there validate tokens. A `userinfo_endpoint` pointing elsewhere sends every
+caller's access token to whoever is listening. LS AAI serves both from its own
+host; a deployment that genuinely splits them sets the endpoint explicitly.
+
 Refusals do not say which check failed. Whether it was the signature, the
 issuer, the audience or the expiry is a fact about this deployment's
 configuration, and telling an unauthenticated caller is telling them how to aim.

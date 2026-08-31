@@ -35,6 +35,7 @@ public, which means anyone can sign. Nothing here ever lets a token choose.
 import json
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 import jwt
@@ -166,6 +167,31 @@ def discover(issuer, fetch=None):
     return document
 
 
+def _same_host_as(issuer, url, what):
+    """Refuse an endpoint the issuer's own document points elsewhere.
+
+    Both endpoints are taken from a document and then trusted completely, and
+    neither was checked. A jwks_uri on another host is the worse of the two:
+    keys fetched from there validate tokens, so anything able to influence that
+    document -- a misconfiguration, a stale copy, a compromised broker -- turns
+    into a full authentication bypass. A userinfo_endpoint on another host sends
+    every caller's access token to whoever is listening.
+
+    Same host as the issuer is what a conformant broker publishes; LS AAI serves
+    both from login.aai.lifescience-ri.eu. A deployment that genuinely splits
+    them sets BIOCHEF_PASSPORT_JWKS_URL or BIOCHEF_PASSPORT_USERINFO_URL and
+    says so out loud.
+    """
+    issuer_host = urllib.parse.urlparse(issuer).netloc.lower()
+    url_host = urllib.parse.urlparse(url).netloc.lower()
+    if not url_host or url_host != issuer_host:
+        raise PassportError(
+            f"{issuer} publishes a {what} at {url_host or 'no host'}, which is "
+            f"not its own host. Set the endpoint explicitly if that is intended."
+        )
+    return url
+
+
 def userinfo_url_for(issuer, fetch=None):
     """Where an issuer's UserInfo endpoint is.
 
@@ -178,7 +204,7 @@ def userinfo_url_for(issuer, fetch=None):
     url = discover(issuer, fetch).get("userinfo_endpoint")
     if not url or not isinstance(url, str):
         raise PassportError(f"{issuer} publishes no usable userinfo_endpoint")
-    return url
+    return _same_host_as(issuer, url, "userinfo_endpoint")
 
 
 def fetch_passport(userinfo_url, access_token, fetch=None):
@@ -219,7 +245,7 @@ def jwks_url_for(issuer, fetch=None):
     url = discover(issuer, fetch).get("jwks_uri")
     if not url or not isinstance(url, str):
         raise PassportError(f"{issuer} publishes no usable jwks_uri")
-    return url
+    return _same_host_as(issuer, url, "jwks_uri")
 
 
 def verify(token, keyset, *, issuer, audience=None):
