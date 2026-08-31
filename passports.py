@@ -160,9 +160,19 @@ def jwks_url_for(issuer, fetch=None):
     fetch = fetch or _fetch_json
     base = issuer.rstrip("/")
     document = fetch(f"{base}/.well-known/openid-configuration")
-    url = (document or {}).get("jwks_uri")
-    if not url:
-        raise PassportError(f"{issuer} publishes no jwks_uri")
+    # Checked rather than assumed to be an object. `(document or {}).get(...)`
+    # reads as defensive and only covers None and empty containers: a captive
+    # portal or a proxy answering with a JSON string reached .get on a str and
+    # raised AttributeError, which is not caught anywhere on the way out and so
+    # arrived as a 500 rather than as a refusal.
+    if not isinstance(document, dict):
+        raise PassportError(
+            f"{issuer} answered its discovery request with "
+            f"{type(document).__name__}, not an object"
+        )
+    url = document.get("jwks_uri")
+    if not url or not isinstance(url, str):
+        raise PassportError(f"{issuer} publishes no usable jwks_uri")
     return url
 
 

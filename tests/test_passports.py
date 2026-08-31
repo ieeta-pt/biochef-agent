@@ -988,3 +988,49 @@ def test_a_waiter_woken_by_a_failure_is_not_told_it_timed_out(broker):
             f"a waiter woken by a failure was told it timed out: {message}"
         )
         assert "could not be resolved" in message
+
+
+def test_the_keys_url_comes_from_the_issuers_own_discovery_document():
+    """Read rather than assembled by convention.
+
+    The conventional path is right for most providers and silently wrong for the
+    rest, and silently wrong here means refusing every valid token.
+    """
+    seen = []
+
+    def fetch(url):
+        seen.append(url)
+        return {"jwks_uri": "https://b.test/oidc/keys"}
+
+    assert passports.jwks_url_for("https://b.test", fetch=fetch) == "https://b.test/oidc/keys"
+    assert seen == ["https://b.test/.well-known/openid-configuration"]
+
+
+def test_a_trailing_slash_on_the_issuer_does_not_double_up():
+    seen = []
+
+    def fetch(url):
+        seen.append(url)
+        return {"jwks_uri": "https://b.test/keys"}
+
+    passports.jwks_url_for("https://b.test/", fetch=fetch)
+    assert seen == ["https://b.test/.well-known/openid-configuration"]
+
+
+def test_an_issuer_publishing_no_keys_url_is_refused():
+    with pytest.raises(passports.PassportError) as caught:
+        passports.jwks_url_for("https://b.test", fetch=lambda url: {})
+    assert "jwks_uri" in str(caught.value)
+
+
+def test_a_non_string_keys_url_is_refused():
+    with pytest.raises(passports.PassportError):
+        passports.jwks_url_for("https://b.test", fetch=lambda url: {"jwks_uri": 12})
+
+
+def test_a_discovery_document_that_is_not_a_document_is_refused():
+    """A proxy answering with nothing, or with something that is not an object,
+    must not come out as an AttributeError somewhere later."""
+    for answer in (None, [], "not a document"):
+        with pytest.raises(passports.PassportError):
+            passports.jwks_url_for("https://b.test", fetch=lambda url: answer)
