@@ -202,7 +202,7 @@ class PassportAuth(AuthProvider):
         # nobody should discover from a 401 at three in the morning; an
         # unreachable host is not that kind of mistake.
         self._token_keyset = None
-        self._last_discovery = 0.0
+        self._last_failure = 0.0
         self._visa_keysets = {}
         self._lock = threading.Lock()
 
@@ -226,22 +226,31 @@ class PassportAuth(AuthProvider):
         with self._lock:
             if self._token_keyset is not None:
                 return self._token_keyset
-            now = time.monotonic()
-            if now - self._last_discovery < DISCOVERY_RETRY_SECONDS:
+            # FAILED recently, not ATTEMPTED recently. Timing the attempt meant
+            # a construction still in flight looked like a fresh failure, so on
+            # a perfectly healthy cold start with concurrent traffic one request
+            # built the key set and every other one was told 401. Refusing a
+            # legitimate caller because of an internal race is a far worse
+            # answer than a redundant fetch.
+            if time.monotonic() - self._last_failure < DISCOVERY_RETRY_SECONDS:
                 # OSError rather than a bespoke type: authenticate already
                 # treats that as "could not establish the key", which is exactly
                 # what this is, and raising it here needs no import.
                 raise OSError(
-                    f"the issuer's key set could not be resolved, and was tried "
-                    f"less than {DISCOVERY_RETRY_SECONDS}s ago"
+                    f"the issuer's key set could not be resolved, and the last "
+                    f"attempt failed less than {DISCOVERY_RETRY_SECONDS}s ago"
                 )
-            self._last_discovery = now
 
-        # Outside the lock. Two callers arriving together may both build one,
-        # which wastes a fetch and is harmless -- one of them wins below. That
-        # is a far better trade than serialising every request in the service
-        # behind a single slow call.
-        keyset = self._factory(self._jwks_url, self._issuer)
+        # Outside the lock, so one slow call cannot stall every other caller.
+        # Callers arriving together may each build one; the first to finish is
+        # kept and the rest are discarded. That costs a duplicated fetch on a
+        # cold start and buys back the 401s above.
+        try:
+            keyset = self._factory(self._jwks_url, self._issuer)
+        except Exception:
+            with self._lock:
+                self._last_failure = time.monotonic()
+            raise
 
         with self._lock:
             if self._token_keyset is None:

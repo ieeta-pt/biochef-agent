@@ -673,3 +673,43 @@ def test_the_keyset_is_built_once_when_the_issuer_answers(broker):
     for _ in range(5):
         assert provider.authenticate(_Request(token)) == f"{BROKER}#user-1"
     assert len(built) == 1
+
+
+def test_a_healthy_cold_start_does_not_refuse_concurrent_callers(broker):
+    """The regression this replaced.
+
+    Timing the ATTEMPT rather than the FAILURE meant a construction still in
+    flight looked like a fresh failure, so on a perfectly healthy cold start one
+    request built the key set and every other concurrent one was told 401.
+    Refusing a legitimate caller because of an internal race is a far worse
+    answer than a redundant fetch.
+    """
+    import threading as _threading
+
+    def slow_but_fine(url, issuer):
+        time.sleep(0.4)
+        return keyset_for(broker)
+
+    provider = auth.PassportAuth(issuer=BROKER, audience=AUDIENCE,
+                                 keyset_factory=slow_but_fine)
+    token = f"Bearer {broker.sign(passport_claims())}"
+    outcomes = []
+
+    def hit():
+        try:
+            outcomes.append(provider.authenticate(_Request(token)))
+        except auth.Unauthenticated:
+            outcomes.append(None)
+
+    threads = [_threading.Thread(target=hit) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    refused = [o for o in outcomes if o is None]
+    assert not refused, (
+        f"{len(refused)} of {len(outcomes)} legitimate concurrent callers were "
+        f"refused during a successful cold start"
+    )
+    assert all(o == f"{BROKER}#user-1" for o in outcomes)
