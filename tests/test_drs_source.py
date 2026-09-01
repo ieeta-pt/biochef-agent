@@ -75,7 +75,7 @@ def transport(objects=None, payloads=None, seen=None):
     objects = objects or {}
     payloads = payloads or {}
 
-    def open_url(url, headers):
+    def open_url(url, headers, **kwargs):
         if seen is not None:
             seen.append(url)
         if url in objects:
@@ -191,7 +191,7 @@ def test_headers_from_the_access_url_are_sent(tmp_path):
     useless without them."""
     sent = {}
 
-    def open_url(url, headers):
+    def open_url(url, headers, **kwargs):
         if url == BYTES_URL:
             sent.update(headers or {})
             return _Body(PAYLOAD)
@@ -272,3 +272,122 @@ def test_a_server_sending_far_more_than_it_declared_is_cut_off(tmp_path):
 def test_a_plain_http_url_is_never_opened():
     with pytest.raises(DataSourceError):
         _open_url("http://bytes.example.test/obj-1", {})
+
+
+def test_a_redirect_off_the_drs_api_is_refused():
+    """urllib follows 3xx by default, which walks straight around the allowlist.
+
+    An allowlisted DRS server answering 302 would send this service wherever it
+    liked, including hosts only reachable from inside. The allowlist checks the
+    URI it was given, so that has to be where the request ends up.
+    """
+    from datasource import _NoRedirects
+
+    handler = _NoRedirects()
+    request = types.SimpleNamespace(full_url=OBJECT_URL)
+    with pytest.raises(DataSourceError) as caught:
+        handler.redirect_request(request, None, 302, "Found", {},
+                                 "https://internal.example.test/admin")
+    assert "internal.example.test" in str(caught.value)
+    assert "BIOCHEF_DRS_HOSTS" in str(caught.value)
+
+
+def test_a_redirect_for_the_bytes_may_stay_on_https_and_may_not_leave_it():
+    """The bytes are a different case: an access_url is expected to bounce to
+    storage, and the allowlist never covered that host because it cannot."""
+    from datasource import _HttpsRedirectsOnly
+
+    handler = _HttpsRedirectsOnly()
+    request = types.SimpleNamespace(full_url=BYTES_URL)
+    with pytest.raises(DataSourceError) as caught:
+        handler.redirect_request(request, None, 302, "Found", {},
+                                 "http://storage.example.test/obj-1")
+    assert "not https" in str(caught.value)
+
+
+def test_the_api_is_opened_without_following_redirects_and_the_bytes_with(tmp_path):
+    """Which call gets which treatment, asserted rather than assumed."""
+    follows = {}
+
+    def open_url(url, headers, follow_redirects=False):
+        follows[url] = follow_redirects
+        if url == OBJECT_URL:
+            return _Body(json.dumps(an_object()).encode())
+        return _Body(PAYLOAD)
+
+    source = a_source(open_url=open_url)
+    with workspace(tmp_path) as ws:
+        source.fetch(ws, "in.fa", f"drs://{HOST}/obj-1")
+    assert follows[OBJECT_URL] is False, "the DRS API must not follow redirects"
+    assert follows[BYTES_URL] is True
+
+
+def test_bytes_that_fail_the_checksum_are_not_left_in_the_workspace(tmp_path):
+    """Writing straight to the name and checking afterwards left the wrong bytes
+    sitting under the right name, which is the gap C1 closed for tool bundles
+    and no better here. Anything reading that file next reads what the server
+    sent rather than what the object named.
+    """
+    source = a_source(open_url=transport({OBJECT_URL: an_object()},
+                                         {BYTES_URL: b"something else entirely"}))
+    with workspace(tmp_path) as ws:
+        with pytest.raises(DataSourceError):
+            source.fetch(ws, "in.fa", f"drs://{HOST}/obj-1")
+        assert not (Path(ws.path) / "in.fa").exists(), "the wrong bytes were kept"
+        assert not (Path(ws.path) / "in.fa.part").exists(), "the staging file was kept"
+
+
+def test_an_overrun_leaves_nothing_behind_either(tmp_path):
+    source = a_source(open_url=transport({OBJECT_URL: an_object(size=16)},
+                                         {BYTES_URL: b"x" * (4 * 1024 * 1024)}))
+    with workspace(tmp_path) as ws:
+        with pytest.raises(DataSourceError):
+            source.fetch(ws, "in.fa", f"drs://{HOST}/obj-1")
+        assert not (Path(ws.path) / "in.fa").exists()
+        assert not (Path(ws.path) / "in.fa.part").exists()
+
+
+def test_the_final_name_never_holds_unverified_bytes(tmp_path):
+    """The property staging actually buys, which "nothing is left behind" does
+    not test: both designs clean up after a failure, and the difference only
+    shows while the bytes are in flight.
+
+    Without staging the workflow's own file exists, mid-stream, holding whatever
+    the server is sending. A crash there leaves it; anything reading the
+    workspace concurrently sees it. Here the reader looks at the workspace on
+    every chunk and records what it finds.
+    """
+    seen_early = []
+
+    class _Watching(io.BytesIO):
+        def __init__(self, data, ws_path):
+            super().__init__(data)
+            self._ws = ws_path
+
+        def read(self, size=-1):
+            seen_early.append((Path(self._ws) / "in.fa").exists())
+            return super().read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    holder = {}
+
+    def open_url(url, headers, **kwargs):
+        if url == OBJECT_URL:
+            return _Body(json.dumps(an_object()).encode())
+        return _Watching(PAYLOAD, holder["path"])
+
+    source = a_source(open_url=open_url)
+    with workspace(tmp_path) as ws:
+        holder["path"] = ws.path
+        source.fetch(ws, "in.fa", f"drs://{HOST}/obj-1")
+        assert (Path(ws.path) / "in.fa").read_bytes() == PAYLOAD
+
+    assert seen_early, "the body was never read"
+    assert not any(seen_early), (
+        "the workflow's own file existed while the bytes were still arriving"
+    )

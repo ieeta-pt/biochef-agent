@@ -185,16 +185,27 @@ class DrsSource(DataSource):
         declared_size = document.get("size")
 
         digest = hashlib.new("sha256" if expected[0] == "sha-256" else "md5")
-        counted = _Counted(self._open_url(url, headers), digest, declared_size, name)
-        ws.write_stream(name, counted)
-
-        actual = digest.hexdigest()
-        if actual.lower() != expected[1].lower():
-            raise DataSourceError(
-                f"{name!r}: {spec} arrived with {expected[0]} {actual}, but the "
-                f"DRS object declares {expected[1]}. The bytes are not the ones "
-                f"named."
-            )
+        # Staged, verified, and only then given the name the workflow asked for.
+        # Writing straight to `name` and checking afterwards left the wrong bytes
+        # sitting in the workspace under the right name -- which is the shape of
+        # the gap C1 closed for tool bundles, and no better here.
+        staged = f"{name}.part"
+        counted = _Counted(
+            self._open_url(url, headers, follow_redirects=True),
+            digest, declared_size, name)
+        try:
+            ws.write_stream(staged, counted)
+            actual = digest.hexdigest()
+            if actual.lower() != expected[1].lower():
+                raise DataSourceError(
+                    f"{name!r}: {spec} arrived with {expected[0]} {actual}, but "
+                    f"the DRS object declares {expected[1]}. The bytes are not "
+                    f"the ones named."
+                )
+        except BaseException:
+            _discard(ws, staged)
+            raise
+        os.replace(os.path.join(ws.path, staged), os.path.join(ws.path, name))
 
     def _parse(self, name, uri):
         parsed = urllib.parse.urlparse(uri)
@@ -313,6 +324,14 @@ class _Counted:
         return chunk
 
 
+def _discard(ws, name):
+    """Remove a staged file, and never mask the failure that got us here."""
+    try:
+        os.unlink(os.path.join(ws.path, name))
+    except OSError:
+        pass
+
+
 def _header_list(headers):
     """DRS gives headers as a list of "Name: value" strings."""
     if not isinstance(headers, list):
@@ -325,11 +344,47 @@ def _header_list(headers):
     return out
 
 
-def _open_url(url, headers):
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse a redirect outright.
+
+    urllib follows 3xx by default, which walks straight around the allowlist:
+    an allowlisted DRS server answering 302 sends this service wherever it
+    likes, including at hosts only reachable from inside. The allowlist checks
+    the URI it was given, not where the request ends up, so the two have to be
+    the same thing.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise DataSourceError(
+            f"{req.full_url} redirected to {newurl}, and a redirect would leave "
+            f"the hosts named in BIOCHEF_DRS_HOSTS behind"
+        )
+
+
+class _HttpsRedirectsOnly(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only while it stays on https.
+
+    The bytes are a different case from the API. An access_url is expected to
+    point at storage and to bounce -- a presigned S3 URL is the ordinary shape
+    -- and the allowlist never covered that host, because it cannot. What the
+    checksum cannot survive is being fetched over plain http, so that is what
+    is refused here.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.lower().startswith("https://"):
+            raise DataSourceError(
+                f"{req.full_url} redirected to {newurl}, which is not https")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_url(url, headers, follow_redirects=False):
     if not url.lower().startswith("https://"):
         raise DataSourceError(f"refusing to read over an insecure URL: {url}")
+    handler = _HttpsRedirectsOnly() if follow_redirects else _NoRedirects()
+    opener = urllib.request.build_opener(handler)
     request = urllib.request.Request(url, headers=dict(headers or {}))
-    return urllib.request.urlopen(request, timeout=60)
+    return opener.open(request, timeout=60)
 
 
 PROVIDERS = {
