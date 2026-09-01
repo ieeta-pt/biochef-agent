@@ -149,6 +149,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_TOOL_CACHE` | `tool-cache` | where pulled tool bundles are kept between runs |
 | `BIOCHEF_DATA_SOURCES` | `upload` | where inputs may come from: `upload`, `localpath` |
 | `BIOCHEF_LOCAL_ROOT` | | the only directory `localpath` may read from |
+| `BIOCHEF_DRS_HOSTS` | *(unset)* | DRS servers the `drs` source may resolve against; unset disables it |
 | `BIOCHEF_RUN_ROOT` | the system temp directory | where a run's private directory is created |
 | `BIOCHEF_RUN_TIMEOUT` | `900` | seconds before a run's whole process group is killed |
 | `BIOCHEF_KEEP_WORKSPACE` | `false` | leave a run's directory behind, for debugging |
@@ -214,6 +215,32 @@ binds the host's `/tmp` into the container, and that is where a run's directory
 lives unless `BIOCHEF_RUN_ROOT` says otherwise. Without it, a containerised tool
 is walled off from `/usr` and `/etc` while still able to read **every other
 run's data**. Emptying this variable turns that off deliberately.
+
+## DRS inputs
+
+`drs://host/id` resolves to `https://host/ga4gh/drs/v1/objects/id`, and that is
+the whole of the difficulty: **the URI names its own host, and the URI comes
+from the client**. A service that follows any host a workflow names is a request
+generator aimed at whatever it can reach from inside the network it sits in,
+which inside a TRE is the point of the TRE.
+
+So `BIOCHEF_DRS_HOSTS` is an allowlist with no default, and unset disables the
+source — the same reasoning as `BIOCHEF_LOCAL_ROOT`, and a stronger case, since
+here the client chooses the host and not merely the path.
+
+Compact identifiers (`drs://prefix:accession`) are refused. Resolving one means
+asking a third-party resolver which host to contact, and taking an endpoint out
+of a document and then trusting it completely is a mistake made twice already in
+this service.
+
+What arrives is checked against the `sha-256` or `md5` the DRS object itself
+declares, and an object declaring neither is refused rather than taken on trust.
+A server sending far more than the size it declared is cut off, because
+otherwise a declared kilobyte and an endless body fill the disk.
+
+An `access_url` may legitimately point at another host — a presigned S3 or GCS
+URL is the ordinary case — which is why the allowlist covers the DRS server
+rather than the bytes, and why the checksum matters.
 
 ## How a request is served
 

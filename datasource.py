@@ -16,7 +16,12 @@ before any of them is asked, against the workflow itself, because a source
 naming its own destination is how a fetch becomes a write to somewhere else.
 """
 
+import hashlib
+import json
 import os
+import urllib.parse
+import urllib.request
+from urllib.parse import quote
 
 
 class DataSourceError(Exception):
@@ -118,10 +123,284 @@ class LocalPathSource(DataSource):
             ws.write_stream(name, source)
 
 
+class DrsSource(DataSource):
+    """An object named by a GA4GH DRS URI (#21).
+
+    `drs://host/id` resolves to `https://host/ga4gh/drs/v1/objects/id`, which is
+    the whole difficulty: the URI names the host, and the URI comes from the
+    client. Following one unchecked makes this service a request generator
+    pointed wherever a workflow says -- from inside a TRE, at whatever that TRE
+    can reach and the caller cannot.
+
+    So the hosts are an allowlist and there is no default, exactly as
+    LocalPathSource confines itself to a root because the client chooses the
+    path. Unset disables the source rather than permitting everything.
+
+    Compact identifiers (`drs://prefix:accession`) are refused. Resolving one
+    means asking a third-party resolver which host to contact, and taking an
+    endpoint out of a document and then trusting it completely is a mistake this
+    codebase has already made twice.
+    """
+
+    name = "drs"
+
+    # Everything the spec fixes, so none of it is a guess: DRS servers are at
+    # https on 443 under this base path.
+    BASE_PATH = "/ga4gh/drs/v1/objects"
+
+    # Preferred first. sha-256 if the server offers it, md5 because most of them
+    # only offer that. An object declaring neither is refused rather than taken
+    # on trust -- an unverified download is the gap C1 exists to close, and it
+    # does not stop being one because a different protocol opened it.
+    CHECKSUMS = ("sha-256", "md5")
+
+    def __init__(self, hosts=None, open_url=None):
+        raw = DRS_HOSTS if hosts is None else hosts
+        self.hosts = frozenset(
+            part.strip().lower() for part in (raw or "").split(",") if part.strip()
+        )
+        if not self.hosts:
+            raise ValueError(
+                "the drs source needs BIOCHEF_DRS_HOSTS set to the DRS servers "
+                "it may resolve against. Refusing to start rather than "
+                "following whatever host a workflow names."
+            )
+        self._open_url = open_url or _open_url
+
+    def describe(self) -> str:
+        return f"{self.name} ({', '.join(sorted(self.hosts))})"
+
+    def fetch(self, ws, name: str, spec) -> None:
+        if not isinstance(spec, str) or not spec:
+            raise DataSourceError(
+                f"{name!r}: the drs source expects a drs:// URI, got "
+                f"{type(spec).__name__}"
+            )
+        host, object_id = self._parse(name, spec)
+
+        document = self._json(f"https://{host}{self.BASE_PATH}/{quote(object_id, safe='')}")
+        url, headers = self._access(host, object_id, document)
+
+        expected = self._checksum(name, document)
+        declared_size = document.get("size")
+
+        digest = hashlib.new("sha256" if expected[0] == "sha-256" else "md5")
+        # Staged, verified, and only then given the name the workflow asked for.
+        # Writing straight to `name` and checking afterwards left the wrong bytes
+        # sitting in the workspace under the right name -- which is the shape of
+        # the gap C1 closed for tool bundles, and no better here.
+        staged = f"{name}.part"
+        counted = _Counted(
+            self._open_url(url, headers, follow_redirects=True),
+            digest, declared_size, name)
+        try:
+            ws.write_stream(staged, counted)
+            actual = digest.hexdigest()
+            if actual.lower() != expected[1].lower():
+                raise DataSourceError(
+                    f"{name!r}: {spec} arrived with {expected[0]} {actual}, but "
+                    f"the DRS object declares {expected[1]}. The bytes are not "
+                    f"the ones named."
+                )
+        except BaseException:
+            _discard(ws, staged)
+            raise
+        os.replace(os.path.join(ws.path, staged), os.path.join(ws.path, name))
+
+    def _parse(self, name, uri):
+        parsed = urllib.parse.urlparse(uri)
+        if parsed.scheme != "drs":
+            raise DataSourceError(f"{name!r}: {uri!r} is not a drs:// URI")
+        authority = parsed.netloc
+        if ":" in authority:
+            # The spec uses the colon to tell the two forms apart, and a port is
+            # not a thing here: a conformant server is on 443.
+            raise DataSourceError(
+                f"{name!r}: {uri!r} looks like a compact identifier. Only "
+                f"hostname-based DRS URIs are resolved, because resolving a "
+                f"compact one means letting a third-party resolver choose which "
+                f"host this service contacts."
+            )
+        host = authority.lower()
+        if host not in self.hosts:
+            raise DataSourceError(
+                f"{name!r}: {host!r} is not in BIOCHEF_DRS_HOSTS"
+            )
+        object_id = parsed.path.lstrip("/")
+        # The id becomes a path segment. One containing a slash or a dot segment
+        # would reach somewhere else on that server entirely.
+        if not object_id or "/" in object_id or object_id.startswith("."):
+            raise DataSourceError(f"{name!r}: {uri!r} has no usable object id")
+        return host, object_id
+
+    def _access(self, host, object_id, document):
+        """A URL to read the bytes from, following the spec's two shapes.
+
+        An access_url may point at any host at all -- a presigned S3 or GCS URL
+        is the normal case and the reason the allowlist covers the DRS server
+        rather than the bytes. What protects the download is the checksum the
+        object itself declares, which is checked after the fact.
+        """
+        methods = document.get("access_methods") or []
+        if not isinstance(methods, list) or not methods:
+            raise DataSourceError(f"{object_id}: the DRS object offers no access_methods")
+
+        for method in methods:
+            if not isinstance(method, dict):
+                continue
+            direct = method.get("access_url")
+            if isinstance(direct, dict) and direct.get("url"):
+                return direct["url"], _header_list(direct.get("headers"))
+
+        for method in methods:
+            if not isinstance(method, dict) or not method.get("access_id"):
+                continue
+            resolved = self._json(
+                f"https://{host}{self.BASE_PATH}/{quote(object_id, safe='')}"
+                f"/access/{quote(str(method['access_id']), safe='')}"
+            )
+            if isinstance(resolved, dict) and resolved.get("url"):
+                return resolved["url"], _header_list(resolved.get("headers"))
+
+        raise DataSourceError(
+            f"{object_id}: no access_method yielded a URL to read from"
+        )
+
+    def _checksum(self, name, document):
+        offered = document.get("checksums") or []
+        by_type = {
+            str(entry.get("type", "")).lower(): str(entry.get("checksum", ""))
+            for entry in offered if isinstance(entry, dict)
+        }
+        for algorithm in self.CHECKSUMS:
+            if by_type.get(algorithm):
+                return algorithm, by_type[algorithm]
+        raise DataSourceError(
+            f"{name!r}: the DRS object declares no {' or '.join(self.CHECKSUMS)} "
+            f"checksum, so what arrives cannot be checked against what was named"
+        )
+
+    def _json(self, url):
+        with self._open_url(url, {}) as response:
+            try:
+                document = json.loads(response.read())
+            except ValueError as exc:
+                raise DataSourceError(f"{url} did not answer with JSON: {exc}") from exc
+        if not isinstance(document, dict):
+            raise DataSourceError(
+                f"{url} answered with {type(document).__name__}, not an object")
+        return document
+
+
+class _Counted:
+    """A response body that hashes as it passes and refuses to overrun.
+
+    A server declaring a small size and then sending without end would otherwise
+    fill the disk, and the workspace writer has no reason to know what the DRS
+    object claimed.
+    """
+
+    # Enough headroom for a server whose size is slightly stale, without letting
+    # "declared 1KB" become "wrote 10GB".
+    SLACK = 1024 * 1024
+
+    def __init__(self, response, digest, declared_size, name):
+        self._response = response
+        self._digest = digest
+        self._limit = None if declared_size is None else int(declared_size) + self.SLACK
+        self._seen = 0
+        self._name = name
+
+    def read(self, size=-1):
+        chunk = self._response.read(size)
+        if chunk:
+            self._seen += len(chunk)
+            if self._limit is not None and self._seen > self._limit:
+                raise DataSourceError(
+                    f"{self._name!r}: the server sent more than the "
+                    f"{self._limit - self.SLACK} bytes the DRS object declared"
+                )
+            self._digest.update(chunk)
+        return chunk
+
+
+def _discard(ws, name):
+    """Remove a staged file, and never mask the failure that got us here."""
+    try:
+        os.unlink(os.path.join(ws.path, name))
+    except OSError:
+        pass
+
+
+def _header_list(headers):
+    """DRS gives headers as a list of "Name: value" strings."""
+    if not isinstance(headers, list):
+        return {}
+    out = {}
+    for entry in headers:
+        if isinstance(entry, str) and ":" in entry:
+            key, _, value = entry.partition(":")
+            out[key.strip()] = value.strip()
+    return out
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse a redirect outright.
+
+    urllib follows 3xx by default, which walks straight around the allowlist:
+    an allowlisted DRS server answering 302 sends this service wherever it
+    likes, including at hosts only reachable from inside. The allowlist checks
+    the URI it was given, not where the request ends up, so the two have to be
+    the same thing.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise DataSourceError(
+            f"{req.full_url} redirected to {newurl}, and a redirect would leave "
+            f"the hosts named in BIOCHEF_DRS_HOSTS behind"
+        )
+
+
+class _HttpsRedirectsOnly(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only while it stays on https.
+
+    The bytes are a different case from the API. An access_url is expected to
+    point at storage and to bounce -- a presigned S3 URL is the ordinary shape
+    -- and the allowlist never covered that host, because it cannot. What the
+    checksum cannot survive is being fetched over plain http, so that is what
+    is refused here.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.lower().startswith("https://"):
+            raise DataSourceError(
+                f"{req.full_url} redirected to {newurl}, which is not https")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_url(url, headers, follow_redirects=False):
+    if not url.lower().startswith("https://"):
+        raise DataSourceError(f"refusing to read over an insecure URL: {url}")
+    handler = _HttpsRedirectsOnly() if follow_redirects else _NoRedirects()
+    opener = urllib.request.build_opener(handler)
+    request = urllib.request.Request(url, headers=dict(headers or {}))
+    return opener.open(request, timeout=60)
+
+
 PROVIDERS = {
     UploadSource.name: UploadSource,
     LocalPathSource.name: LocalPathSource,
+    DrsSource.name: DrsSource,
 }
+
+DRS_HOSTS = os.getenv("BIOCHEF_DRS_HOSTS", "")
+"""The DRS servers this deployment may resolve against.
+
+Empty by default, which disables the source. A DRS URI names its own host, and
+the URI comes from the client, so a service that follows any of them is a
+request generator aimed at whatever it can reach from inside the network it sits
+in.
+"""
 
 LOCAL_ROOT = os.getenv("BIOCHEF_LOCAL_ROOT", "")
 """The only directory the localpath source may read from.
