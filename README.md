@@ -97,6 +97,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_SIGNING_MODE` | `off` | `off`, `warn`, or `strict` — whether a bundle must be signed to run |
 | `BIOCHEF_SIGNING_POLICY` | *(unset)* | path to the Hub's `biochef.signing-policy.v1` document |
 | `BIOCHEF_COSIGN` | `cosign` | the cosign executable to verify with |
+| `BIOCHEF_SLSA_VERIFIER` | `slsa-verifier` | the SLSA Verifier executable to verify official provenance with |
 
 Three of those decide how isolated a run is, and are worth reading twice before
 changing.
@@ -119,6 +120,12 @@ unreadable policy, a reference outside the policy's own registry prefix, or a
 manifest whose digest could not be established are all refusals. A verification
 step that passes when it could not run is worse than none, because it is
 believed.
+
+In `strict`, the caller must provide an immutable digest, and the Agent also
+checks the CycloneDX and SLSA evidence against the files it executes.
+Cosign and SLSA Verifier are installed in the deployment environment; the Agent
+does not download executables at runtime. `warn` reports failed checks and
+continues, while `off` preserves the previous local-development behaviour.
 
 `BIOCHEF_CONTAINER_IMAGE` must carry a scheme — `docker://`, `oras://`,
 `library://`, `shub://`, `http://`, `https://` — or be an absolute path to a

@@ -25,6 +25,7 @@ believed.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 
@@ -51,6 +52,7 @@ REQUIRED = (
 )
 
 DEFAULT_TIMEOUT_SECONDS = 60
+_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class SignatureError(Exception):
@@ -121,6 +123,26 @@ def covered_by(reference, policy):
     return reference.lower().startswith(policy["registry_prefix"].lower())
 
 
+def is_immutable(reference):
+    """Whether a reference already names an exact OCI manifest digest."""
+    try:
+        repository, digest = reference.rsplit("@", 1)
+    except (AttributeError, ValueError):
+        return False
+    return bool(repository and _DIGEST.fullmatch(digest))
+
+
+def immutable_reference(reference, digest):
+    """Replace a tag, if present, with the manifest digest actually fetched."""
+    if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+        raise SignatureError(
+            f"{reference}: the manifest digest could not be established, so there is no immutable artifact reference")
+    repository = reference.split("@", 1)[0]
+    if ":" in repository.rsplit("/", 1)[-1]:
+        repository = repository.rsplit(":", 1)[0]
+    return f"{repository}@{digest}"
+
+
 def verify(reference, digest, policy, cosign=None, timeout=DEFAULT_TIMEOUT_SECONDS):
     """Ask cosign whether this exact artifact carries a signature we accept.
 
@@ -148,11 +170,7 @@ def verify(reference, digest, policy, cosign=None, timeout=DEFAULT_TIMEOUT_SECON
             f"{binary} is not on PATH, so no signature can be checked"
         )
 
-    # Everything before the tag or digest, then the digest we actually resolved.
-    repository = reference.split("@", 1)[0]
-    if ":" in repository.rsplit("/", 1)[-1]:
-        repository = repository.rsplit(":", 1)[0]
-    target = f"{repository}@{digest}"
+    target = immutable_reference(reference, digest)
 
     command = [
         binary, "verify",

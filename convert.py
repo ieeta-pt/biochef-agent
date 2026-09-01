@@ -11,6 +11,7 @@ from enum import Enum
 from dotenv import load_dotenv
 
 import signing
+import evidence_verification
 from workspace import check_name
 
 load_dotenv()
@@ -225,7 +226,7 @@ except Exception:  # pragma: no cover - a stubbed oras in the test suite
 
 
 def fetch_manifest(target):
-    """The manifest and the digest that names it, from a single fetch.
+    """The manifest and the digest that names it, from a single fetch, along with the raw bytes.
 
     oras parses the response and throws it away, so the manifest digest -- which
     is defined as the hash of the exact bytes served, not of anything we could
@@ -245,7 +246,7 @@ def fetch_manifest(target):
     """
     container = client.get_container(target)
     if not (hasattr(client, "do_request") and hasattr(client, "prefix")):
-        return client.get_manifest(container), None
+        return client.get_manifest(container), None, None
 
     url = f"{client.prefix}://{container.manifest_url()}"
     response = client.do_request(url, "GET", headers={"Accept": _MANIFEST_TYPES})
@@ -262,7 +263,13 @@ def fetch_manifest(target):
             f"{target}: the registry served a manifest whose digest is {digest} "
             f"but labelled it {advertised}"
         )
-    return json.loads(body), digest
+    requested = getattr(container, "digest", None)
+    if requested and requested != digest:
+        raise ToolIntegrityError(
+            f"{target}: the registry served manifest {digest}, but the requested "
+            f"immutable reference names {requested}"
+        )
+    return json.loads(body), digest, body
 
 
 def fetch_tool(tool_id, repo):
@@ -277,12 +284,22 @@ def fetch_tool(tool_id, repo):
 
     outdir = os.path.join(TOOL_CACHE, tool_id)
     target = f"{REGISTRY_URL}/{repo}"
+    current_mode = signing.mode()
+    if current_mode == signing.STRICT and not signing.is_immutable(target):
+        raise signing.SignatureError(
+            f"{target}: strict verification requires the caller to select an "
+            "immutable OCI manifest digest"
+        )
 
     # Fetched once, and used for the signature check, the cache check and the
     # verification of anything pulled, so all three are talking about the same
     # artifact. Two separate fetches made an ordinary push to the same tag,
     # mid-pull, look exactly like tampering.
-    manifest, manifest_digest = fetch_manifest(target)
+    manifest, manifest_digest, raw_manifest = fetch_manifest(target)
+    try:
+        subject = signing.immutable_reference(target, manifest_digest)
+    except signing.SignatureError:
+        subject = None
 
     # Before the manifest is used for anything else, because everything else
     # trusts it. cache_matches decides whether the cached bundle is still good
@@ -290,6 +307,16 @@ def fetch_tool(tool_id, repo):
     # pulled blobs against the digests this manifest declares -- so a manifest
     # nobody vouched for makes both of those self-consistent and meaningless.
     signing.check(target, manifest_digest, log=print)
+    evidence = evidence_verification.check(
+        subject,
+        raw_manifest,
+        client,
+        fetch_manifest,
+        log=print,
+    )
+
+    # Once a tag has been resolved, pull the exact subject that was checked.
+    pull_target = subject if current_mode != signing.OFF and subject else target
 
     # On EVERY call, not only on a miss. The cache is what materialise_tools
     # copies into a run and chmods 0700, so verifying only the pull that created
@@ -301,23 +328,42 @@ def fetch_tool(tool_id, repo):
     #
     # The cost is a manifest fetch and a local re-hash per tool per request. The
     # blobs are not downloaded again.
-    if not cache_matches(outdir, manifest, target):
+    if not cache_matches(outdir, manifest, pull_target):
         # Staged, then moved into place, so an interrupted pull cannot leave a
         # half-written bundle that the next run would read as complete.
         staging = outdir + ".part"
         shutil.rmtree(staging, ignore_errors=True)
         os.makedirs(staging, exist_ok=True)
-        client.pull(target=target, outdir=staging)
+        client.pull(target=pull_target, outdir=staging)
         # Before the staged directory becomes the cached one, and so before
         # anything in it can be copied into a run. A bundle that does not match
         # is left in .part and removed, never promoted.
         try:
-            verify_against_manifest(target, staging, manifest=manifest)
+            verify_against_manifest(pull_target, staging, manifest=manifest)
+            evidence_verification.verify_pulled(
+                staging,
+                subject,
+                tool_id,
+                evidence,
+                log=print,
+            )
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
             raise
         shutil.rmtree(outdir, ignore_errors=True)
         os.replace(staging, outdir)
+    else:
+        # Authentication of an attestation is not enough: its predicate and
+        # bundle.json must describe the exact files in the cache, because those
+        # are the bytes materialise_tools will copy and execute. Recheck cache
+        # hits on every fetch in case a previous tool run changed shared files.
+        evidence_verification.verify_pulled(
+            outdir,
+            subject,
+            tool_id,
+            evidence,
+            log=print,
+        )
 
     with open(os.path.join(outdir, "bundle.json"), "r") as f:
         bundle = json.load(f)

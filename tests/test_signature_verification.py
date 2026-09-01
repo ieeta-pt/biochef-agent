@@ -20,6 +20,7 @@ verification can be present and still worthless: a mode that silently reads as
 was never established. Each of those is a pass that would be believed.
 """
 
+import asyncio
 import hashlib
 import json
 import os
@@ -54,6 +55,8 @@ if "oras" not in sys.modules:
 import pytest
 
 import convert
+import evidence_verification
+import main
 import signing
 
 
@@ -67,7 +70,7 @@ POLICY = {
     "slsa_build_type": "https://github.com/slsa-framework/slsa-github-generator/generic@v1",
     "slsa_source_repository": "github.com/ieeta-pt/biochef-recipes",
     "slsa_source_ref": "refs/heads/master",
-    "slsa_source_workflow": "ieeta-pt/biochef-recipes/.github/workflows/manual-publish.yml@refs/heads/master",
+    "slsa_source_workflow": "ieeta-pt/biochef-recipes/.github/workflows/upload.yml@refs/heads/master",
 }
 
 REFERENCE = "registry.example.test/biochef-plugins-samtools.view:1.0"
@@ -275,6 +278,8 @@ class _RawRegistry:
 
     def get_container(self, target):
         class _C:
+            digest = target.rsplit("@", 1)[1] if "@" in target else None
+
             def manifest_url(self):
                 return "registry.example.test/v2/x/manifests/1.0"
         return _C()
@@ -286,9 +291,10 @@ class _RawRegistry:
 def test_the_digest_comes_from_the_bytes_that_were_served(monkeypatch):
     body = b'{"layers":[],"schemaVersion":2}'
     monkeypatch.setattr(convert, "client", _RawRegistry(body))
-    manifest, digest = convert.fetch_manifest("registry.example.test/x:1.0")
+    manifest, digest, raw_manifest = convert.fetch_manifest("registry.example.test/x:1.0")
     assert manifest["schemaVersion"] == 2
     assert digest == "sha256:" + hashlib.sha256(body).hexdigest()
+    assert raw_manifest == body
 
 
 def test_a_registry_that_mislabels_its_own_manifest_is_refused(monkeypatch):
@@ -303,6 +309,19 @@ def test_a_registry_that_mislabels_its_own_manifest_is_refused(monkeypatch):
     with pytest.raises(convert.ToolIntegrityError) as caught:
         convert.fetch_manifest("registry.example.test/x:1.0")
     assert "labelled" in str(caught.value)
+
+
+def test_a_digest_reference_must_return_the_manifest_it_names(monkeypatch):
+    body = b'{"layers":[],"schemaVersion":2}'
+    registry = _RawRegistry(body)
+    expected = "sha256:" + "00" * 32
+    container = registry.get_container("unused")
+    container.digest = expected
+    registry.get_container = lambda target: container
+    monkeypatch.setattr(convert, "client", registry)
+    with pytest.raises(convert.ToolIntegrityError) as caught:
+        convert.fetch_manifest(f"registry.example.test/x@{expected}")
+    assert "immutable reference" in str(caught.value)
 
 
 def test_a_non_200_manifest_response_is_refused(monkeypatch):
@@ -326,9 +345,10 @@ def test_a_client_without_a_raw_request_yields_no_digest_and_strict_refuses(monk
             return {"layers": []}
 
     monkeypatch.setattr(convert, "client", _Plain())
-    manifest, digest = convert.fetch_manifest("registry.example.test/x:1.0")
+    manifest, digest, raw_manifest = convert.fetch_manifest("registry.example.test/x:1.0")
     assert manifest == {"layers": []}
     assert digest is None
+    assert raw_manifest is None
 
     monkeypatch.setenv("BIOCHEF_SIGNING_MODE", "strict")
     monkeypatch.setenv("BIOCHEF_SIGNING_POLICY", _policy_file(tmp_path))
@@ -358,11 +378,153 @@ def test_the_check_happens_before_the_manifest_is_used_for_anything(monkeypatch)
     code = "\n".join(line.split("#", 1)[0] for line in fetch.splitlines())
 
     assert "signing.check(" in code, "fetch_tool no longer verifies anything"
+    assert "evidence_verification.check(" in code, "direct evidence is no longer verified"
+    assert "evidence_verification.verify_pulled(" in code, "pulled evidence is no longer bound"
     assert "cache_matches(" in code, "read the wrong function"
     assert code.index("signing.check(") < code.index("cache_matches("), (
         "the signature is checked after the cache decision, which already "
         "trusted the manifest"
     )
+    assert code.index("evidence_verification.check(") < code.index("cache_matches(")
+    assert code.index("cache_matches(") < code.index("evidence_verification.verify_pulled(")
+
+
+def test_strict_requires_the_caller_to_select_an_immutable_digest(monkeypatch):
+    body = b'{"layers":[],"schemaVersion":2}'
+    registry = _RefusingRegistry(body)
+
+    monkeypatch.setattr(convert, "client", registry)
+    monkeypatch.setattr(convert, "REGISTRY_URL", "registry.example.test")
+    monkeypatch.setenv("BIOCHEF_SIGNING_MODE", "strict")
+    with pytest.raises(signing.SignatureError, match="caller.*immutable"):
+        convert.fetch_tool("jq.query-1", "biochef-plugins-jq.query:latest")
+    assert not registry.pulled
+
+
+def test_verification_refusals_have_a_structured_http_response():
+    handler = main.app.exception_handlers[signing.SignatureError]
+    assert handler is main.app.exception_handlers[
+        evidence_verification.EvidenceVerificationError
+    ]
+
+    response = asyncio.run(handler(None, signing.SignatureError("not admitted")))
+    assert response.status_code == 403
+    assert json.loads(response.body) == {
+        "detail": {
+            "error": "artifact_verification",
+            "message": "not admitted",
+        }
+    }
+
+
+def test_every_fetch_repeats_all_checks_even_when_the_bundle_is_cached(
+        tmp_path, monkeypatch):
+    """A warm cache must not reduce execution verification to pull-time history."""
+    body = b'{"layers":[],"schemaVersion":2}'
+    digest = "sha256:" + hashlib.sha256(body).hexdigest()
+    subject = f"registry.example.test/biochef-plugins-jq.query@{digest}"
+    registry = _RefusingRegistry(body)
+    cache = tmp_path / "cache" / "jq.query"
+    cache.mkdir(parents=True)
+    (cache / "bundle.json").write_text('{"bin":"jq"}')
+    events = []
+    direct_result = object()
+
+    monkeypatch.setattr(convert, "client", registry)
+    monkeypatch.setattr(convert, "REGISTRY_URL", "registry.example.test")
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("BIOCHEF_SIGNING_MODE", "strict")
+    monkeypatch.setattr(
+        convert.signing,
+        "check",
+        lambda reference, manifest_digest, log=None:
+            events.append(("signature", reference, manifest_digest)),
+    )
+    monkeypatch.setattr(
+        convert.evidence_verification,
+        "check",
+        lambda reference, raw_manifest, client, manifest_fetch, log=None:
+            events.append(("direct-evidence", reference)) or direct_result,
+    )
+    monkeypatch.setattr(convert, "cache_matches", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        convert.evidence_verification,
+        "verify_pulled",
+        lambda directory, reference, tool_id, result, log=None:
+            events.append(("pulled-content", directory, reference, tool_id, result)),
+    )
+
+    repo = f"biochef-plugins-jq.query@{digest}"
+    convert.fetch_tool("jq.query-1", repo)
+    convert.fetch_tool("jq.query-2", repo)
+
+    assert [event[0] for event in events] == [
+        "signature", "direct-evidence", "pulled-content",
+        "signature", "direct-evidence", "pulled-content",
+    ]
+    assert all(event[1] == subject for event in events if event[0] == "direct-evidence")
+    assert not registry.pulled
+
+
+def test_evidence_failure_does_not_promote_the_staged_bundle(tmp_path, monkeypatch):
+    """A bundle refused by its evidence must never become the shared cache."""
+    files = {
+        "bundle.json": b'{"bin":"tool"}',
+        "tool": b"native tool",
+    }
+    manifest = {
+        "schemaVersion": 2,
+        "layers": [
+            {
+                "digest": "sha256:" + hashlib.sha256(content).hexdigest(),
+                "mediaType": "application/octet-stream",
+                "annotations": {"org.opencontainers.image.title": name},
+            }
+            for name, content in files.items()
+        ],
+    }
+    body = json.dumps(manifest, separators=(",", ":")).encode()
+    digest = "sha256:" + hashlib.sha256(body).hexdigest()
+    registry = _RawRegistry(body)
+
+    def pull(target, outdir):
+        Path(outdir).mkdir(parents=True, exist_ok=True)
+        for name, content in files.items():
+            (Path(outdir) / name).write_bytes(content)
+
+    registry.pull = pull
+    cache = tmp_path / "cache"
+    checked = []
+    evidence = object()
+
+    monkeypatch.setattr(convert, "client", registry)
+    monkeypatch.setattr(convert, "REGISTRY_URL", "registry.example.test")
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(cache))
+    monkeypatch.setenv("BIOCHEF_SIGNING_MODE", "strict")
+    monkeypatch.setattr(convert.signing, "check", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        convert.evidence_verification,
+        "check",
+        lambda *args, **kwargs: evidence,
+    )
+
+    def refuse(directory, reference, tool_id, result, log=None):
+        checked.append(Path(directory))
+        raise evidence_verification.EvidenceVerificationError("evidence mismatch")
+
+    monkeypatch.setattr(convert.evidence_verification, "verify_pulled", refuse)
+
+    with pytest.raises(
+        evidence_verification.EvidenceVerificationError,
+        match="evidence mismatch",
+    ):
+        convert.fetch_tool("tool-1", f"x@{digest}")
+
+    assert checked == [cache / "tool.part"], (
+        "pulled evidence was checked only after the bundle became the shared cache"
+    )
+    assert not (cache / "tool").exists(), "the refused bundle was promoted"
+    assert not (cache / "tool.part").exists(), "the refused staging directory survived"
 
 
 # --- the acceptance criterion itself ----------------------------------------
@@ -391,7 +553,9 @@ def test_strict_stops_a_bundle_before_it_is_ever_pulled(tmp_path, monkeypatch):
     happened too late would fail rather than pass quietly.
     """
     cosign = _stub_cosign(tmp_path, 1, "no matching signatures")
-    registry = _RefusingRegistry(json.dumps({"layers": []}).encode())
+    body = json.dumps({"layers": []}).encode()
+    digest = "sha256:" + hashlib.sha256(body).hexdigest()
+    registry = _RefusingRegistry(body)
 
     monkeypatch.setattr(convert, "client", registry)
     monkeypatch.setattr(convert, "REGISTRY_URL", "reg.test")
@@ -400,9 +564,8 @@ def test_strict_stops_a_bundle_before_it_is_ever_pulled(tmp_path, monkeypatch):
     monkeypatch.setenv("BIOCHEF_SIGNING_POLICY",
                        _policy_file(tmp_path, registry_prefix="reg.test/plugins-"))
     monkeypatch.setenv("BIOCHEF_COSIGN", cosign)
-
     with pytest.raises(signing.SignatureError):
-        convert.fetch_tool("samtools", "plugins-samtools.view:1.0")
+        convert.fetch_tool("samtools", f"plugins-samtools.view@{digest}")
 
     assert not registry.pulled, "the refusal came after the bundle was fetched"
     assert not (tmp_path / "cache").exists(), (
