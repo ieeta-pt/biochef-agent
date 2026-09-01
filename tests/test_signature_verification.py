@@ -466,6 +466,67 @@ def test_every_fetch_repeats_all_checks_even_when_the_bundle_is_cached(
     assert not registry.pulled
 
 
+def test_evidence_failure_does_not_promote_the_staged_bundle(tmp_path, monkeypatch):
+    """A bundle refused by its evidence must never become the shared cache."""
+    files = {
+        "bundle.json": b'{"bin":"tool"}',
+        "tool": b"native tool",
+    }
+    manifest = {
+        "schemaVersion": 2,
+        "layers": [
+            {
+                "digest": "sha256:" + hashlib.sha256(content).hexdigest(),
+                "mediaType": "application/octet-stream",
+                "annotations": {"org.opencontainers.image.title": name},
+            }
+            for name, content in files.items()
+        ],
+    }
+    body = json.dumps(manifest, separators=(",", ":")).encode()
+    digest = "sha256:" + hashlib.sha256(body).hexdigest()
+    registry = _RawRegistry(body)
+
+    def pull(target, outdir):
+        Path(outdir).mkdir(parents=True, exist_ok=True)
+        for name, content in files.items():
+            (Path(outdir) / name).write_bytes(content)
+
+    registry.pull = pull
+    cache = tmp_path / "cache"
+    checked = []
+    evidence = object()
+
+    monkeypatch.setattr(convert, "client", registry)
+    monkeypatch.setattr(convert, "REGISTRY_URL", "registry.example.test")
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(cache))
+    monkeypatch.setenv("BIOCHEF_SIGNING_MODE", "strict")
+    monkeypatch.setattr(convert.signing, "check", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        convert.evidence_verification,
+        "check",
+        lambda *args, **kwargs: evidence,
+    )
+
+    def refuse(directory, reference, tool_id, result, log=None):
+        checked.append(Path(directory))
+        raise evidence_verification.EvidenceVerificationError("evidence mismatch")
+
+    monkeypatch.setattr(convert.evidence_verification, "verify_pulled", refuse)
+
+    with pytest.raises(
+        evidence_verification.EvidenceVerificationError,
+        match="evidence mismatch",
+    ):
+        convert.fetch_tool("tool-1", f"x@{digest}")
+
+    assert checked == [cache / "tool.part"], (
+        "pulled evidence was checked only after the bundle became the shared cache"
+    )
+    assert not (cache / "tool").exists(), "the refused bundle was promoted"
+    assert not (cache / "tool.part").exists(), "the refused staging directory survived"
+
+
 # --- the acceptance criterion itself ----------------------------------------
 
 class _RefusingRegistry(_RawRegistry):

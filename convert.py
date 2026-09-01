@@ -340,22 +340,30 @@ def fetch_tool(tool_id, repo):
         # is left in .part and removed, never promoted.
         try:
             verify_against_manifest(pull_target, staging, manifest=manifest)
+            evidence_verification.verify_pulled(
+                staging,
+                subject,
+                tool_id,
+                evidence,
+                log=print,
+            )
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
             raise
         shutil.rmtree(outdir, ignore_errors=True)
         os.replace(staging, outdir)
-
-    # Authentication of an attestation is not enough: its predicate and
-    # bundle.json must describe the exact files in the cache, because those are
-    # the bytes materialise_tools will copy and execute.
-    evidence_verification.verify_pulled(
-        outdir,
-        subject,
-        tool_id,
-        evidence,
-        log=print,
-    )
+    else:
+        # Authentication of an attestation is not enough: its predicate and
+        # bundle.json must describe the exact files in the cache, because those
+        # are the bytes materialise_tools will copy and execute. Recheck cache
+        # hits on every fetch in case a previous tool run changed shared files.
+        evidence_verification.verify_pulled(
+            outdir,
+            subject,
+            tool_id,
+            evidence,
+            log=print,
+        )
 
     with open(os.path.join(outdir, "bundle.json"), "r") as f:
         bundle = json.load(f)
