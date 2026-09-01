@@ -65,8 +65,10 @@ from workspace import make_workspace
 # the interface, and what a third provider costs
 
 
-def test_both_current_sources_are_providers():
-    assert sorted(PROVIDERS) == ["localpath", "upload"]
+def test_the_current_sources_are_providers():
+    """Named exactly, so adding one is a decision somebody made rather than
+    something that happened. F2 (drs) arrived this way; F1 (htsget) will."""
+    assert sorted(PROVIDERS) == ["drs", "localpath", "upload"]
     assert isinstance(get_sources(["upload"])["upload"], UploadSource)
 
 
@@ -74,7 +76,7 @@ def test_an_unknown_source_stops_the_process():
     """A typo must not silently leave a deployment with sources it did not ask
     for, or without ones it did."""
     with pytest.raises(ValueError) as exc:
-        get_sources(["htsget"])
+        get_sources(["htsget"])   # F1, not written yet
     assert "BIOCHEF_DATA_SOURCES" in str(exc.value)
     assert "upload" in str(exc.value) and "localpath" in str(exc.value)
 
