@@ -156,5 +156,7 @@ async def convert(
         # The process was never moved, so there is no global state to restore --
         # only a directory to remove, and it goes whether the run succeeded or
         # not.
-        if not KEEP_WORKSPACE:
+        if KEEP_WORKSPACE:
+            ws.close()
+        else:
             ws.cleanup()
