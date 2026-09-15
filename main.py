@@ -1,12 +1,21 @@
 from convert import *
 from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import JSONResponse
 from typing import List
 import json
 from pydantic import BaseModel
 import os
 import base64
 
+from workspace import UnsafeName, check_name
+
 app = FastAPI()
+
+
+@app.exception_handler(UnsafeName)
+async def unusable_name(request, exc):
+    """A bad name is the client's mistake, so say so rather than returning 500."""
+    return JSONResponse(status_code=400, content={"detail": f"unusable file name: {exc}"})
 
 
 def run_snakemake():
@@ -28,9 +37,11 @@ async def convert(
     os.makedirs("tmp", exist_ok=True)
     os.chdir("tmp")
 
-    # Save uploaded files
+    # Save uploaded files. The name is checked rather than trusted: starlette
+    # passes the multipart filename through verbatim, so without this an
+    # absolute path is written where it says and cwd is not a boundary at all.
     for f in files:
-        with open(f.filename, "wb") as buffer:
+        with open(check_name(f.filename), "wb") as buffer:
             buffer.write(await f.read())
 
     # Parse workflow
