@@ -120,6 +120,21 @@ def test_the_workspace_is_private(tmp_path):
         ws.cleanup()
 
 
+def test_close_keeps_workspace_and_releases_descriptor(tmp_path):
+    ws = make_workspace(str(tmp_path))
+    path = Path(ws.path)
+    descriptor = ws._fd
+
+    ws.close()
+
+    assert path.is_dir(), "close is not cleanup; retained files must survive"
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+    ws.cleanup()
+    assert not path.exists()
+
+
 # --------------------------------------------------------------------------
 # the timeout, which is only correct if it kills the group
 
