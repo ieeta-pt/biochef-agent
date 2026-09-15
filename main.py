@@ -11,8 +11,14 @@ import subprocess
 import base64
 
 from workspace import UnsafeName, check_name, make_workspace
+from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
 
 app = FastAPI()
+
+# Before anything reads the body. starlette spools the whole multipart payload
+# before the handler is entered, so a limit enforced in /convert would be
+# refusing bytes that are already on disk (#11).
+app.add_middleware(BodySizeLimitMiddleware)
 
 
 @app.exception_handler(UnsafeName)
