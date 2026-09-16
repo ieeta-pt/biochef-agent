@@ -1,9 +1,13 @@
 from fastapi import FastAPI
+import fcntl
 import json
 import oras.client
 import os
 import shutil
 import stat
+import threading
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -96,6 +100,31 @@ copy in whichever workspace needs it.
 """
 
 tools = {}
+_fetch_locks = {}
+_fetch_locks_guard = threading.Lock()
+
+
+@contextmanager
+def _fetch_lock(tool_id):
+    """Lock one local cache entry across cooperating threads and processes."""
+    with _fetch_locks_guard:
+        thread_lock = _fetch_locks.setdefault(tool_id, threading.Lock())
+
+    with thread_lock:
+        os.makedirs(TOOL_CACHE, exist_ok=True)
+        # Keep this file: recreating it could let processes lock different inodes.
+        lock_path = os.path.join(TOOL_CACHE, f".{tool_id}.lock")
+        lock_fd = os.open(
+            lock_path,
+            os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
 
 def fetch_tool(tool_id, repo):
@@ -112,22 +141,23 @@ def fetch_tool(tool_id, repo):
         return tools[tool_id]
 
     outdir = os.path.join(TOOL_CACHE, tool_id)
-    if not os.path.exists(os.path.join(outdir, "bundle.json")):
-        # Staged, then moved into place, so an interrupted pull cannot leave a
-        # half-written bundle that the next run would read as complete. It is
-        # also the point where a digest would be checked (#9).
-        staging = outdir + ".part"
-        shutil.rmtree(staging, ignore_errors=True)
-        os.makedirs(staging, exist_ok=True)
-        client.pull(target=f"{REGISTRY_URL}/{repo}", outdir=staging)
-        shutil.rmtree(outdir, ignore_errors=True)
-        os.replace(staging, outdir)
+    with _fetch_lock(tool_id):
+        if not os.path.exists(os.path.join(outdir, "bundle.json")):
+            staging = f"{outdir}.part.{uuid.uuid4().hex}"
+            os.makedirs(staging)
+            try:
+                client.pull(target=f"{REGISTRY_URL}/{repo}", outdir=staging)
+                shutil.rmtree(outdir, ignore_errors=True)
+                os.replace(staging, outdir)
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
 
-    with open(os.path.join(outdir, "bundle.json"), "r") as f:
-        bundle = json.load(f)
+        # Read under the promotion lock so outdir cannot disappear between them.
+        with open(os.path.join(outdir, "bundle.json"), "r") as f:
+            bundle = json.load(f)
 
-    tools[tool_id] = bundle
-    return bundle
+        tools[tool_id] = bundle
+        return bundle
 
 
 def expected_uploads(workflow):
