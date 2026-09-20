@@ -6,7 +6,7 @@
 Asserting only that is not enough on its own. A container runner that silently
 fell back to running on the host would satisfy it perfectly, and that is exactly
 the failure worth catching -- the whole point of E2 is that the step is NOT on
-the host. So the workflow produces four things:
+the host. So the workflow produces five things:
 
   result.txt      the actual work. Must be byte-for-byte identical.
   where.txt       which operating system the step ran on. Must DIFFER.
@@ -14,6 +14,8 @@ the host. So the workflow produces four things:
                   readable outside the container and hidden inside it.
   exec.txt        the output of a file executed OUT OF the workspace. Must run
                   under both.
+  env_inheritance.txt  whether a harmless host variable was inherited. Must be
+                       present outside and absent inside the container.
 
 exec.txt exists because `./<bin>` is the only rule shape the emitter ever
 produces -- convert.py builds every command as `cmd = [f"./{node.bin}"]` -- and
@@ -77,7 +79,8 @@ rule all:
         "result.txt",
         "where.txt",
         "neighbour.txt",
-        "exec.txt"
+        "exec.txt",
+        "env_inheritance.txt"
 
 rule work:
     input:
@@ -105,6 +108,13 @@ rule from_workspace:
         o_0="exec.txt"
     shell:
         "./tool > {output.o_0}"
+
+rule env_inheritance:
+    output:
+        o_0="env_inheritance.txt"
+    shell:
+        "if printenv BIOCHEF_PARITY_ENV_PROBE >/dev/null; then echo inherited; "
+        "else echo absent; fi > {output.o_0}"
 '''
 
 
@@ -148,6 +158,8 @@ def main():
               "this check cannot verify anything", file=sys.stderr)
         return 2
 
+    os.environ["BIOCHEF_PARITY_ENV_PROBE"] = "test-value"
+
     root = tempfile.mkdtemp(prefix="biochef-parity-")
     cache = os.path.join(root, "apptainer-cache")
     # Deliberately NOT created here. Snakemake makes the --apptainer-prefix
@@ -177,13 +189,18 @@ def main():
             print(result.stderr[-4000:], file=sys.stderr)
             return 1
         outcomes[label] = (_read(ws, "result.txt"), _read(ws, "where.txt"),
-                           _read(ws, "neighbour.txt"), _read(ws, "exec.txt"))
+                           _read(ws, "neighbour.txt"), _read(ws, "exec.txt"),
+                           _read(ws, "env_inheritance.txt"))
         print(f"    ran on: {outcomes[label][1].decode().strip()!r}   "
               f"other runs' data: {outcomes[label][2].decode().strip()!r}",
               flush=True)
 
-    plain_result, plain_where, plain_neighbour, plain_exec = outcomes["subprocess"]
-    boxed_result, boxed_where, boxed_neighbour, boxed_exec = outcomes["apptainer"]
+    plain_result, plain_where, plain_neighbour, plain_exec, plain_env_result = (
+        outcomes["subprocess"]
+    )
+    boxed_result, boxed_where, boxed_neighbour, boxed_exec, boxed_env_result = (
+        outcomes["apptainer"]
+    )
 
     failures = []
     if plain_result != boxed_result:
@@ -226,6 +243,11 @@ def main():
                 f"({got.strip()!r}); the emitter only ever produces ./<bin>"
             )
 
+    if plain_env_result.strip() != b"inherited":
+        failures.append("the host-side step did not receive the test variable")
+    if boxed_env_result.strip() != b"absent":
+        failures.append("a containerised step inherited the test environment variable")
+
     if failures:
         for f in failures:
             print(f"FAIL: {f}", file=sys.stderr)
@@ -235,7 +257,8 @@ def main():
           f"different systems ({plain_where.decode().strip()!r} vs "
           f"{boxed_where.decode().strip()!r}), so the container was real; "
           f"a file placed in the workspace executed under both; and another "
-          f"run's data was readable on the host but hidden inside it")
+          f"run's data was readable on the host but hidden inside it; "
+          f"the test environment variable was not inherited")
     return 0
 
 
