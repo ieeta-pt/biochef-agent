@@ -1,10 +1,14 @@
 from fastapi import FastAPI
+import fcntl
 import hashlib
 import json
 import oras.client
 import os
 import shutil
 import stat
+import threading
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -90,15 +94,38 @@ class Workflow:
 TOOL_CACHE = os.path.realpath(os.getenv("BIOCHEF_TOOL_CACHE", "tool-cache"))
 """Where pulled bundles live, shared by every run.
 
-Splitting the cache out of the run directory is forced by giving each run its
-own directory, not a tidy-up. fetch_tool memoises and returns early on a hit, so
-it never re-copied the binary; with one shared directory that made the copy
-survive between runs, and with a fresh directory per run it would simply be
-missing on the second. The pull is cached here, and materialise_tools puts a
-copy in whichever workspace needs it.
+Each run has its own workspace, while downloaded bundles can be reused. On
+every fetch, the cached files are checked against the registry manifest; a
+matching entry avoids another pull. materialise_tools copies the executable
+into whichever run workspace needs it.
 """
 
 tools = {}
+_fetch_locks = {}
+_fetch_locks_guard = threading.Lock()
+
+
+@contextmanager
+def _fetch_lock(tool_id):
+    """Lock one local cache entry across cooperating threads and processes."""
+    with _fetch_locks_guard:
+        thread_lock = _fetch_locks.setdefault(tool_id, threading.Lock())
+
+    with thread_lock:
+        os.makedirs(TOOL_CACHE, exist_ok=True)
+        # Keep this file: recreating it could let processes lock different inodes.
+        lock_path = os.path.join(TOOL_CACHE, f".{tool_id}.lock")
+        lock_fd = os.open(
+            lock_path,
+            os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
 
 class ToolIntegrityError(Exception):
@@ -291,85 +318,46 @@ def fetch_tool(tool_id, repo):
             "immutable OCI manifest digest"
         )
 
-    # Fetched once, and used for the signature check, the cache check and the
-    # verification of anything pulled, so all three are talking about the same
-    # artifact. Two separate fetches made an ordinary push to the same tag,
-    # mid-pull, look exactly like tampering.
-    manifest, manifest_digest, raw_manifest = fetch_manifest(target)
-    try:
-        subject = signing.immutable_reference(target, manifest_digest)
-    except signing.SignatureError:
-        subject = None
-
-    # Before the manifest is used for anything else, because everything else
-    # trusts it. cache_matches decides whether the cached bundle is still good
-    # by comparing against this manifest, and verify_against_manifest checks
-    # pulled blobs against the digests this manifest declares -- so a manifest
-    # nobody vouched for makes both of those self-consistent and meaningless.
-    signing.check(target, manifest_digest, log=print)
-    evidence = evidence_verification.check(
-        subject,
-        raw_manifest,
-        client,
-        fetch_manifest,
-        log=print,
-    )
-
-    # Once a tag has been resolved, pull the exact subject that was checked.
-    pull_target = subject if current_mode != signing.OFF and subject else target
-
-    # On EVERY call, not only on a miss. The cache is what materialise_tools
-    # copies into a run and chmods 0700, so verifying only the pull that created
-    # it proves something about a moment in the past rather than about the bytes
-    # being executed. It is a plain directory, written by this service, and a
-    # tool running under the subprocess runner is unconfined and runs as the
-    # same user -- so one run can rewrite what every later run executes. That is
-    # not a clever attack, it is the ordinary consequence of a shared cache.
-    #
-    # The cost is a manifest fetch and a local re-hash per tool per request. The
-    # blobs are not downloaded again.
-    if not cache_matches(outdir, manifest, pull_target):
-        # Staged, then moved into place, so an interrupted pull cannot leave a
-        # half-written bundle that the next run would read as complete.
-        staging = outdir + ".part"
-        shutil.rmtree(staging, ignore_errors=True)
-        os.makedirs(staging, exist_ok=True)
-        client.pull(target=pull_target, outdir=staging)
-        # Before the staged directory becomes the cached one, and so before
-        # anything in it can be copied into a run. A bundle that does not match
-        # is left in .part and removed, never promoted.
+    with _fetch_lock(tool_id):
+        manifest, manifest_digest, raw_manifest = fetch_manifest(target)
         try:
-            verify_against_manifest(pull_target, staging, manifest=manifest)
-            evidence_verification.verify_pulled(
-                staging,
-                subject,
-                tool_id,
-                evidence,
-                log=print,
-            )
-        except Exception:
-            shutil.rmtree(staging, ignore_errors=True)
-            raise
-        shutil.rmtree(outdir, ignore_errors=True)
-        os.replace(staging, outdir)
-    else:
-        # Authentication of an attestation is not enough: its predicate and
-        # bundle.json must describe the exact files in the cache, because those
-        # are the bytes materialise_tools will copy and execute. Recheck cache
-        # hits on every fetch in case a previous tool run changed shared files.
-        evidence_verification.verify_pulled(
-            outdir,
+            subject = signing.immutable_reference(target, manifest_digest)
+        except signing.SignatureError:
+            subject = None
+
+        signing.check(target, manifest_digest, log=print)
+        evidence = evidence_verification.check(
             subject,
-            tool_id,
-            evidence,
+            raw_manifest,
+            client,
+            fetch_manifest,
             log=print,
         )
 
-    with open(os.path.join(outdir, "bundle.json"), "r") as f:
-        bundle = json.load(f)
+        pull_target = subject if current_mode != signing.OFF and subject else target
+        if not cache_matches(outdir, manifest, pull_target):
+            staging = f"{outdir}.part.{uuid.uuid4().hex}"
+            os.makedirs(staging)
+            try:
+                client.pull(target=pull_target, outdir=staging)
+                verify_against_manifest(pull_target, staging, manifest=manifest)
+                evidence_verification.verify_pulled(
+                    staging, subject, tool_id, evidence, log=print
+                )
+                shutil.rmtree(outdir, ignore_errors=True)
+                os.replace(staging, outdir)
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+        else:
+            evidence_verification.verify_pulled(
+                outdir, subject, tool_id, evidence, log=print
+            )
 
-    tools[tool_id] = bundle
-    return bundle
+        with open(os.path.join(outdir, "bundle.json"), "r") as f:
+            bundle = json.load(f)
+
+        tools[tool_id] = bundle
+        return bundle
 
 
 def expected_uploads(workflow):

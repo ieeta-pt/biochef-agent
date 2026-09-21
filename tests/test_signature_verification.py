@@ -486,8 +486,10 @@ def test_evidence_failure_does_not_promote_the_staged_bundle(tmp_path, monkeypat
     body = json.dumps(manifest, separators=(",", ":")).encode()
     digest = "sha256:" + hashlib.sha256(body).hexdigest()
     registry = _RawRegistry(body)
+    pulled_targets = []
 
     def pull(target, outdir):
+        pulled_targets.append(target)
         Path(outdir).mkdir(parents=True, exist_ok=True)
         for name, content in files.items():
             (Path(outdir) / name).write_bytes(content)
@@ -520,11 +522,14 @@ def test_evidence_failure_does_not_promote_the_staged_bundle(tmp_path, monkeypat
     ):
         convert.fetch_tool("tool-1", f"x@{digest}")
 
-    assert checked == [cache / "tool.part"], (
+    assert len(checked) == 1
+    assert pulled_targets == [f"registry.example.test/x@{digest}"]
+    assert checked[0].parent == cache
+    assert checked[0].name.startswith("tool.part."), (
         "pulled evidence was checked only after the bundle became the shared cache"
     )
     assert not (cache / "tool").exists(), "the refused bundle was promoted"
-    assert not (cache / "tool.part").exists(), "the refused staging directory survived"
+    assert not list(cache.glob("tool.part.*")), "the refused staging directory survived"
 
 
 # --- the acceptance criterion itself ----------------------------------------
@@ -568,9 +573,9 @@ def test_strict_stops_a_bundle_before_it_is_ever_pulled(tmp_path, monkeypatch):
         convert.fetch_tool("samtools", f"plugins-samtools.view@{digest}")
 
     assert not registry.pulled, "the refusal came after the bundle was fetched"
-    assert not (tmp_path / "cache").exists(), (
-        "a cache directory was created for a bundle that was refused"
-    )
+    cache = tmp_path / "cache"
+    assert not (cache / "samtools").exists(), "a refused bundle entered the cache"
+    assert not list(cache.glob("samtools.part.*")), "a refused bundle was staged"
 
 
 def test_off_still_pulls_so_the_test_above_is_not_passing_for_the_wrong_reason(
