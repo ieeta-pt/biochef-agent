@@ -12,7 +12,9 @@ import base64
 
 from workspace import UnsafeName, check_name, make_workspace
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
+from evidence_verification import EvidenceVerificationError
 from runner import SubprocessRunner, get_runner
+from signing import SignatureError
 
 app = FastAPI()
 
@@ -43,6 +45,21 @@ async def tool_integrity(request, exc):
     return JSONResponse(
         status_code=502,
         content={"detail": {"error": "tool_integrity", "message": str(exc)}},
+    )
+
+
+@app.exception_handler(SignatureError)
+@app.exception_handler(EvidenceVerificationError)
+async def artifact_verification(request, exc):
+    """Refuse an artifact that does not satisfy the local execution policy."""
+    return JSONResponse(
+        status_code=403,
+        content={
+            "detail": {
+                "error": "artifact_verification",
+                "message": str(exc),
+            }
+        },
     )
 
 

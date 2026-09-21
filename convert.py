@@ -15,6 +15,7 @@ from enum import Enum
 from dotenv import load_dotenv
 
 import signing
+import evidence_verification
 from workspace import check_name
 
 load_dotenv()
@@ -252,7 +253,7 @@ except Exception:  # pragma: no cover - a stubbed oras in the test suite
 
 
 def fetch_manifest(target):
-    """The manifest and the digest that names it, from a single fetch.
+    """The manifest and the digest that names it, from a single fetch, along with the raw bytes.
 
     oras parses the response and throws it away, so the manifest digest -- which
     is defined as the hash of the exact bytes served, not of anything we could
@@ -272,7 +273,7 @@ def fetch_manifest(target):
     """
     container = client.get_container(target)
     if not (hasattr(client, "do_request") and hasattr(client, "prefix")):
-        return client.get_manifest(container), None
+        return client.get_manifest(container), None, None
 
     url = f"{client.prefix}://{container.manifest_url()}"
     response = client.do_request(url, "GET", headers={"Accept": _MANIFEST_TYPES})
@@ -289,7 +290,13 @@ def fetch_manifest(target):
             f"{target}: the registry served a manifest whose digest is {digest} "
             f"but labelled it {advertised}"
         )
-    return json.loads(body), digest
+    requested = getattr(container, "digest", None)
+    if requested and requested != digest:
+        raise ToolIntegrityError(
+            f"{target}: the registry served manifest {digest}, but the requested "
+            f"immutable reference names {requested}"
+        )
+    return json.loads(body), digest, body
 
 
 def fetch_tool(tool_id, repo):
@@ -304,22 +311,48 @@ def fetch_tool(tool_id, repo):
 
     outdir = os.path.join(TOOL_CACHE, tool_id)
     target = f"{REGISTRY_URL}/{repo}"
-    with _fetch_lock(tool_id):
-        manifest, manifest_digest = fetch_manifest(target)
-        signing.check(target, manifest_digest, log=print)
+    current_mode = signing.mode()
+    if current_mode == signing.STRICT and not signing.is_immutable(target):
+        raise signing.SignatureError(
+            f"{target}: strict verification requires the caller to select an "
+            "immutable OCI manifest digest"
+        )
 
-        if not cache_matches(outdir, manifest, target):
+    with _fetch_lock(tool_id):
+        manifest, manifest_digest, raw_manifest = fetch_manifest(target)
+        try:
+            subject = signing.immutable_reference(target, manifest_digest)
+        except signing.SignatureError:
+            subject = None
+
+        signing.check(target, manifest_digest, log=print)
+        evidence = evidence_verification.check(
+            subject,
+            raw_manifest,
+            client,
+            fetch_manifest,
+            log=print,
+        )
+
+        pull_target = subject if current_mode != signing.OFF and subject else target
+        if not cache_matches(outdir, manifest, pull_target):
             staging = f"{outdir}.part.{uuid.uuid4().hex}"
             os.makedirs(staging)
             try:
-                client.pull(target=target, outdir=staging)
-                verify_against_manifest(target, staging, manifest=manifest)
+                client.pull(target=pull_target, outdir=staging)
+                verify_against_manifest(pull_target, staging, manifest=manifest)
+                evidence_verification.verify_pulled(
+                    staging, subject, tool_id, evidence, log=print
+                )
                 shutil.rmtree(outdir, ignore_errors=True)
                 os.replace(staging, outdir)
             finally:
                 shutil.rmtree(staging, ignore_errors=True)
+        else:
+            evidence_verification.verify_pulled(
+                outdir, subject, tool_id, evidence, log=print
+            )
 
-        # Read under the promotion lock so outdir cannot disappear between them.
         with open(os.path.join(outdir, "bundle.json"), "r") as f:
             bundle = json.load(f)
 
