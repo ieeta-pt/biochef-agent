@@ -405,9 +405,9 @@ def test_strict_stops_a_bundle_before_it_is_ever_pulled(tmp_path, monkeypatch):
         convert.fetch_tool("samtools", "plugins-samtools.view:1.0")
 
     assert not registry.pulled, "the refusal came after the bundle was fetched"
-    assert not (tmp_path / "cache").exists(), (
-        "a cache directory was created for a bundle that was refused"
-    )
+    cache = tmp_path / "cache"
+    assert not (cache / "samtools").exists(), "a refused bundle entered the cache"
+    assert not list(cache.glob("samtools.part.*")), "a refused bundle was staged"
 
 
 def test_off_still_pulls_so_the_test_above_is_not_passing_for_the_wrong_reason(

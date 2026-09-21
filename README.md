@@ -93,7 +93,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess` or `apptainer` |
 | `BIOCHEF_CONTAINER_IMAGE` | `docker://debian:stable-slim` | image each step runs in, under the `apptainer` runner |
 | `BIOCHEF_APPTAINER_CACHE` | `apptainer-cache` | where pulled container images are kept between runs |
-| `BIOCHEF_APPTAINER_ARGS` | `--contain` | extra flags for apptainer itself |
+| `BIOCHEF_APPTAINER_ARGS` | `--contain --cleanenv` | extra flags for apptainer itself |
 | `BIOCHEF_SIGNING_MODE` | `off` | `off`, `warn`, or `strict` — whether a bundle must be signed to run |
 | `BIOCHEF_SIGNING_POLICY` | *(unset)* | path to the Hub's `biochef.signing-policy.v1` document |
 | `BIOCHEF_COSIGN` | `cosign` | the cosign executable to verify with |
@@ -136,11 +136,7 @@ not, and base-image security updates never arrive. A digest —
 which is the only way that cache invalidates. Deleting `apptainer-cache/` forces
 a re-pull in the meantime.
 
-`BIOCHEF_APPTAINER_ARGS` defaults to `--contain` because apptainer otherwise
-binds the host's `/tmp` into the container, and that is where a run's directory
-lives unless `BIOCHEF_RUN_ROOT` says otherwise. Without it, a containerised tool
-is walled off from `/usr` and `/etc` while still able to read **every other
-run's data**. Emptying this variable turns that off deliberately.
+`BIOCHEF_APPTAINER_ARGS` defaults to `--contain --cleanenv`. Without `--contain`, apptainer binds the host's `/tmp` into the container, and that is where a run's directory lives unless `BIOCHEF_RUN_ROOT` says otherwise. Without it, a containerised tool is walled off from `/usr` and `/etc` while still able to read **every other run's data**. Without `--cleanenv`, the tool process also inherits the Agent's environment. Emptying this variable turns both protections off deliberately.
 
 ## How a request is served
 

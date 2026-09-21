@@ -150,6 +150,16 @@ class Workspace:
         os.chmod(name, 0o700, dir_fd=self._fd)
         return os.path.join(self.path, name)
 
+    def close(self) -> None:
+        """Release the directory descriptor without deleting the workspace."""
+        if self._fd is None:
+            return
+        fd, self._fd = self._fd, None
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
     def cleanup(self) -> None:
         """Remove the workspace, but only if the path still refers to it.
 
@@ -170,10 +180,7 @@ class Workspace:
         except OSError:
             same = False
 
-        try:
-            os.close(self._fd)
-        except OSError:
-            pass
+        self.close()
 
         if same:
             shutil.rmtree(self.path, ignore_errors=True)
