@@ -101,9 +101,9 @@ def test_the_container_is_contained_by_default():
     """
     import runner as runner_module
 
-    assert runner_module.APPTAINER_ARGS == "--contain"
+    assert runner_module.APPTAINER_ARGS == "--contain --cleanenv"
     argv = ApptainerRunner(cache_dir="/cache").command(_Workspace("/ws"))
-    assert "--apptainer-args=--contain" in argv
+    assert "--apptainer-args=--contain --cleanenv" in argv
 
 
 def test_the_apptainer_args_are_one_argv_element():
