@@ -28,6 +28,24 @@ async def unusable_name(request, exc):
     return JSONResponse(status_code=400, content={"detail": f"unusable file name: {exc}"})
 
 
+@app.exception_handler(ToolIntegrityError)
+async def tool_integrity(request, exc):
+    """502, because the failure is upstream and not the client's doing.
+
+    Unhandled, this surfaced as a bare "Internal Server Error" -- accurate about
+    nothing. Nothing was leaked, but nothing was said either, and an operator
+    reading a 500 has no reason to look at the registry.
+
+    The detail is the exception's own message, which names the artifact and the
+    two digests and says explicitly that a tag moving mid-pull looks the same
+    from here. It carries no local paths.
+    """
+    return JSONResponse(
+        status_code=502,
+        content={"detail": {"error": "tool_integrity", "message": str(exc)}},
+    )
+
+
 RUN_ROOT = os.getenv("BIOCHEF_RUN_ROOT") or None
 RUN_TIMEOUT_S = int(os.getenv("BIOCHEF_RUN_TIMEOUT", "900"))
 KEEP_WORKSPACE = os.getenv("BIOCHEF_KEEP_WORKSPACE", "false").lower() == "true"
