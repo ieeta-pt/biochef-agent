@@ -138,7 +138,7 @@ created and destroyed per run, so an image cached inside one would be pulled
 again every time.
 """
 
-APPTAINER_ARGS = os.getenv("BIOCHEF_APPTAINER_ARGS", "--contain")
+APPTAINER_ARGS = os.getenv("BIOCHEF_APPTAINER_ARGS", "--contain --cleanenv")
 """Extra flags for the apptainer invocation itself.
 
 --contain by default, and the default is the point. Apptainer binds the host's
@@ -150,8 +150,10 @@ workspace, which for a service whose reason to exist is keeping one dataset away
 from another is the wrong half to get right. The container runs as the same
 user, so the 0700 mode on a workspace does not help.
 
-Emptying this variable turns containment off, for an operator who needs the host
-/tmp visible and knows what that means.
+--cleanenv stops ordinary Agent environment variables, including registry
+credentials, being inherited by the tool process. It does not isolate /proc or
+the network. Emptying this variable turns both protections off, for an operator
+who needs host access and knows what that means.
 """
 
 _IMAGE_SHAPE = re.compile(r"\A[A-Za-z0-9/][A-Za-z0-9._:/@+-]{0,255}\Z")

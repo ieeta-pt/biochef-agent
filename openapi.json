@@ -108,7 +108,7 @@
   "paths": {
     "/convert": {
       "post": {
-        "description": "Unchanged: the whole run happens inside this request.\n\nKept as it was because it is the contract the editor speaks today. /runs is\nthe same work without the wait.",
+        "description": "The editor's synchronous contract, sharing the execution limit.\n\nKept as it was because it is the contract the editor speaks today. /runs is\nthe same work without the wait.",
         "operationId": "convert_convert_post",
         "requestBody": {
           "content": {
@@ -175,6 +175,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "description": "Agent capacity reached; retry later"
           }
         },
         "summary": "Submit Run"

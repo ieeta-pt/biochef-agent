@@ -207,6 +207,7 @@ def test_a_plain_name_still_works(client, tmp_path, monkeypatch):
 
     assert response.status_code == 200, response.text
     assert (Path(kept[0].path) / "input-1-out").read_bytes() == b"payload"
+    assert kept[0]._fd is None, "retaining a workspace also retained its descriptor"
     kept[0].cleanup()
 
 

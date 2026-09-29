@@ -14,9 +14,11 @@ import base64
 
 from workspace import UnsafeName, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
-from runs import IllegalTransition, RunState, RunStore, UnknownRun
-from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
+from runs import IllegalTransition, RunCapacityError, RunState, RunStore, UnknownRun
+from bodylimit import BodySizeLimitMiddleware
+from evidence_verification import EvidenceVerificationError
 from runner import SubprocessRunner, get_runner
+from signing import SignatureError
 
 app = FastAPI()
 
@@ -59,6 +61,21 @@ async def tool_integrity(request, exc):
     return JSONResponse(
         status_code=502,
         content={"detail": {"error": "tool_integrity", "message": str(exc)}},
+    )
+
+
+@app.exception_handler(SignatureError)
+@app.exception_handler(EvidenceVerificationError)
+async def artifact_verification(request, exc):
+    """Refuse an artifact that does not satisfy the local execution policy."""
+    return JSONResponse(
+        status_code=403,
+        content={
+            "detail": {
+                "error": "artifact_verification",
+                "message": str(exc),
+            }
+        },
     )
 
 
@@ -204,7 +221,9 @@ def perform_run(biochef_workflow: str, uploads, progress=None):
         # The process was never moved, so there is no global state to restore --
         # only a directory to remove, and it goes whether the run succeeded or
         # not.
-        if not KEEP_WORKSPACE:
+        if KEEP_WORKSPACE:
+            ws.close()
+        else:
             ws.cleanup()
 
 
@@ -213,17 +232,18 @@ async def convert(
     biochef_workflow: str = Form(...),
     files: List[UploadFile] = File(...)
 ):
-    """Unchanged: the whole run happens inside this request.
+    """The editor's synchronous contract, sharing the execution limit.
 
     Kept as it was because it is the contract the editor speaks today. /runs is
     the same work without the wait.
     """
-    uploads = [(f.filename, await f.read()) for f in files]
-    return await run_in_threadpool(perform_run, biochef_workflow, uploads)
+    async with _slots():
+        uploads = [(f.filename, await f.read()) for f in files]
+        return await run_in_threadpool(perform_run, biochef_workflow, uploads)
 
 
 MAX_CONCURRENT_RUNS = int(os.getenv("BIOCHEF_MAX_CONCURRENT_RUNS", "4"))
-"""How many runs may execute at once.
+"""How many /runs and /convert workflows may execute at once.
 
 Without a bound, a burst of submissions became a burst of snakemake processes:
 anyio's default thread limiter is 40, so forty tools could be running at once on
@@ -233,6 +253,8 @@ Accepting work is cheap; doing it is not, and the two need separating.
 Runs beyond the limit wait in QUEUED, which is what that state is for -- WES
 means "accepted, not yet started" by it, and a client polling sees exactly that.
 """
+if MAX_CONCURRENT_RUNS < 1:
+    raise ValueError("BIOCHEF_MAX_CONCURRENT_RUNS must be positive")
 
 _slots_by_loop = weakref.WeakKeyDictionary()
 
@@ -328,7 +350,9 @@ def _advance(run_id, state, **detail):
         pass
 
 
-@app.post("/runs", status_code=202)
+@app.post("/runs", status_code=202, responses={
+    503: {"description": "Agent capacity reached; retry later"},
+})
 async def submit_run(
     biochef_workflow: str = Form(...),
     files: List[UploadFile] = File(...)
@@ -340,9 +364,19 @@ async def submit_run(
     difference between this and /convert, and the reason it cannot simply call
     the same handler in the background.
     """
-    uploads = [(f.filename, await f.read()) for f in files]
-    run = RUNS.create()
-    task = asyncio.create_task(_execute(run.run_id, biochef_workflow, uploads))
+    try:
+        run = RUNS.create()
+    except RunCapacityError:
+        raise HTTPException(
+            status_code=503, detail="agent run capacity reached; retry later",
+            headers={"Retry-After": "1"},
+        ) from None
+    try:
+        uploads = [(f.filename, await f.read()) for f in files]
+        task = asyncio.create_task(_execute(run.run_id, biochef_workflow, uploads))
+    except BaseException:
+        RUNS.discard(run.run_id)
+        raise
     # Held until it finishes, then dropped. See _running above: without this the
     # task can be collected mid-run and the run never reaches a terminal state.
     _running.add(task)
