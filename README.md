@@ -44,6 +44,14 @@ the outputs once it is `COMPLETE`. States use the eight WES-style names in issue
 `QUEUED`, `INITIALIZING`, `RUNNING`, `COMPLETE`, `EXECUTOR_ERROR`,
 `SYSTEM_ERROR`, `CANCELING`, `CANCELED`. A complete WES API is separate work.
 
+`POST /runs/{run_id}/cancel` stops one. A run still waiting for a slot has
+executed nothing, so it settles `CANCELED` without ever starting; a run that is
+executing has its process group ended — the tool and children that remain in
+that group, using the same lever as the timeout. The reply is normally
+`CANCELING` while the worker tidies up, but may already be `CANCELED` if it
+finishes before the response. A cancelled run returns no outputs even if the
+work finished anyway.
+
 Runs are held in memory: nothing survives a restart, and nothing is shared
 between replicas. `BIOCHEF_MAX_RUNS` bounds how many are remembered; finished
 runs are evicted first, while a full set of active runs refuses new work with

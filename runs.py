@@ -92,6 +92,13 @@ class Run:
         self.state = RunState.QUEUED
         self.outputs = None
         self.error = None
+        self.pgid = None
+        """The process group executing this run, once there is one.
+
+        A run waiting for a slot has none yet, and cancelling it is a matter of
+        state alone. A run that has started needs the group ended, which is the
+        same lever the timeout pulls.
+        """
 
     def as_dict(self) -> dict:
         """What a caller is told about this run.
@@ -171,6 +178,26 @@ class RunStore:
             if error is not None:
                 run.error = error
             return run
+
+    def attach(self, run_id: str, pgid: int) -> bool:
+        """Record the group and report if cancellation arrived before it did."""
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is not None:
+                run.pgid = pgid
+                return run.state is RunState.CANCELING
+            return False
+
+    def detach(self, run_id: str) -> None:
+        """Forget the process group, because it no longer exists.
+
+        The number outlives the group, and the kernel may reissue it. Anything
+        still holding it is aiming at whoever gets it next.
+        """
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is not None:
+                run.pgid = None
 
     def _evict_if_needed(self):
         """Called with the lock held."""
