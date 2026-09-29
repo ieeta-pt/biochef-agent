@@ -28,7 +28,31 @@ None of that is built yet. What exists today is the single endpoint below.
 
 ## The contract
 
-One endpoint. `POST /convert`, `multipart/form-data`, two fields:
+`openapi.json` is generated from the service (`python ci/export_openapi.py`)
+and checked by the suite, so the committed contract cannot drift.
+
+Two ways to run the same workflow.
+
+**Synchronously.** `POST /convert`, `multipart/form-data`, two fields. The
+connection is held for the whole run — up to `BIOCHEF_RUN_TIMEOUT`, fifteen
+minutes by default — and the outputs come back in the response. This is the
+contract the editor speaks today.
+
+**Asynchronously.** `POST /runs` takes the same two fields and answers `202`
+immediately with a `run_id`. `GET /runs/{run_id}` reports the state, and carries
+the outputs once it is `COMPLETE`. States use the eight WES-style names in issue #5 —
+`QUEUED`, `INITIALIZING`, `RUNNING`, `COMPLETE`, `EXECUTOR_ERROR`,
+`SYSTEM_ERROR`, `CANCELING`, `CANCELED`. A complete WES API is separate work.
+
+Runs are held in memory: nothing survives a restart, and nothing is shared
+between replicas. `BIOCHEF_MAX_RUNS` bounds how many are remembered; finished
+runs are evicted first, while a full set of active runs refuses new work with
+HTTP 503. A rejected request has no `run_id`; the caller can retry later.
+`/convert` and `/runs` share the same execution slots, though `/convert` still
+holds its HTTP connection open. Queued `/runs` jobs still hold their uploaded
+inputs in memory; the request-size limit is not an aggregate memory limit.
+
+Both take the same fields:
 
 | field | what it is |
 |---|---|
@@ -90,6 +114,8 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_RUN_TIMEOUT` | `900` | seconds before a run's whole process group is killed |
 | `BIOCHEF_KEEP_WORKSPACE` | `false` | leave a run's directory behind, for debugging |
 | `BIOCHEF_MAX_UPLOAD_BYTES` | `536870912` | largest request body accepted, in bytes |
+| `BIOCHEF_MAX_RUNS` | `256` | maximum run records retained for polling |
+| `BIOCHEF_MAX_CONCURRENT_RUNS` | `4` | execution slots shared by `/runs` and `/convert`; admitted `/runs` jobs wait in `QUEUED` |
 | `BIOCHEF_AUTH` | `none` | who may call it: `none` or `bearer` |
 | `BIOCHEF_AUTH_TOKEN` | | the shared token, required when `BIOCHEF_AUTH=bearer` |
 | `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess` or `apptainer` |
