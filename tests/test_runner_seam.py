@@ -301,6 +301,33 @@ class _NeverEnds(Runner):
         return ["sh", "-c", "sleep 120"]
 
 
+def test_failed_start_callback_does_not_leave_the_group_running(tmp_path):
+    seen = []
+
+    def cannot_register(pgid):
+        seen.append(pgid)
+        raise RuntimeError("registration failed")
+
+    with pytest.raises(RuntimeError, match="registration failed"):
+        _NeverEnds().run(_Workspace(tmp_path), timeout_s=30,
+                         on_start=cannot_register)
+
+    assert seen
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            os.killpg(seen[0], 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        try:
+            os.killpg(seen[0], signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        pytest.fail("the callback failure left a process group running")
+
+
 def test_an_unexpected_failure_does_not_leave_the_group_running(tmp_path,
                                                                 monkeypatch):
     """The inverse of the stale-pgid bug, and it was in the same finally.

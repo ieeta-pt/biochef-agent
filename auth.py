@@ -95,6 +95,8 @@ class BearerAuth(AuthProvider):
                 "non-empty value. Refusing to start rather than run with a "
                 "token nobody has to guess."
             )
+        if not token.isascii():
+            raise ValueError("BIOCHEF_AUTH_TOKEN must contain only ASCII characters")
         self._token = token
 
     def authenticate(self, request: Request) -> Optional[str]:
@@ -105,6 +107,8 @@ class BearerAuth(AuthProvider):
         scheme, _, presented = header.partition(" ")
         if scheme.lower() != "bearer" or not presented:
             raise Unauthenticated("expected an Authorization: Bearer <token>")
+        if not presented.isascii():
+            raise Unauthenticated("the token presented is not the one configured")
 
         # compare_digest, not ==. String comparison returns as soon as it finds a
         # difference, so how long it takes leaks how much of the token was right,

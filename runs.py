@@ -1,8 +1,7 @@
 """A run that outlives the request that asked for it (#5).
 
-B1 wants the WES `RunState` vocabulary rather than one of our own, so that
-exposing this as a WES endpoint later (F5) is an adapter and not a rewrite. The
-names below are exactly WES's, spelled the same way.
+B1 uses the eight WES-style `RunState` names required by issue #5. A complete
+WES API remains a separate endpoint task.
 
 The store is in memory and deliberately small in ambition. It is enough for
 "submit, poll, collect", which is what B1 asks for, and it is honest about what
@@ -20,7 +19,7 @@ from typing import Optional
 
 
 class RunState(str, Enum):
-    """The WES run states, verbatim.
+    """The eight WES-style run states required by issue #5.
 
     str-valued so a state serialises as its own name in JSON without anything
     having to convert it, and so a comparison against the string works.
@@ -68,15 +67,21 @@ class IllegalTransition(Exception):
     """A state change the machine does not permit."""
 
 
+class RunCapacityError(Exception):
+    """This process cannot retain another run."""
+
+
 MAX_RUNS = int(os.getenv("BIOCHEF_MAX_RUNS", "256"))
 """How many runs are remembered.
 
 Bounded because this is a dictionary that only ever grew otherwise, and a
 long-lived service accepting runs would use memory in proportion to its uptime.
-When it is full the oldest FINISHED run is forgotten; a run still in flight is
-never evicted, because forgetting it would lose the only handle to work that is
-still happening.
+When it is full the oldest FINISHED run is forgotten; if every slot is still
+in flight, a new submission is refused instead of evicting live work.
 """
+
+if MAX_RUNS < 1:
+    raise ValueError("BIOCHEF_MAX_RUNS must be positive")
 
 
 class Run:
@@ -124,13 +129,20 @@ class RunStore:
         self._runs = OrderedDict()
         self._lock = threading.Lock()
         self._max = MAX_RUNS if max_runs is None else max_runs
+        if self._max < 1:
+            raise ValueError("max_runs must be positive")
 
     def create(self) -> Run:
-        run = Run(uuid.uuid4().hex)
         with self._lock:
             self._evict_if_needed()
+            run = Run(uuid.uuid4().hex)
             self._runs[run.run_id] = run
         return run
+
+    def discard(self, run_id: str) -> None:
+        """Undo admission when request upload fails before a run is launched."""
+        with self._lock:
+            del self._runs[run_id]
 
     def get(self, run_id: str) -> Run:
         with self._lock:
@@ -167,12 +179,14 @@ class RunStore:
                 run.error = error
             return run
 
-    def attach(self, run_id: str, pgid: int) -> None:
-        """Record the process group, so something can end it later."""
+    def attach(self, run_id: str, pgid: int) -> bool:
+        """Record the group and report if cancellation arrived before it did."""
         with self._lock:
             run = self._runs.get(run_id)
             if run is not None:
                 run.pgid = pgid
+                return run.state is RunState.CANCELING
+            return False
 
     def detach(self, run_id: str) -> None:
         """Forget the process group, because it no longer exists.
@@ -193,8 +207,4 @@ class RunStore:
                     del self._runs[run_id]
                     break
             else:
-                # Everything remembered is still in flight. Forgetting one would
-                # lose the only handle to work that is still happening, so the
-                # store grows past its bound rather than doing that, and the
-                # ceiling is enforced again as soon as anything finishes.
-                return
+                raise RunCapacityError("all remembered runs are still in flight")

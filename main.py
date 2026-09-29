@@ -14,10 +14,12 @@ import base64
 
 from workspace import UnsafeName, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
-from runs import (IllegalTransition, RunState, RunStore, TERMINAL,
-                  UnknownRun)
-from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
+from runs import (IllegalTransition, RunCapacityError, RunState, RunStore,
+                  TERMINAL, UnknownRun)
+from bodylimit import BodySizeLimitMiddleware
+from evidence_verification import EvidenceVerificationError
 from runner import SubprocessRunner, get_runner
+from signing import SignatureError
 
 app = FastAPI()
 
@@ -63,6 +65,21 @@ async def tool_integrity(request, exc):
     )
 
 
+@app.exception_handler(SignatureError)
+@app.exception_handler(EvidenceVerificationError)
+async def artifact_verification(request, exc):
+    """Refuse an artifact that does not satisfy the local execution policy."""
+    return JSONResponse(
+        status_code=403,
+        content={
+            "detail": {
+                "error": "artifact_verification",
+                "message": str(exc),
+            }
+        },
+    )
+
+
 RUN_ROOT = os.getenv("BIOCHEF_RUN_ROOT") or None
 RUN_TIMEOUT_S = int(os.getenv("BIOCHEF_RUN_TIMEOUT", "900"))
 KEEP_WORKSPACE = os.getenv("BIOCHEF_KEEP_WORKSPACE", "false").lower() == "true"
@@ -92,7 +109,7 @@ class BiochefWorkflow(BaseModel):
 
 
 def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None,
-                on_finish=None):
+                on_finish=None, cancel_requested=None):
     """One run, start to finish, given the uploads already read.
 
     Split out of the handler so the synchronous endpoint and the asynchronous one
@@ -175,6 +192,9 @@ def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None,
                 detail="an upload occupies a name this run needs: 'Snakefile'",
             )
 
+        if cancel_requested is not None and cancel_requested():
+            return None
+
         report(RunState.RUNNING)
         code, _out, err = run_snakemake(ws, on_start=on_start,
                                         on_finish=on_finish)
@@ -207,7 +227,9 @@ def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None,
         # The process was never moved, so there is no global state to restore --
         # only a directory to remove, and it goes whether the run succeeded or
         # not.
-        if not KEEP_WORKSPACE:
+        if KEEP_WORKSPACE:
+            ws.close()
+        else:
             ws.cleanup()
 
 
@@ -216,17 +238,18 @@ async def convert(
     biochef_workflow: str = Form(...),
     files: List[UploadFile] = File(...)
 ):
-    """Unchanged: the whole run happens inside this request.
+    """The editor's synchronous contract, sharing the execution limit.
 
     Kept as it was because it is the contract the editor speaks today. /runs is
     the same work without the wait.
     """
-    uploads = [(f.filename, await f.read()) for f in files]
-    return await run_in_threadpool(perform_run, biochef_workflow, uploads)
+    async with _slots():
+        uploads = [(f.filename, await f.read()) for f in files]
+        return await run_in_threadpool(perform_run, biochef_workflow, uploads)
 
 
 MAX_CONCURRENT_RUNS = int(os.getenv("BIOCHEF_MAX_CONCURRENT_RUNS", "4"))
-"""How many runs may execute at once.
+"""How many /runs and /convert workflows may execute at once.
 
 Without a bound, a burst of submissions became a burst of snakemake processes:
 anyio's default thread limiter is 40, so forty tools could be running at once on
@@ -236,6 +259,8 @@ Accepting work is cheap; doing it is not, and the two need separating.
 Runs beyond the limit wait in QUEUED, which is what that state is for -- WES
 means "accepted, not yet started" by it, and a client polling sees exactly that.
 """
+if MAX_CONCURRENT_RUNS < 1:
+    raise ValueError("BIOCHEF_MAX_CONCURRENT_RUNS must be positive")
 
 _slots_by_loop = weakref.WeakKeyDictionary()
 
@@ -298,7 +323,12 @@ async def _execute(run_id: str, biochef_workflow: str, uploads):
         _advance(run_id, state)
 
     def started(pgid):
-        RUNS.attach(run_id, pgid)
+        if RUNS.attach(run_id, pgid):
+            # Cancellation may have arrived while the runner was starting.
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     def finished():
         RUNS.detach(run_id)
@@ -315,7 +345,7 @@ async def _execute(run_id: str, biochef_workflow: str, uploads):
                 return
             results = await run_in_threadpool(
                 perform_run, biochef_workflow, uploads, progress, started,
-                finished)
+                finished, lambda: _was_cancelled(run_id))
     except HTTPException as refusal:
         if _was_cancelled(run_id):
             _advance(run_id, RunState.CANCELED)
@@ -352,17 +382,26 @@ def _was_cancelled(run_id) -> bool:
 def _advance(run_id, state, **detail):
     """Record a transition, tolerating one that is no longer legal.
 
-    A run may have reached a terminal state already -- cancelled, once #7
-    exists -- and the worker will not know. Refusing loudly inside a background
-    task would only raise into nowhere.
+    A cancellation can arrive after the worker checks the state but before it
+    records a terminal result. In that case the worker must settle CANCELING,
+    not leave it there forever.
     """
     try:
         RUNS.advance(run_id, state, **detail)
-    except (IllegalTransition, UnknownRun):
+    except IllegalTransition:
+        if state in (RunState.COMPLETE, RunState.EXECUTOR_ERROR,
+                     RunState.SYSTEM_ERROR) and _was_cancelled(run_id):
+            try:
+                RUNS.advance(run_id, RunState.CANCELED)
+            except (IllegalTransition, UnknownRun):
+                pass
+    except UnknownRun:
         pass
 
 
-@app.post("/runs", status_code=202)
+@app.post("/runs", status_code=202, responses={
+    503: {"description": "Agent capacity reached; retry later"},
+})
 async def submit_run(
     biochef_workflow: str = Form(...),
     files: List[UploadFile] = File(...)
@@ -374,9 +413,19 @@ async def submit_run(
     difference between this and /convert, and the reason it cannot simply call
     the same handler in the background.
     """
-    uploads = [(f.filename, await f.read()) for f in files]
-    run = RUNS.create()
-    task = asyncio.create_task(_execute(run.run_id, biochef_workflow, uploads))
+    try:
+        run = RUNS.create()
+    except RunCapacityError:
+        raise HTTPException(
+            status_code=503, detail="agent run capacity reached; retry later",
+            headers={"Retry-After": "1"},
+        ) from None
+    try:
+        uploads = [(f.filename, await f.read()) for f in files]
+        task = asyncio.create_task(_execute(run.run_id, biochef_workflow, uploads))
+    except BaseException:
+        RUNS.discard(run.run_id)
+        raise
     # Held until it finishes, then dropped. See _running above: without this the
     # task can be collected mid-run and the run never reaches a terminal state.
     _running.add(task)
@@ -407,14 +456,12 @@ async def cancel_run(run_id: str):
     Two shapes of run, and they differ. One waiting for a slot has executed
     nothing, so cancelling it is a matter of state: it settles CANCELED when its
     turn comes and it declines to start. One that is running has a process
-    group, and that group is ended -- the tool and everything it spawned,
-    exactly as the timeout does it, because a tool that spawns children and
-    survives its parent is the reason group-killing is there at all.
+    group, and that group is ended -- the tool and children that remain in the
+    group, exactly as the timeout does it.
 
-    The reply is CANCELING rather than CANCELED, and that is not evasion: the
-    kill has been issued, but the run is not over until the worker has finished
-    tidying up and said so. Reporting CANCELED here would be claiming something
-    that has not happened yet.
+    The reply is normally CANCELING while the worker tidies up. It may already
+    be CANCELED if the worker finishes before the response; CANCELED is only
+    recorded after cleanup.
     """
     try:
         run = RUNS.get(run_id)

@@ -108,7 +108,7 @@
   "paths": {
     "/convert": {
       "post": {
-        "description": "Unchanged: the whole run happens inside this request.\n\nKept as it was because it is the contract the editor speaks today. /runs is\nthe same work without the wait.",
+        "description": "The editor's synchronous contract, sharing the execution limit.\n\nKept as it was because it is the contract the editor speaks today. /runs is\nthe same work without the wait.",
         "operationId": "convert_convert_post",
         "requestBody": {
           "content": {
@@ -175,6 +175,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "description": "Agent capacity reached; retry later"
           }
         },
         "summary": "Submit Run"
@@ -220,7 +223,7 @@
     },
     "/runs/{run_id}/cancel": {
       "post": {
-        "description": "Ask a run to stop, and end the processes doing it.\n\nThe path is WES's, so exposing this as a WES endpoint later (F5) does not\nmove it.\n\nTwo shapes of run, and they differ. One waiting for a slot has executed\nnothing, so cancelling it is a matter of state: it settles CANCELED when its\nturn comes and it declines to start. One that is running has a process\ngroup, and that group is ended -- the tool and everything it spawned,\nexactly as the timeout does it, because a tool that spawns children and\nsurvives its parent is the reason group-killing is there at all.\n\nThe reply is CANCELING rather than CANCELED, and that is not evasion: the\nkill has been issued, but the run is not over until the worker has finished\ntidying up and said so. Reporting CANCELED here would be claiming something\nthat has not happened yet.",
+        "description": "Ask a run to stop, and end the processes doing it.\n\nThe path is WES's, so exposing this as a WES endpoint later (F5) does not\nmove it.\n\nTwo shapes of run, and they differ. One waiting for a slot has executed\nnothing, so cancelling it is a matter of state: it settles CANCELED when its\nturn comes and it declines to start. One that is running has a process\ngroup, and that group is ended -- the tool and children that remain in the\ngroup, exactly as the timeout does it.\n\nThe reply is normally CANCELING while the worker tidies up. It may already\nbe CANCELED if the worker finishes before the response; CANCELED is only\nrecorded after cleanup.",
         "operationId": "cancel_run_runs__run_id__cancel_post",
         "parameters": [
           {
