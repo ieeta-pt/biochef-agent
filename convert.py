@@ -1,16 +1,22 @@
 from fastapi import FastAPI
+import fcntl
 import hashlib
 import json
 import oras.client
 import os
 import shutil
 import stat
+import threading
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 
 from dotenv import load_dotenv
 
+import evidence_verification
 import profiles
+import signing
 from workspace import check_name
 
 load_dotenv()
@@ -101,15 +107,38 @@ class Workflow:
 TOOL_CACHE = os.path.realpath(os.getenv("BIOCHEF_TOOL_CACHE", "tool-cache"))
 """Where pulled bundles live, shared by every run.
 
-Splitting the cache out of the run directory is forced by giving each run its
-own directory, not a tidy-up. fetch_tool memoises and returns early on a hit, so
-it never re-copied the binary; with one shared directory that made the copy
-survive between runs, and with a fresh directory per run it would simply be
-missing on the second. The pull is cached here, and materialise_tools puts a
-copy in whichever workspace needs it.
+Each run has its own workspace, while downloaded bundles can be reused. On
+every fetch, the cached files are checked against the registry manifest; a
+matching entry avoids another pull. materialise_tools copies the executable
+into whichever run workspace needs it.
 """
 
 tools = {}
+_fetch_locks = {}
+_fetch_locks_guard = threading.Lock()
+
+
+@contextmanager
+def _fetch_lock(tool_id):
+    """Lock one local cache entry across cooperating threads and processes."""
+    with _fetch_locks_guard:
+        thread_lock = _fetch_locks.setdefault(tool_id, threading.Lock())
+
+    with thread_lock:
+        os.makedirs(TOOL_CACHE, exist_ok=True)
+        # Keep this file: recreating it could let processes lock different inodes.
+        lock_path = os.path.join(TOOL_CACHE, f".{tool_id}.lock")
+        lock_fd = os.open(
+            lock_path,
+            os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
 
 class ToolIntegrityError(Exception):
@@ -227,6 +256,62 @@ def verify_against_manifest(target, staging, manifest=None):
             )
 
 
+# Taken from oras rather than restated: a manifest media type oras would accept
+# must not be refused here just because this file has an older list.
+try:
+    import oras.defaults
+    _MANIFEST_TYPES = ", ".join(oras.defaults.default_manifest_accepted_media_types)
+except Exception:  # pragma: no cover - a stubbed oras in the test suite
+    _MANIFEST_TYPES = "application/vnd.oci.image.manifest.v1+json"
+
+
+def fetch_manifest(target):
+    """The manifest and the digest that names it, from a single fetch, along with the raw bytes.
+
+    oras parses the response and throws it away, so the manifest digest -- which
+    is defined as the hash of the exact bytes served, not of anything we could
+    re-serialise -- is not recoverable from what get_manifest returns. Signature
+    verification needs that digest, and needs it to name the same artifact the
+    blobs are pulled from, so the request happens here and both are kept.
+
+    The digest is computed from the bytes rather than taken from the registry's
+    Docker-Content-Digest header. The header is advisory and comes from the same
+    party as the manifest; if both are present and disagree, that is refused,
+    because a registry answering one thing and labelling it another is not a
+    situation to pick a winner in.
+
+    Falls back to oras's own accessor for any client that cannot do a raw
+    request, returning no digest -- which strict mode refuses, so the fallback
+    cannot quietly become a way to skip verification.
+    """
+    container = client.get_container(target)
+    if not (hasattr(client, "do_request") and hasattr(client, "prefix")):
+        return client.get_manifest(container), None, None
+
+    url = f"{client.prefix}://{container.manifest_url()}"
+    response = client.do_request(url, "GET", headers={"Accept": _MANIFEST_TYPES})
+    if response.status_code != 200:
+        raise ToolIntegrityError(
+            f"{target}: the registry answered {response.status_code} for its manifest"
+        )
+
+    body = response.content
+    digest = "sha256:" + hashlib.sha256(body).hexdigest()
+    advertised = response.headers.get("Docker-Content-Digest")
+    if advertised and advertised != digest:
+        raise ToolIntegrityError(
+            f"{target}: the registry served a manifest whose digest is {digest} "
+            f"but labelled it {advertised}"
+        )
+    requested = getattr(container, "digest", None)
+    if requested and requested != digest:
+        raise ToolIntegrityError(
+            f"{target}: the registry served manifest {digest}, but the requested "
+            f"immutable reference names {requested}"
+        )
+    return json.loads(body), digest, body
+
+
 def fetch_tool(tool_id, repo):
     """Pull a bundle into the shared cache and return it.
 
@@ -239,46 +324,53 @@ def fetch_tool(tool_id, repo):
 
     outdir = os.path.join(TOOL_CACHE, tool_id)
     target = f"{REGISTRY_URL}/{repo}"
+    current_mode = signing.mode()
+    if current_mode == signing.STRICT and not signing.is_immutable(target):
+        raise signing.SignatureError(
+            f"{target}: strict verification requires the caller to select an "
+            "immutable OCI manifest digest"
+        )
 
-    # Fetched once, and used for both the cache check and the verification of
-    # anything pulled, so the two are talking about the same artifact. Two
-    # separate fetches made an ordinary push to the same tag, mid-pull, look
-    # exactly like tampering.
-    manifest = client.get_manifest(client.get_container(target))
-
-    # On EVERY call, not only on a miss. The cache is what materialise_tools
-    # copies into a run and chmods 0700, so verifying only the pull that created
-    # it proves something about a moment in the past rather than about the bytes
-    # being executed. It is a plain directory, written by this service, and a
-    # tool running under the subprocess runner is unconfined and runs as the
-    # same user -- so one run can rewrite what every later run executes. That is
-    # not a clever attack, it is the ordinary consequence of a shared cache.
-    #
-    # The cost is a manifest fetch and a local re-hash per tool per request. The
-    # blobs are not downloaded again.
-    if not cache_matches(outdir, manifest, target):
-        # Staged, then moved into place, so an interrupted pull cannot leave a
-        # half-written bundle that the next run would read as complete.
-        staging = outdir + ".part"
-        shutil.rmtree(staging, ignore_errors=True)
-        os.makedirs(staging, exist_ok=True)
-        client.pull(target=target, outdir=staging)
-        # Before the staged directory becomes the cached one, and so before
-        # anything in it can be copied into a run. A bundle that does not match
-        # is left in .part and removed, never promoted.
+    with _fetch_lock(tool_id):
+        manifest, manifest_digest, raw_manifest = fetch_manifest(target)
         try:
-            verify_against_manifest(target, staging, manifest=manifest)
-        except Exception:
-            shutil.rmtree(staging, ignore_errors=True)
-            raise
-        shutil.rmtree(outdir, ignore_errors=True)
-        os.replace(staging, outdir)
+            subject = signing.immutable_reference(target, manifest_digest)
+        except signing.SignatureError:
+            subject = None
 
-    with open(os.path.join(outdir, "bundle.json"), "r") as f:
-        bundle = json.load(f)
+        signing.check(target, manifest_digest, log=print)
+        evidence = evidence_verification.check(
+            subject,
+            raw_manifest,
+            client,
+            fetch_manifest,
+            log=print,
+        )
 
-    tools[tool_id] = bundle
-    return bundle
+        pull_target = subject if current_mode != signing.OFF and subject else target
+        if not cache_matches(outdir, manifest, pull_target):
+            staging = f"{outdir}.part.{uuid.uuid4().hex}"
+            os.makedirs(staging)
+            try:
+                client.pull(target=pull_target, outdir=staging)
+                verify_against_manifest(pull_target, staging, manifest=manifest)
+                evidence_verification.verify_pulled(
+                    staging, subject, tool_id, evidence, log=print
+                )
+                shutil.rmtree(outdir, ignore_errors=True)
+                os.replace(staging, outdir)
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+        else:
+            evidence_verification.verify_pulled(
+                outdir, subject, tool_id, evidence, log=print
+            )
+
+        with open(os.path.join(outdir, "bundle.json"), "r") as f:
+            bundle = json.load(f)
+
+        tools[tool_id] = bundle
+        return bundle
 
 
 def expected_uploads(workflow):

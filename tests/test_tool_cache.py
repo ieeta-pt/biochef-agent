@@ -38,7 +38,10 @@ if "oras" not in sys.modules:
 
 import hashlib
 import json
+import multiprocessing
 import os
+import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -132,11 +135,14 @@ def test_a_bundle_is_pulled_into_the_cache_and_staged_first(registry, tmp_path):
     assert bundle["bin"] == "tool"
     assert len(registry.pulls) == 1
     target, outdir = registry.pulls[0]
-    assert outdir.endswith(".part"), "the pull must be staged, not written in place"
-
     cache = Path(convert.TOOL_CACHE) / "tool"
+    assert ".part." in outdir, "the pull must be staged, not written in place"
+    assert outdir != str(cache) + ".part", (
+        "the staging name must be unique per attempt -- a fixed one is shared "
+        "between concurrent runs"
+    )
     assert (cache / "bundle.json").exists(), "the staged directory was not moved into place"
-    assert not Path(str(cache) + ".part").exists(), "the staging directory was left behind"
+    assert not list(cache.parent.glob("tool.part*")), "a staging directory was left behind"
 
 
 def test_a_second_node_does_not_pull_again(registry):
@@ -148,11 +154,6 @@ def test_a_second_node_does_not_pull_again(registry):
 
 def test_a_leftover_staging_directory_from_an_interrupted_pull_is_discarded(
         registry, tmp_path):
-    """The reason for rmtree before makedirs.
-
-    A previous run killed mid-pull leaves a .part behind; reusing it would mix
-    two pulls together.
-    """
     staging = Path(convert.TOOL_CACHE) / "tool.part"
     staging.mkdir(parents=True)
     (staging / "stale-file").write_text("from an interrupted pull")
@@ -164,8 +165,24 @@ def test_a_leftover_staging_directory_from_an_interrupted_pull_is_discarded(
     assert not (cache / "stale-file").exists(), "content from the interrupted pull survived"
 
 
+def test_failed_pull_removes_staging(registry):
+    def failing_pull(target, outdir):
+        os.makedirs(outdir, exist_ok=True)
+        Path(outdir, "half-written").write_text("interrupted")
+        raise RuntimeError("the registry went away")
+
+    registry.pull = failing_pull
+
+    with pytest.raises(RuntimeError):
+        convert.fetch_tool("tool-1", "some/repo")
+
+    cache_root = Path(convert.TOOL_CACHE)
+    leftovers = list(cache_root.glob("tool.part*")) if cache_root.exists() else []
+    assert not leftovers, f"staging survived a failed pull: {leftovers}"
+
+
 def test_a_cached_bundle_on_disk_is_not_pulled_again(registry, tmp_path):
-    """The memo is per-process; the cache has to survive a restart too."""
+    """A verified disk cache hit should not pull the bundle again."""
     convert.fetch_tool("tool-1", "some/repo")
     convert.tools.clear()               # as if the process restarted
 
@@ -179,6 +196,113 @@ def test_a_tool_id_that_is_not_a_plain_name_is_refused(registry):
 
     with pytest.raises(UnsafeName):
         convert.fetch_tool("../escape-1", "some/repo")
+
+
+def test_same_tool_threads_share_one_pull(registry):
+    outcome = {"ok": 0, "failed": []}
+    barrier = threading.Barrier(20)
+    guard = threading.Lock()
+
+    def race():
+        barrier.wait()
+        try:
+            convert.fetch_tool("tool-1", "some/repo")
+            with guard:
+                outcome["ok"] += 1
+        except Exception as failure:  # noqa: BLE001 - failures are test output
+            with guard:
+                outcome["failed"].append(repr(failure))
+
+    threads = [threading.Thread(target=race) for _ in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert outcome["failed"] == [], outcome["failed"]
+    assert outcome["ok"] == 20
+    assert len(registry.pulls) == 1
+
+
+def test_different_tools_pull_concurrently(registry):
+    original_pull = registry.pull
+    inside_pull = threading.Barrier(2, timeout=2)
+    failures = []
+
+    def overlapping_pull(target, outdir):
+        inside_pull.wait()
+        original_pull(target, outdir)
+
+    registry.pull = overlapping_pull
+
+    def fetch(tool_id):
+        try:
+            convert.fetch_tool(tool_id, f"some/{tool_id}")
+        except Exception as failure:  # noqa: BLE001 - failures are test output
+            failures.append(repr(failure))
+
+    threads = [
+        threading.Thread(target=fetch, args=("tool-1",)),
+        threading.Thread(target=fetch, args=("other-1",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert failures == [], failures
+    assert len(registry.pulls) == 2
+
+
+def _shared_cache_worker(cache, start, pull_count):
+    class Registry(FakeRegistry):
+        def pull(self, target, outdir):
+            with pull_count.get_lock():
+                pull_count.value += 1
+            os.makedirs(outdir, exist_ok=True)
+            time.sleep(0.15)
+            Path(outdir, "bundle.json").write_text(json.dumps(BUNDLE))
+            Path(outdir, "tool").write_text("#!/bin/sh\n")
+
+    convert.TOOL_CACHE = cache
+    convert.client = Registry()
+    convert.tools.clear()
+    start.wait()
+
+    bundle = convert.fetch_tool("tool-1", "some/repo")
+    assert bundle["bin"] == "tool"
+
+
+def test_same_tool_processes_share_one_pull(tmp_path):
+    cache = tmp_path / "shared-cache"
+    cache.mkdir()
+
+    context = multiprocessing.get_context("fork")
+    start = context.Event()
+    pull_count = context.Value("i", 0)
+    processes = [
+        context.Process(
+            target=_shared_cache_worker,
+            args=(str(cache), start, pull_count),
+        )
+        for _ in range(6)
+    ]
+    for process in processes:
+        process.start()
+
+    start.set()
+    for process in processes:
+        process.join(timeout=5)
+
+    try:
+        assert all(not process.is_alive() for process in processes)
+        assert all(process.exitcode == 0 for process in processes)
+        assert pull_count.value == 1
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join()
 
 
 # --------------------------------------------------------------------------
