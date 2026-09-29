@@ -106,9 +106,15 @@ def test_the_verification_happens_before_the_bundle_is_promoted():
     is the cached one, and the cache is what every later run copies from.
     """
     source = inspect.getsource(convert.fetch_tool)
-    assert "verify_against_manifest" in source
-    assert source.index("verify_against_manifest") < source.index("os.replace"), (
-        "the check must run while the pull is still staged in .part"
+
+    assert source.index("verify_against_manifest(pull_target") < source.index(
+        "os.replace(staging, outdir)"), (
+        "the check must run while the pull is still staged, before anything is "
+        "put in place"
+    )
+    assert source.index("evidence_verification.verify_pulled(") < source.index(
+        "os.replace(staging, outdir)"), (
+        "signed evidence and pulled bytes must be checked before promotion"
     )
 
 

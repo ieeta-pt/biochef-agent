@@ -1,4 +1,6 @@
 from convert import *
+import asyncio
+import weakref
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
@@ -10,12 +12,21 @@ import signal
 import subprocess
 import base64
 
+import profiles
 from workspace import UnsafeName, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
-from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
+from runs import (IllegalTransition, RunCapacityError, RunState, RunStore,
+                  TERMINAL, UnknownRun)
+from bodylimit import BodySizeLimitMiddleware
 from evidence_verification import EvidenceVerificationError
 from runner import SubprocessRunner, get_runner
 from signing import SignatureError
+
+# The service is starting, so say what it is configured to permit. convert
+# applied the profile at import, because every setting here is read at import;
+# this is the first point at which saying so is not a side effect of somebody
+# importing a module.
+print(profiles.describe(PROFILE))
 
 app = FastAPI()
 
@@ -89,14 +100,14 @@ start, rather than accepting work and failing every submission.
 """
 
 
-def run_snakemake(ws, timeout_s=RUN_TIMEOUT_S):
+def run_snakemake(ws, timeout_s=RUN_TIMEOUT_S, on_start=None, on_finish=None):
     """Execute the workflow with the configured runner.
 
     Kept as a function, rather than calling RUNNER.run at the call site, so that
     the timeout default lives in one place and the handler does not have to know
     which provider it got.
     """
-    return RUNNER.run(ws, timeout_s)
+    return RUNNER.run(ws, timeout_s, on_start=on_start, on_finish=on_finish)
 
 
 class BiochefWorkflow(BaseModel):
@@ -104,14 +115,27 @@ class BiochefWorkflow(BaseModel):
     edges: list
 
 
-@app.post("/convert")
-async def convert(
-    biochef_workflow: str = Form(...),
-    files: List[UploadFile] = File(...)
-):
+def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None,
+                on_finish=None, cancel_requested=None):
+    """One run, start to finish, given the uploads already read.
+
+    Split out of the handler so the synchronous endpoint and the asynchronous one
+    execute the same code rather than two copies that drift. The uploads arrive
+    as (name, bytes) because the asynchronous path has to read them while the
+    request is still open -- by the time the work runs, there is no request left
+    to read them from.
+
+    Synchronous on purpose: every step here blocks, and both callers hand it to a
+    worker thread. `progress` is called with each RunState as it is entered, and
+    is None for the synchronous path, which has nowhere to report it.
+    """
+    def report(state):
+        if progress is not None:
+            progress(state)
+
+    report(RunState.INITIALIZING)
     ws = make_workspace(RUN_ROOT)
     try:
-        # Parse workflow
         workflow_dict = json.loads(biochef_workflow)
         workflow = parse_biochef_workflow(workflow_dict)
 
@@ -133,8 +157,8 @@ async def convert(
         # output does not exist yet.
         expected = expected_uploads(workflow)
         seen = set()
-        for f in files:
-            name = check_name(f.filename)
+        for filename, content in uploads:
+            name = check_name(filename)
             if name not in expected:
                 raise HTTPException(
                     status_code=400,
@@ -142,7 +166,7 @@ async def convert(
                            f"it expects {sorted(expected)}",
                 )
             try:
-                ws.write_bytes(name, await f.read())
+                ws.write_bytes(name, content)
             except FileExistsError:
                 raise HTTPException(
                     status_code=400,
@@ -157,7 +181,6 @@ async def convert(
                 detail=f"missing inputs: {sorted(expected - seen)}",
             )
 
-        # Convert workflow to Snakemake and run
         # The runner may need lines of its own at the top -- a container
         # directive, for the provider that runs each step in one. Asking the
         # runner keeps the emitter from having to know how the workflow will be
@@ -176,9 +199,12 @@ async def convert(
                 detail="an upload occupies a name this run needs: 'Snakefile'",
             )
 
-        # Off the event loop: communicate() blocks, and running it inline would
-        # mean the service never has two runs in flight to keep apart.
-        code, _out, err = await run_in_threadpool(run_snakemake, ws)
+        if cancel_requested is not None and cancel_requested():
+            return None
+
+        report(RunState.RUNNING)
+        code, _out, err = run_snakemake(ws, on_start=on_start,
+                                        on_finish=on_finish)
         if code != 0:
             raise HTTPException(
                 status_code=500,
@@ -212,3 +238,269 @@ async def convert(
             ws.close()
         else:
             ws.cleanup()
+
+
+@app.post("/convert")
+async def convert(
+    biochef_workflow: str = Form(...),
+    files: List[UploadFile] = File(...)
+):
+    """The editor's synchronous contract, sharing the execution limit.
+
+    Kept as it was because it is the contract the editor speaks today. /runs is
+    the same work without the wait.
+    """
+    async with _slots():
+        uploads = [(f.filename, await f.read()) for f in files]
+        return await run_in_threadpool(perform_run, biochef_workflow, uploads)
+
+
+MAX_CONCURRENT_RUNS = int(os.getenv("BIOCHEF_MAX_CONCURRENT_RUNS", "4"))
+"""How many /runs and /convert workflows may execute at once.
+
+Without a bound, a burst of submissions became a burst of snakemake processes:
+anyio's default thread limiter is 40, so forty tools could be running at once on
+a machine sized for rather fewer, each with its own workspace on the same disk.
+Accepting work is cheap; doing it is not, and the two need separating.
+
+Runs beyond the limit wait in QUEUED, which is what that state is for -- WES
+means "accepted, not yet started" by it, and a client polling sees exactly that.
+"""
+if MAX_CONCURRENT_RUNS < 1:
+    raise ValueError("BIOCHEF_MAX_CONCURRENT_RUNS must be positive")
+
+_slots_by_loop = weakref.WeakKeyDictionary()
+
+
+def _slots():
+    """The semaphore for whichever event loop is running.
+
+    Not one module-level Semaphore. asyncio locks bind themselves to a loop the
+    first time a waiter is created -- so a single shared one works until it is
+    contended, and from then on any use from a different loop raises
+    "is bound to a different event loop".
+
+      loop 1 with contention: ok
+      loop 2 with contention: RuntimeError: <Semaphore [locked]> is bound to a
+                              different event loop
+
+    A server runs one loop, so this would not have bitten in production. It
+    would have bitten in tests, which build a fresh loop per TestClient -- and
+    only did not because the test that forces contention substitutes its own
+    semaphore. A bound that breaks the moment someone tests it properly is not
+    much of a bound.
+
+    Weakly keyed, so a finished loop takes its semaphore with it.
+    """
+    loop = asyncio.get_running_loop()
+    semaphore = _slots_by_loop.get(loop)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_RUNS)
+        _slots_by_loop[loop] = semaphore
+    return semaphore
+
+_running = set()
+"""Strong references to the tasks in flight.
+
+asyncio.create_task returns a task the caller is expected to keep. The event
+loop holds only a WEAK reference, so a task nobody else refers to can be
+garbage collected part-way through -- documented CPython behaviour, and a
+particularly unpleasant one here, because the run would simply stop, stay
+non-terminal, and be polled forever by a client waiting for an answer that is
+never coming.
+"""
+
+RUNS = RunStore()
+"""Runs this process is aware of.
+
+In memory, so nothing survives a restart and nothing is shared between replicas.
+Both are real limits rather than oversights, and both are why a persistent store
+is its own piece of work.
+"""
+
+
+async def _execute(run_id: str, biochef_workflow: str, uploads):
+    """Do the run, and record how it ended.
+
+    Every path out of here reaches a terminal state. A run stuck in RUNNING
+    because something raised on the way to recording a failure would be worse
+    than a run that failed: a client polling it would wait forever.
+    """
+    def progress(state):
+        _advance(run_id, state)
+
+    def started(pgid):
+        if RUNS.attach(run_id, pgid):
+            # Cancellation may have arrived while the runner was starting.
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def finished():
+        RUNS.detach(run_id)
+
+    try:
+        # Waits here while the service is busy, and the run stays QUEUED until a
+        # slot frees. Acquiring before anything else means a queued run has not
+        # yet made a workspace or pulled a tool.
+        async with _slots():
+            # Asked for while queued, and never started. Nothing was executed,
+            # so there is nothing to kill -- only a state to settle.
+            if RUNS.get(run_id).state is RunState.CANCELING:
+                _advance(run_id, RunState.CANCELED)
+                return
+            results = await run_in_threadpool(
+                perform_run, biochef_workflow, uploads, progress, started,
+                finished, lambda: _was_cancelled(run_id))
+    except HTTPException as refusal:
+        if _was_cancelled(run_id):
+            _advance(run_id, RunState.CANCELED)
+            return
+        # The run failed for a reason attributable to what was submitted or to
+        # the tools it named -- a bad workflow, a missing input, a tool exiting
+        # non-zero. WES calls that EXECUTOR_ERROR.
+        _advance(run_id, RunState.EXECUTOR_ERROR, error=refusal.detail)
+    except Exception as failure:                     # noqa: BLE001
+        if _was_cancelled(run_id):
+            _advance(run_id, RunState.CANCELED)
+            return
+        # Anything else is us, not the submission. SYSTEM_ERROR says so rather
+        # than blaming the workflow for a defect in this service.
+        _advance(run_id, RunState.SYSTEM_ERROR,
+                 error={"error": "system_error", "message": str(failure)})
+    else:
+        if _was_cancelled(run_id):
+            # The kill lost the race and the work finished anyway. It was still
+            # asked to stop, and saying COMPLETE would hand back outputs the
+            # caller has said they do not want.
+            _advance(run_id, RunState.CANCELED)
+            return
+        _advance(run_id, RunState.COMPLETE, outputs=results)
+
+
+def _was_cancelled(run_id) -> bool:
+    try:
+        return RUNS.get(run_id).state is RunState.CANCELING
+    except UnknownRun:
+        return False
+
+
+def _advance(run_id, state, **detail):
+    """Record a transition, tolerating one that is no longer legal.
+
+    A cancellation can arrive after the worker checks the state but before it
+    records a terminal result. In that case the worker must settle CANCELING,
+    not leave it there forever.
+    """
+    try:
+        RUNS.advance(run_id, state, **detail)
+    except IllegalTransition:
+        if state in (RunState.COMPLETE, RunState.EXECUTOR_ERROR,
+                     RunState.SYSTEM_ERROR) and _was_cancelled(run_id):
+            try:
+                RUNS.advance(run_id, RunState.CANCELED)
+            except (IllegalTransition, UnknownRun):
+                pass
+    except UnknownRun:
+        pass
+
+
+@app.post("/runs", status_code=202, responses={
+    503: {"description": "Agent capacity reached; retry later"},
+})
+async def submit_run(
+    biochef_workflow: str = Form(...),
+    files: List[UploadFile] = File(...)
+):
+    """Accept a workflow and answer immediately with something to poll.
+
+    The uploads are read here, while the request is still open. By the time the
+    work runs there is no request left to read them from -- which is the whole
+    difference between this and /convert, and the reason it cannot simply call
+    the same handler in the background.
+    """
+    try:
+        run = RUNS.create()
+    except RunCapacityError:
+        raise HTTPException(
+            status_code=503, detail="agent run capacity reached; retry later",
+            headers={"Retry-After": "1"},
+        ) from None
+    try:
+        uploads = [(f.filename, await f.read()) for f in files]
+        task = asyncio.create_task(_execute(run.run_id, biochef_workflow, uploads))
+    except BaseException:
+        RUNS.discard(run.run_id)
+        raise
+    # Held until it finishes, then dropped. See _running above: without this the
+    # task can be collected mid-run and the run never reaches a terminal state.
+    _running.add(task)
+    task.add_done_callback(_running.discard)
+    return run.as_dict()
+
+
+@app.get("/runs/{run_id}")
+async def get_run(run_id: str):
+    """Where a run has got to, and its outputs once it is COMPLETE."""
+    try:
+        return RUNS.get(run_id).as_dict()
+    except UnknownRun:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no run {run_id!r}; it never existed, or it finished long "
+                   f"enough ago to have been forgotten",
+        )
+
+
+@app.post("/runs/{run_id}/cancel")
+async def cancel_run(run_id: str):
+    """Ask a run to stop, and end the processes doing it.
+
+    The path is WES's, so exposing this as a WES endpoint later (F5) does not
+    move it.
+
+    Two shapes of run, and they differ. One waiting for a slot has executed
+    nothing, so cancelling it is a matter of state: it settles CANCELED when its
+    turn comes and it declines to start. One that is running has a process
+    group, and that group is ended -- the tool and children that remain in the
+    group, exactly as the timeout does it.
+
+    The reply is normally CANCELING while the worker tidies up. It may already
+    be CANCELED if the worker finishes before the response; CANCELED is only
+    recorded after cleanup.
+    """
+    try:
+        run = RUNS.get(run_id)
+    except UnknownRun:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no run {run_id!r}; it never existed, or it finished long "
+                   f"enough ago to have been forgotten",
+        )
+
+    if run.state in TERMINAL:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "already_finished", "run_id": run_id,
+                    "state": run.state.value,
+                    "message": "this run has already ended; there is nothing "
+                               "to cancel"},
+        )
+
+    try:
+        RUNS.advance(run_id, RunState.CANCELING)
+    except IllegalTransition:
+        # Someone else asked first, or it ended between the check and here.
+        return RUNS.get(run_id).as_dict()
+
+    pgid = run.pgid
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            # Already gone -- it finished on its own in the meantime. The
+            # worker will settle the state.
+            pass
+
+    return RUNS.get(run_id).as_dict()
