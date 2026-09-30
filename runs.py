@@ -97,6 +97,7 @@ class Run:
         self.stdout = ""
         self.stderr = ""
         self.steps = {}
+        self.node_logs = {}
         self.pgid = None
         """The process group executing this run, once there is one.
 
@@ -106,11 +107,11 @@ class Run:
         """
 
     def logs_as_dict(self) -> dict:
-        """What this run printed, and which steps failed.
+        """Run-level output, diagnostic error blocks, and per-node output.
 
-        `steps` is only ever the failing ones, and the docstring on steplogs
-        explains why: snakemake attributes failures by name and does not
-        separate anything else.
+        `steps` is populated only on a failed workflow, from Snakemake-style
+        stderr headings. Tool output can imitate those headings. `node_logs`
+        comes from separate files opened for each executed rule.
         """
         return {
             "run_id": self.run_id,
@@ -118,6 +119,7 @@ class Run:
             "stdout": self.stdout,
             "stderr": self.stderr,
             "steps": self.steps,
+            "node_logs": self.node_logs,
         }
 
     def as_dict(self) -> dict:
@@ -208,8 +210,9 @@ class RunStore:
                 return run.state is RunState.CANCELING
             return False
 
-    def record_logs(self, run_id: str, stdout, stderr, steps) -> None:
-        """Keep what the run printed, bounded, with failures already attributed.
+    def record_logs(self, run_id: str, stdout, stderr, steps,
+                    node_logs=None) -> None:
+        """Keep bounded stream tails, node logs, and diagnostic blocks.
 
         The attribution arrives finished rather than being worked out here.
         Doing it in this module would mean importing the emitter for its rule
@@ -223,6 +226,7 @@ class RunStore:
             run.stdout = clamp(stdout)
             run.stderr = clamp(stderr)
             run.steps = steps
+            run.node_logs = node_logs or {}
 
     def detach(self, run_id: str) -> None:
         """Forget the process group, because it no longer exists.

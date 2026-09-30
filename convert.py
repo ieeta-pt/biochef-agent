@@ -408,11 +408,8 @@ def materialise_tools(workflow, ws):
 def rule_name_for(node_id):
     """The snakemake rule name a node is emitted as.
 
-    Extracted so there is one of these rather than two. Attribution of a failing
-    step reads "Error in rule <name>:" out of snakemake's output and has to turn
-    that back into a node id; a second copy of this transform would go on
-    working right up until someone changed the emitter, and then attribute
-    failures to nothing at all.
+    Snakemake's diagnostic error headings use this name. The separate per-rule
+    log files are indexed by node id and do not depend on parsing a heading.
     """
     return node_id.replace(".", "_").replace("-", "_")
 
@@ -478,7 +475,13 @@ def parse_biochef_workflow(biochef_workflow):
     return new_workflow
 
 
-def convert_to_snakemake(workflow: Workflow):
+def convert_to_snakemake(workflow: Workflow, step_logs=None):
+    if step_logs is not None and len(step_logs) != len(workflow.nodes):
+        raise ValueError("one pair of log names is required for each node")
+    if step_logs is not None:
+        names = [check_name(name) for pair in step_logs for name in pair]
+        if len(set(names)) != len(names):
+            raise ValueError("step log names must be distinct")
     result = []
     result.append("rule all:\n    input:")
 
@@ -486,7 +489,7 @@ def convert_to_snakemake(workflow: Workflow):
         for output in node.outputs.values():
             result.append(f"        \"{output.file}\",")
 
-    for node in workflow.nodes:
+    for index, node in enumerate(workflow.nodes):
         # print(node)
         result.append(f"rule {rule_name_for(node.id)}:")
         cmd = [f"./{node.bin}"]
@@ -525,11 +528,22 @@ def convert_to_snakemake(workflow: Workflow):
                     extra_cms.append(f"        cp {output.hardcoded_file} {{output.{output_var}}}")
             i += 1
 
+        if step_logs is not None:
+            stdout_name, stderr_name = step_logs[index]
+            result.append(
+                f"    log: stdout={json.dumps(check_name(stdout_name))}, "
+                f"stderr={json.dumps(check_name(stderr_name))}"
+            )
+
         result.append(f"    shell:")
         result.append(f"        \"\"\"")
+        if step_logs is not None:
+            result.append("        (")
         result.append(f"        {" ".join(cmd)}")
         for command in extra_cms:
             result.append(command)
+        if step_logs is not None:
+            result.append("        ) > {log.stdout} 2> {log.stderr}")
         result.append(f"        \"\"\"")
 
     return "\n".join(result)

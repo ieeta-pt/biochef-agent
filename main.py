@@ -16,7 +16,8 @@ from workspace import UnsafeName, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
 from runs import (IllegalTransition, RunCapacityError, RunState, RunStore,
                   TERMINAL, UnknownRun)
-from steplogs import failing_steps
+from steplogs import (clamp, failing_steps, make_step_log_names,
+                      read_node_logs)
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
 from evidence_verification import EvidenceVerificationError
 from runner import SubprocessRunner, get_runner
@@ -179,7 +180,10 @@ def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None,
         # directive, for the provider that runs each step in one. Asking the
         # runner keeps the emitter from having to know how the workflow will be
         # executed.
-        snakemake = RUNNER.snakefile_preamble() + convert_to_snakemake(workflow)
+        step_logs = (make_step_log_names(len(workflow.nodes))
+                     if on_logs is not None else None)
+        snakemake = RUNNER.snakefile_preamble() + convert_to_snakemake(
+            workflow, step_logs=step_logs)
         # Same mapping as the upload loop. An upload named "Snakefile" -- or,
         # on a case-insensitive filesystem, "SNAKEFILE" -- occupies this slot
         # first, and O_EXCL then refuses the generated write. That is the right
@@ -200,11 +204,12 @@ def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None,
         code, out, err = run_snakemake(ws, on_start=on_start,
                                        on_finish=on_finish)
 
-        # Recorded before the failure path raises, because a failed run is
-        # exactly the one whose output someone needs. Reporting it only on
-        # success, or only as a 2000-character tail, was the whole of #6.
+        # Preserve logs even when the runner exits nonzero, before reporting
+        # the execution failure.
         if on_logs is not None:
-            on_logs(out, err, [node.id for node in workflow.nodes])
+            node_ids = [node.id for node in workflow.nodes]
+            on_logs(code, out, err, node_ids,
+                    read_node_logs(ws, node_ids, step_logs))
 
         if code != 0:
             raise HTTPException(
@@ -341,11 +346,14 @@ async def _execute(run_id: str, biochef_workflow: str, uploads):
     def finished():
         RUNS.detach(run_id)
 
-    def logs(stdout, stderr, node_ids):
+    def logs(exit_code, stdout, stderr, node_ids, node_logs):
         # Attributed here, where the emitter is already imported, so the run
         # store does not have to reach for it.
-        steps = failing_steps(stderr, node_ids, rule_name_for)
-        RUNS.record_logs(run_id, stdout, stderr, steps)
+        # A successful tool can print a Snakemake-looking error heading. Only
+        # parse a failed workflow, and only from the retained stderr tail.
+        steps = (failing_steps(clamp(stderr), node_ids, rule_name_for)
+                 if exit_code != 0 else {})
+        RUNS.record_logs(run_id, stdout, stderr, steps, node_logs)
 
     try:
         # Waits here while the service is busy, and the run stays QUEUED until a
@@ -515,18 +523,20 @@ async def cancel_run(run_id: str):
 
 @app.get("/runs/{run_id}/logs")
 async def get_run_logs(run_id: str):
-    """What the run printed, and which step snakemake blamed.
+    """Run-level output and separately captured output from each executed node.
 
-    Two halves, and the response says which is which rather than blurring them.
-    `steps` names the nodes that FAILED, because snakemake states that outright.
-    A step that succeeded is not separated out: its output is in `stdout` along
-    with everything else's, and nothing marks where one rule's writing ends.
-    Splitting that needs a log: directive per rule, which is the emitter's
-    business.
+    `stdout` and `stderr` are Snakemake's run-wide streams. `node_logs` has
+    stdout and stderr from separate files for each rule that started, including
+    a failing tool's actual stderr. Stdout already directed into a declared
+    scientific output remains in that output and is not copied into a log.
+    `steps` remains a diagnostic index of Snakemake-style error headings in the
+    run-wide stderr; tools can imitate those headings, so it is not proof of
+    failure or a substitute for `node_logs`.
 
-    Available while a run is still going, not only at the end -- there is no
-    reason to make someone wait for a fifteen-minute run to finish before seeing
-    what it has said so far.
+    Logs are recorded after the workflow process exits, before output collection
+    and the run's terminal state. They are not available during execution.
+    Each stream's retained per-node tails share BIOCHEF_MAX_LOG_BYTES across
+    nodes; log files on disk can grow until the run ends.
     """
     try:
         run = RUNS.get(run_id)
