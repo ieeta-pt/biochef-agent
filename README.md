@@ -44,6 +44,21 @@ the outputs once it is `COMPLETE`. States use the eight WES-style names in issue
 `QUEUED`, `INITIALIZING`, `RUNNING`, `COMPLETE`, `EXECUTOR_ERROR`,
 `SYSTEM_ERROR`, `CANCELING`, `CANCELED`. A complete WES API is separate work.
 
+`GET /runs/{run_id}/logs` returns Snakemake's run-wide `stdout` and `stderr`,
+plus `node_logs`: separate stdout and stderr captured for each rule that ran.
+A failing tool's own stderr is in its node's entry. Stdout that a recipe directs
+to a scientific output file stays in that output and is not copied into logs.
+The older `steps` field indexes Snakemake-style error headings in the run-wide
+stderr. It is a diagnostic hint, not proof of step identity; use `node_logs`
+for what each rule printed. Rules share a workspace, so these files are
+diagnostic records rather than tamper-proof audit evidence.
+
+It is not a stream. Snakemake's run-wide output is captured with `communicate()`,
+and per-rule log files are read when the workflow process exits. Logs therefore
+appear before the run reaches a terminal state, but not while tools are running.
+`/convert` keeps its existing shell command and failure response; per-rule
+capture applies to asynchronous `/runs` only.
+
 `POST /runs/{run_id}/cancel` stops one. A run still waiting for a slot has
 executed nothing, so it settles `CANCELED` without ever starting; a run that is
 executing has its process group ended — the tool and children that remain in
@@ -59,6 +74,16 @@ HTTP 503. A rejected request has no `run_id`; the caller can retry later.
 `/convert` and `/runs` share the same execution slots, though `/convert` still
 holds its HTTP connection open. Queued `/runs` jobs still hold their uploaded
 inputs in memory; the request-size limit is not an aggregate memory limit.
+
+**Budget for that.** At the defaults the two retained run-wide stream tails can
+reach 512 MiB — `BIOCHEF_MAX_RUNS` × `BIOCHEF_MAX_LOG_BYTES` × two streams.
+The per-node stdout and stderr tails share another two-stream budget per run,
+adding up to another 512 MiB at the defaults. A run also holds diagnostic
+error blocks and base64-encoded outputs. The runner still buffers complete
+run-wide streams before truncation, and per-rule log files can grow on disk
+until the run ends. This setting is a retention bound, not a peak resource
+limit. Logs may contain sensitive tool output; this prototype has no local
+log-release policy for TRE use.
 
 Both take the same fields:
 
@@ -123,6 +148,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_KEEP_WORKSPACE` | `false` | leave a run's directory behind, for debugging |
 | `BIOCHEF_MAX_UPLOAD_BYTES` | `536870912` | largest request body accepted, in bytes |
 | `BIOCHEF_MAX_RUNS` | `256` | maximum run records retained for polling |
+| `BIOCHEF_MAX_LOG_BYTES` | `1048576` | retained bytes per run-wide stream and shared budget per node-log stream, tail first |
 | `BIOCHEF_MAX_CONCURRENT_RUNS` | `4` | execution slots shared by `/runs` and `/convert`; admitted `/runs` jobs wait in `QUEUED` |
 | `BIOCHEF_AUTH` | `none` | who may call it: `none` or `bearer` |
 | `BIOCHEF_AUTH_TOKEN` | | the shared token, required when `BIOCHEF_AUTH=bearer` |

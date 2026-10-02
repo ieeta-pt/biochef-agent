@@ -16,7 +16,9 @@ from workspace import UnsafeName, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
 from runs import (IllegalTransition, RunCapacityError, RunState, RunStore,
                   TERMINAL, UnknownRun)
-from bodylimit import BodySizeLimitMiddleware
+from steplogs import (clamp, failing_steps, make_step_log_names,
+                      read_node_logs)
+from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
 from evidence_verification import EvidenceVerificationError
 from runner import SubprocessRunner, get_runner
 from signing import SignatureError
@@ -109,7 +111,7 @@ class BiochefWorkflow(BaseModel):
 
 
 def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None,
-                on_finish=None, cancel_requested=None):
+                on_finish=None, on_logs=None, cancel_requested=None):
     """One run, start to finish, given the uploads already read.
 
     Split out of the handler so the synchronous endpoint and the asynchronous one
@@ -178,7 +180,10 @@ def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None,
         # directive, for the provider that runs each step in one. Asking the
         # runner keeps the emitter from having to know how the workflow will be
         # executed.
-        snakemake = RUNNER.snakefile_preamble() + convert_to_snakemake(workflow)
+        step_logs = (make_step_log_names(len(workflow.nodes))
+                     if on_logs is not None else None)
+        snakemake = RUNNER.snakefile_preamble() + convert_to_snakemake(
+            workflow, step_logs=step_logs)
         # Same mapping as the upload loop. An upload named "Snakefile" -- or,
         # on a case-insensitive filesystem, "SNAKEFILE" -- occupies this slot
         # first, and O_EXCL then refuses the generated write. That is the right
@@ -196,8 +201,16 @@ def perform_run(biochef_workflow: str, uploads, progress=None, on_start=None,
             return None
 
         report(RunState.RUNNING)
-        code, _out, err = run_snakemake(ws, on_start=on_start,
-                                        on_finish=on_finish)
+        code, out, err = run_snakemake(ws, on_start=on_start,
+                                       on_finish=on_finish)
+
+        # Preserve logs even when the runner exits nonzero, before reporting
+        # the execution failure.
+        if on_logs is not None:
+            node_ids = [node.id for node in workflow.nodes]
+            on_logs(code, out, err, node_ids,
+                    read_node_logs(ws, node_ids, step_logs))
+
         if code != 0:
             raise HTTPException(
                 status_code=500,
@@ -333,6 +346,15 @@ async def _execute(run_id: str, biochef_workflow: str, uploads):
     def finished():
         RUNS.detach(run_id)
 
+    def logs(exit_code, stdout, stderr, node_ids, node_logs):
+        # Attributed here, where the emitter is already imported, so the run
+        # store does not have to reach for it.
+        # A successful tool can print a Snakemake-looking error heading. Only
+        # parse a failed workflow, and only from the retained stderr tail.
+        steps = (failing_steps(clamp(stderr), node_ids, rule_name_for)
+                 if exit_code != 0 else {})
+        RUNS.record_logs(run_id, stdout, stderr, steps, node_logs)
+
     try:
         # Waits here while the service is busy, and the run stays QUEUED until a
         # slot frees. Acquiring before anything else means a queued run has not
@@ -345,7 +367,7 @@ async def _execute(run_id: str, biochef_workflow: str, uploads):
                 return
             results = await run_in_threadpool(
                 perform_run, biochef_workflow, uploads, progress, started,
-                finished, lambda: _was_cancelled(run_id))
+                finished, logs, lambda: _was_cancelled(run_id))
     except HTTPException as refusal:
         if _was_cancelled(run_id):
             _advance(run_id, RunState.CANCELED)
@@ -497,3 +519,31 @@ async def cancel_run(run_id: str):
             pass
 
     return RUNS.get(run_id).as_dict()
+
+
+@app.get("/runs/{run_id}/logs")
+async def get_run_logs(run_id: str):
+    """Run-level output and separately captured output from each executed node.
+
+    `stdout` and `stderr` are Snakemake's run-wide streams. `node_logs` has
+    stdout and stderr from separate files for each rule that started, including
+    a failing tool's actual stderr. Stdout already directed into a declared
+    scientific output remains in that output and is not copied into a log.
+    `steps` remains a diagnostic index of Snakemake-style error headings in the
+    run-wide stderr; tools can imitate those headings, so it is not proof of
+    failure or a substitute for `node_logs`.
+
+    Logs are recorded after the workflow process exits, before output collection
+    and the run's terminal state. They are not available during execution.
+    Each stream's retained per-node tails share BIOCHEF_MAX_LOG_BYTES across
+    nodes; log files on disk can grow until the run ends.
+    """
+    try:
+        run = RUNS.get(run_id)
+    except UnknownRun:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no run {run_id!r}; it never existed, or it finished long "
+                   f"enough ago to have been forgotten",
+        )
+    return run.logs_as_dict()

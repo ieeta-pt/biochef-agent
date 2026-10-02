@@ -15,6 +15,8 @@ import threading
 import uuid
 from collections import OrderedDict
 from enum import Enum
+
+from steplogs import clamp
 from typing import Optional
 
 
@@ -92,6 +94,10 @@ class Run:
         self.state = RunState.QUEUED
         self.outputs = None
         self.error = None
+        self.stdout = ""
+        self.stderr = ""
+        self.steps = {}
+        self.node_logs = {}
         self.pgid = None
         """The process group executing this run, once there is one.
 
@@ -99,6 +105,22 @@ class Run:
         state alone. A run that has started needs the group ended, which is the
         same lever the timeout pulls.
         """
+
+    def logs_as_dict(self) -> dict:
+        """Run-level output, diagnostic error blocks, and per-node output.
+
+        `steps` is populated only on a failed workflow, from Snakemake-style
+        stderr headings. Tool output can imitate those headings. `node_logs`
+        comes from separate files opened for each executed rule.
+        """
+        return {
+            "run_id": self.run_id,
+            "state": self.state.value,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "steps": self.steps,
+            "node_logs": self.node_logs,
+        }
 
     def as_dict(self) -> dict:
         """What a caller is told about this run.
@@ -187,6 +209,24 @@ class RunStore:
                 run.pgid = pgid
                 return run.state is RunState.CANCELING
             return False
+
+    def record_logs(self, run_id: str, stdout, stderr, steps,
+                    node_logs=None) -> None:
+        """Keep bounded stream tails, node logs, and diagnostic blocks.
+
+        The attribution arrives finished rather than being worked out here.
+        Doing it in this module would mean importing the emitter for its rule
+        naming, and the emitter builds a registry client at import -- so asking
+        a run store what state a run is in would open a connection.
+        """
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                return
+            run.stdout = clamp(stdout)
+            run.stderr = clamp(stderr)
+            run.steps = steps
+            run.node_logs = node_logs or {}
 
     def detach(self, run_id: str) -> None:
         """Forget the process group, because it no longer exists.
