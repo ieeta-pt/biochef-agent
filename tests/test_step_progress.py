@@ -11,10 +11,10 @@ running, or waiting, or finished successfully, is indistinguishable from a step
 that does not exist.
 
 The other one is why the first cannot simply be fixed in the store. The runner
-captures output with communicate(), which buffers until the workflow process
-exits. So there is nothing to read while the tools are running -- not a little,
-none -- and any per-step state derived from that output could only appear after
-the entire run had finished, which is exactly when nobody needs it painted.
+collects output with communicate(), which returns it only after the workflow
+process exits. So there is nothing available to the handler while tools are
+running, and any per-step state derived after communicate() returns would arrive
+when nobody needs it painted.
 
 Snakemake does report as it goes. Confirmed against 9.21, it prints
 
@@ -22,8 +22,8 @@ Snakemake does report as it goes. Confirmed against 9.21, it prints
     Finished jobid: 2 (Rule: step_one)
     1 of 3 steps (33%) done
 
-so the transitions are all there, arriving in real time, into a pipe nobody
-reads until the end.
+so the transitions are all there, arriving in real time, but the handler receives
+the collected text only after execution.
 """
 
 import inspect
@@ -90,10 +90,9 @@ def test_the_only_per_step_information_is_which_ones_failed():
 def test_the_output_is_read_as_it_arrives():
     """Which is what makes per-step state possible at all.
 
-    communicate() returns only when the process ends, so while it was used
-    nothing could be reported about a run in progress. Both streams are drained
-    by their own reader now -- both, because draining one and not the other is
-    the deadlock communicate() exists to avoid.
+    communicate() returns only when the process ends, so it gives the handler
+    no per-line callback while a run is in progress. Both streams are now read
+    by their own reader thread, so neither pipe can fill and block the child.
     """
     source = inspect.getsource(runner_module.Runner.run)
     assert "process.communicate(timeout=timeout_s)" not in source
@@ -240,6 +239,8 @@ def test_a_polled_run_carries_per_step_status_before_it_finishes(tmp_path,
 
     def emitting(ws, timeout_s=None, on_start=None, on_finish=None, on_line=None):
         on_line("stderr", "localrule tool_1:\n")
+        # Stdout must not complete the running node.
+        on_line("stdout", "Finished jobid: 1 (Rule: tool_1)\n")
         started.set()
         release.wait(15)
         on_line("stderr", "Finished jobid: 1 (Rule: tool_1)\n")
@@ -289,4 +290,5 @@ def test_a_polled_run_carries_per_step_status_before_it_finishes(tmp_path,
 
         assert body["steps"]["tool-1"] == "COMPLETE", body
     finally:
+        release.set()
         convert.tools.clear()

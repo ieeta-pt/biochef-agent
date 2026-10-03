@@ -28,9 +28,8 @@ None of that is built yet. What exists today is the single endpoint below.
 
 ## The contract
 
-`openapi.json` in this repository is the source of truth, generated from the
-service itself (`python ci/export_openapi.py`) and checked by the suite, so it
-cannot drift.
+`openapi.json` is generated from the service (`python ci/export_openapi.py`)
+and checked by the suite, so the committed contract cannot drift.
 
 Two ways to run the same workflow.
 
@@ -41,47 +40,61 @@ contract the editor speaks today.
 
 **Asynchronously.** `POST /runs` takes the same two fields and answers `202`
 immediately with a `run_id`. `GET /runs/{run_id}` reports the state, and carries
-the outputs once it is `COMPLETE`. States are GA4GH WES's vocabulary verbatim —
+the outputs once it is `COMPLETE`. States use the eight WES-style names in issue #5 —
 `QUEUED`, `INITIALIZING`, `RUNNING`, `COMPLETE`, `EXECUTOR_ERROR`,
-`SYSTEM_ERROR`, `CANCELING`, `CANCELED` — so exposing this as a WES endpoint
-later is an adapter rather than a rewrite.
+`SYSTEM_ERROR`, `CANCELING`, `CANCELED`. A complete WES API is separate work.
 
 `GET /runs/{run_id}` carries `steps` while the run is happening — one of
-`PENDING`, `RUNNING`, `COMPLETE`, `FAILED` per node, which is what the editor
-paints. Snakemake announces each job as it starts and finishes, and the agent
-reads its output as it arrives rather than at the end, so a node changes colour
-while the work is going on. A node nobody has mentioned is `PENDING`, which is
+`PENDING`, `RUNNING`, `COMPLETE`, `FAILED` per node, which an editor can use to
+colour nodes. Snakemake announces each job as it starts and finishes, and the
+agent publishes those changes before the run ends for clients polling this
+endpoint. A node nobody has mentioned is `PENDING`, which is
 what snakemake implies by saying nothing about a job until it starts it.
+These are the last states announced by the engine. Cancellation can leave a
+step marked `RUNNING`; the run's terminal state takes precedence in the UI.
 
-`GET /runs/{run_id}/logs` returns what the run printed, plus `failed_steps`,
-naming the nodes that failed and what snakemake said about each.
+`GET /runs/{run_id}/logs` returns Snakemake's run-wide `stdout` and `stderr`,
+plus `node_logs`: separate stdout and stderr captured for each rule that ran.
+A failing tool's own stderr is in its node's entry. Stdout that a recipe directs
+to a scientific output file stays in that output and is not copied into logs.
+`failed_steps` indexes Snakemake-style error headings in the run-wide stderr
+(called `steps` in #67). It is a diagnostic hint, not proof of step identity; use `node_logs`
+for what each rule printed. Rules share a workspace, so these files are
+diagnostic records rather than tamper-proof audit evidence.
 
-**The logs are not streamed, though the progress is.** They are recorded in one
-go when the workflow process exits — readable while the run is still finishing,
-but not during it. The two differ because progress is a handful of state
-transitions and the logs are unbounded output; flushing every line into the run
-store would take a lock per line. Following the output live is a separate piece
-of work. A step that succeeded is not separated out:
-its output is in `stdout` along with everything else's, and nothing in
-snakemake's output marks where one rule's writing ends. Splitting that needs a
-`log:` directive per rule, which is emitter work.
+**The logs are not streamed, though progress is updated live.** The runner
+drains both pipes as output arrives, using the engine's stderr announcements
+for progress. Run-wide output is recorded and per-rule log files are read when
+the workflow process exits. Logs therefore appear before the run reaches a
+terminal state, but not while tools are running.
+`/convert` keeps its existing shell command and failure response; per-rule
+capture applies to asynchronous `/runs` only.
 
 `POST /runs/{run_id}/cancel` stops one. A run still waiting for a slot has
 executed nothing, so it settles `CANCELED` without ever starting; a run that is
-executing has its whole process group ended — the tool and anything it spawned,
-the same lever the timeout pulls. The reply is `CANCELING`, because the kill has
-been issued but the run is not over until the worker has tidied up and said so.
-A cancelled run returns no outputs even if the work finished anyway.
+executing has its process group ended — the tool and children that remain in
+that group, using the same lever as the timeout. The reply is normally
+`CANCELING` while the worker tidies up, but may already be `CANCELED` if it
+finishes before the response. A cancelled run returns no outputs even if the
+work finished anyway.
 
 Runs are held in memory: nothing survives a restart, and nothing is shared
-between replicas. `BIOCHEF_MAX_RUNS` bounds how many are remembered, and a run
-still in flight is never forgotten.
+between replicas. `BIOCHEF_MAX_RUNS` bounds how many are remembered; finished
+runs are evicted first, while a full set of active runs refuses new work with
+HTTP 503. A rejected request has no `run_id`; the caller can retry later.
+`/convert` and `/runs` share the same execution slots, though `/convert` still
+holds its HTTP connection open. Queued `/runs` jobs still hold their uploaded
+inputs in memory; the request-size limit is not an aggregate memory limit.
 
-**Budget for that.** At the defaults the logs alone can reach 512 MiB —
-`BIOCHEF_MAX_RUNS` × `BIOCHEF_MAX_LOG_BYTES` × two streams — and each remembered
-run also holds its outputs, base64-encoded, bounded only by how many runs are
-kept. A deployment that returns large outputs should lower `BIOCHEF_MAX_RUNS`,
-`BIOCHEF_MAX_LOG_BYTES`, or both.
+**Budget for that.** At the defaults the two retained run-wide stream tails can
+reach 512 MiB — `BIOCHEF_MAX_RUNS` × `BIOCHEF_MAX_LOG_BYTES` × two streams.
+The per-node stdout and stderr tails share another two-stream budget per run,
+adding up to another 512 MiB at the defaults. A run also holds diagnostic
+error blocks and base64-encoded outputs. The runner still buffers complete
+run-wide streams before truncation, and per-rule log files can grow on disk
+until the run ends. This setting is a retention bound, not a peak resource
+limit. Logs may contain sensitive tool output; this prototype has no local
+log-release policy for TRE use.
 
 Both take the same fields:
 
@@ -153,15 +166,19 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_RUN_TIMEOUT` | `900` | seconds before a run's whole process group is killed |
 | `BIOCHEF_KEEP_WORKSPACE` | `false` | leave a run's directory behind, for debugging |
 | `BIOCHEF_MAX_UPLOAD_BYTES` | `536870912` | largest request body accepted, in bytes |
-| `BIOCHEF_MAX_RUNS` | `256` | how many runs are remembered for polling |
-| `BIOCHEF_MAX_LOG_BYTES` | `1048576` | how much of a run's output is kept, tail first |
-| `BIOCHEF_MAX_CONCURRENT_RUNS` | `4` | how many runs execute at once; the rest wait in `QUEUED` |
+| `BIOCHEF_MAX_RUNS` | `256` | maximum run records retained for polling |
+| `BIOCHEF_MAX_LOG_BYTES` | `1048576` | retained bytes per run-wide stream and shared budget per node-log stream, tail first |
+| `BIOCHEF_MAX_CONCURRENT_RUNS` | `4` | execution slots shared by `/runs` and `/convert`; admitted `/runs` jobs wait in `QUEUED` |
 | `BIOCHEF_AUTH` | `none` | who may call it: `none` or `bearer` |
 | `BIOCHEF_AUTH_TOKEN` | | the shared token, required when `BIOCHEF_AUTH=bearer` |
 | `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess` or `apptainer` |
 | `BIOCHEF_CONTAINER_IMAGE` | `docker://debian:stable-slim` | image each step runs in, under the `apptainer` runner |
 | `BIOCHEF_APPTAINER_CACHE` | `apptainer-cache` | where pulled container images are kept between runs |
-| `BIOCHEF_APPTAINER_ARGS` | `--contain` | extra flags for apptainer itself |
+| `BIOCHEF_APPTAINER_ARGS` | `--contain --cleanenv` | extra flags for apptainer itself |
+| `BIOCHEF_SIGNING_MODE` | `off` | `off`, `warn`, or `strict` — whether a bundle must be signed to run |
+| `BIOCHEF_SIGNING_POLICY` | *(unset)* | path to the Hub's `biochef.signing-policy.v1` document |
+| `BIOCHEF_COSIGN` | `cosign` | the cosign executable to verify with |
+| `BIOCHEF_SLSA_VERIFIER` | `slsa-verifier` | the SLSA Verifier executable to verify official provenance with |
 
 `BIOCHEF_AUTH` defaults to `none`, which means **any caller that can open a
 socket to this service can make it execute tool binaries**. That is a reasonable
@@ -193,6 +210,25 @@ instead. The container is the boundary between an untrusted tool binary and the
 machine, so on any deployment holding data that matters, `apptainer` is the
 setting you want.
 
+`BIOCHEF_SIGNING_MODE` defaults to `off`, which is what this service did before
+it could verify anything and is named so that it reads as a decision. The Hub
+signs and attests every bundle it publishes; `strict` makes a bundle that does
+not carry a signature this policy accepts refuse to run, which is what a TRE
+needs. `warn` verifies and reports but runs anyway, which is how you find out
+what your catalogue actually looks like before switching it on.
+
+`strict` fails closed in every direction: no cosign on `PATH`, no policy, an
+unreadable policy, a reference outside the policy's own registry prefix, or a
+manifest whose digest could not be established are all refusals. A verification
+step that passes when it could not run is worse than none, because it is
+believed.
+
+In `strict`, the caller must provide an immutable digest, and the Agent also
+checks the CycloneDX and SLSA evidence against the files it executes.
+Cosign and SLSA Verifier must be installed in the Agent's environment; the Agent
+does not download them at runtime. `warn` reports failed checks and
+continues, while `off` preserves the previous local-development behaviour.
+
 `BIOCHEF_CONTAINER_IMAGE` must carry a scheme — `docker://`, `oras://`,
 `library://`, `shub://`, `http://`, `https://` — or be an absolute path to a
 `.sif`. A value without one is not a registry reference to snakemake; it is a
@@ -209,11 +245,7 @@ not, and base-image security updates never arrive. A digest —
 which is the only way that cache invalidates. Deleting `apptainer-cache/` forces
 a re-pull in the meantime.
 
-`BIOCHEF_APPTAINER_ARGS` defaults to `--contain` because apptainer otherwise
-binds the host's `/tmp` into the container, and that is where a run's directory
-lives unless `BIOCHEF_RUN_ROOT` says otherwise. Without it, a containerised tool
-is walled off from `/usr` and `/etc` while still able to read **every other
-run's data**. Emptying this variable turns that off deliberately.
+`BIOCHEF_APPTAINER_ARGS` defaults to `--contain --cleanenv`. Without `--contain`, apptainer binds the host's `/tmp` into the container, and that is where a run's directory lives unless `BIOCHEF_RUN_ROOT` says otherwise. Without it, a containerised tool is walled off from `/usr` and `/etc` while still able to read **every other run's data**. Without `--cleanenv`, the tool process also inherits the Agent's environment. Emptying this variable turns both protections off deliberately.
 
 ## How a request is served
 
