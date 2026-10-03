@@ -108,7 +108,7 @@
   "paths": {
     "/convert": {
       "post": {
-        "description": "Unchanged: the whole run happens inside this request.\n\nKept as it was because it is the contract the editor speaks today. /runs is\nthe same work without the wait.",
+        "description": "The editor's synchronous contract, sharing the execution limit.\n\nKept as it was because it is the contract the editor speaks today. /runs is\nthe same work without the wait.",
         "operationId": "convert_convert_post",
         "requestBody": {
           "content": {
@@ -175,6 +175,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "description": "Agent capacity reached; retry later"
           }
         },
         "summary": "Submit Run"
@@ -220,7 +223,7 @@
     },
     "/runs/{run_id}/cancel": {
       "post": {
-        "description": "Ask a run to stop, and end the processes doing it.\n\nThe path is WES's, so exposing this as a WES endpoint later (F5) does not\nmove it.\n\nTwo shapes of run, and they differ. One waiting for a slot has executed\nnothing, so cancelling it is a matter of state: it settles CANCELED when its\nturn comes and it declines to start. One that is running has a process\ngroup, and that group is ended -- the tool and everything it spawned,\nexactly as the timeout does it, because a tool that spawns children and\nsurvives its parent is the reason group-killing is there at all.\n\nThe reply is CANCELING rather than CANCELED, and that is not evasion: the\nkill has been issued, but the run is not over until the worker has finished\ntidying up and said so. Reporting CANCELED here would be claiming something\nthat has not happened yet.",
+        "description": "Ask a run to stop, and end the processes doing it.\n\nThe path is WES's, so exposing this as a WES endpoint later (F5) does not\nmove it.\n\nTwo shapes of run, and they differ. One waiting for a slot has executed\nnothing, so cancelling it is a matter of state: it settles CANCELED when its\nturn comes and it declines to start. One that is running has a process\ngroup, and that group is ended -- the tool and children that remain in the\ngroup, exactly as the timeout does it.\n\nThe reply is normally CANCELING while the worker tidies up. It may already\nbe CANCELED if the worker finishes before the response; CANCELED is only\nrecorded after cleanup.",
         "operationId": "cancel_run_runs__run_id__cancel_post",
         "parameters": [
           {
@@ -258,7 +261,7 @@
     },
     "/runs/{run_id}/logs": {
       "get": {
-        "description": "What the run printed, and which step snakemake blamed.\n\nTwo halves, and the response says which is which rather than blurring them.\n`steps` names the nodes that FAILED, because snakemake states that outright.\nA step that succeeded is not separated out: its output is in `stdout` along\nwith everything else's, and nothing marks where one rule's writing ends.\nSplitting that needs a log: directive per rule, which is the emitter's\nbusiness.\n\nAvailable while a run is still going, not only at the end -- there is no\nreason to make someone wait for a fifteen-minute run to finish before seeing\nwhat it has said so far.",
+        "description": "Run-level output and separately captured output from each executed node.\n\n`stdout` and `stderr` are Snakemake's run-wide streams. `node_logs` has\nstdout and stderr from separate files for each rule that started, including\na failing tool's actual stderr. Stdout already directed into a declared\nscientific output remains in that output and is not copied into a log.\n`failed_steps` is a diagnostic index of Snakemake-style error headings in the\nrun-wide stderr; tools can imitate those headings, so it is not proof of\nfailure or a substitute for `node_logs`.\n\nLogs are recorded after the workflow process exits, before output collection\nand the run's terminal state. They are not available during execution.\nEach stream's retained per-node tails share BIOCHEF_MAX_LOG_BYTES across\nnodes; log files on disk can grow until the run ends.",
         "operationId": "get_run_logs_runs__run_id__logs_get",
         "parameters": [
           {

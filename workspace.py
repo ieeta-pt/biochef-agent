@@ -29,6 +29,7 @@ import errno
 import os
 import re
 import shutil
+import stat
 import tempfile
 
 SAFE_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -132,8 +133,15 @@ class Workspace:
         flags = os.O_WRONLY | os.O_CREAT | (os.O_EXCL if exclusive else os.O_TRUNC)
         return os.fdopen(self._open(name, flags), "wb")
 
-    def open_read(self, name: str):
-        return os.fdopen(self._open(name, os.O_RDONLY), "rb")
+    def open_read(self, name: str, *, regular_only: bool = False):
+        # A tool can replace a log with a FIFO; a blocking open would hang the
+        # run before its file type could be checked.
+        flags = os.O_RDONLY | (os.O_NONBLOCK if regular_only else 0)
+        fd = self._open(name, flags)
+        if regular_only and not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise UnsafeName(f"{name!r} is not a regular file")
+        return os.fdopen(fd, "rb")
 
     def write_bytes(self, name: str, data: bytes, *, exclusive: bool = True) -> int:
         with self.open_write(name, exclusive=exclusive) as fh:
@@ -149,6 +157,16 @@ class Workspace:
             self.write_bytes(name, src.read())
         os.chmod(name, 0o700, dir_fd=self._fd)
         return os.path.join(self.path, name)
+
+    def close(self) -> None:
+        """Release the directory descriptor without deleting the workspace."""
+        if self._fd is None:
+            return
+        fd, self._fd = self._fd, None
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
     def cleanup(self) -> None:
         """Remove the workspace, but only if the path still refers to it.
@@ -170,10 +188,7 @@ class Workspace:
         except OSError:
             same = False
 
-        try:
-            os.close(self._fd)
-        except OSError:
-            pass
+        self.close()
 
         if same:
             shutil.rmtree(self.path, ignore_errors=True)
