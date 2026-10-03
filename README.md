@@ -44,18 +44,29 @@ the outputs once it is `COMPLETE`. States use the eight WES-style names in issue
 `QUEUED`, `INITIALIZING`, `RUNNING`, `COMPLETE`, `EXECUTOR_ERROR`,
 `SYSTEM_ERROR`, `CANCELING`, `CANCELED`. A complete WES API is separate work.
 
+`GET /runs/{run_id}` carries `steps` while the run is happening — one of
+`PENDING`, `RUNNING`, `COMPLETE`, `FAILED` per node, which an editor can use to
+colour nodes. Snakemake announces each job as it starts and finishes, and the
+agent publishes those changes before the run ends for clients polling this
+endpoint. A node nobody has mentioned is `PENDING`, which is
+what snakemake implies by saying nothing about a job until it starts it.
+These are the last states announced by the engine. Cancellation can leave a
+step marked `RUNNING`; the run's terminal state takes precedence in the UI.
+
 `GET /runs/{run_id}/logs` returns Snakemake's run-wide `stdout` and `stderr`,
 plus `node_logs`: separate stdout and stderr captured for each rule that ran.
 A failing tool's own stderr is in its node's entry. Stdout that a recipe directs
 to a scientific output file stays in that output and is not copied into logs.
-The older `steps` field indexes Snakemake-style error headings in the run-wide
-stderr. It is a diagnostic hint, not proof of step identity; use `node_logs`
+`failed_steps` indexes Snakemake-style error headings in the run-wide stderr
+(called `steps` in #67). It is a diagnostic hint, not proof of step identity; use `node_logs`
 for what each rule printed. Rules share a workspace, so these files are
 diagnostic records rather than tamper-proof audit evidence.
 
-It is not a stream. Snakemake's run-wide output is captured with `communicate()`,
-and per-rule log files are read when the workflow process exits. Logs therefore
-appear before the run reaches a terminal state, but not while tools are running.
+**The logs are not streamed, though progress is updated live.** The runner
+drains both pipes as output arrives, using the engine's stderr announcements
+for progress. Run-wide output is recorded and per-rule log files are read when
+the workflow process exits. Logs therefore appear before the run reaches a
+terminal state, but not while tools are running.
 `/convert` keeps its existing shell command and failure response; per-rule
 capture applies to asynchronous `/runs` only.
 

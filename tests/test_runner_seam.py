@@ -12,8 +12,10 @@ right and the part whose absence is invisible until a tool is left running.
 """
 
 import inspect
+import io
 import os
 import signal
+import threading
 import time
 import sys
 import types
@@ -136,7 +138,7 @@ def test_no_provider_reimplements_the_kill(tmp_path):
             f"the group-kill with every other provider"
         )
     base = inspect.getsource(Runner.run)
-    assert "os.killpg" in base
+    assert "_kill_group" in base
     assert "start_new_session=True" in base
 
 
@@ -149,29 +151,36 @@ def test_the_configured_timeout_is_the_one_applied(monkeypatch, tmp_path):
     which for a service that exists partly to stop a hanging tool is the wrong
     thing to be vague about.
 
-    My first attempt at this asserted on elapsed wall-clock, and a doubled
-    timeout slipped under the bound anyway -- any bound loose enough to survive
-    a loaded machine is loose enough to hide a factor of two. Recording what is
-    actually handed to communicate() is exact and cannot flake.
+    A stopwatch assertion flakes on a loaded machine. Recording the timeout
+    handed to the parent wait checks the configured bound directly.
     """
     import runner as runner_module
 
     seen = {}
 
     class _FakePopen:
-        def __init__(self, argv, **kwargs):
-            self.pid = os.getpid()      # so os.getpgid() has something real
-            self.returncode = 0
+        """Enough of a Popen for the runner: two streams and a wait().
 
-        def communicate(self, timeout=None):
+        The runner reads the pipes itself now rather than calling communicate,
+        so a stand-in needs stdout and stderr that end immediately.
+        """
+
+        def __init__(self, argv, **kwargs):
+            self.pid = os.getpid()      # getpgid is replaced with a fake below
+            self.returncode = 0
+            self.stdout = io.StringIO("")
+            self.stderr = io.StringIO("")
+
+        def wait(self, timeout=None):
             seen["timeout"] = timeout
-            return ("", "")
+            return 0
 
     monkeypatch.setattr(runner_module.subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(runner_module.os, "getpgid", lambda pid: 2**30)
     _SleepRunner().run(_Workspace(tmp_path), timeout_s=11)
 
     assert seen["timeout"] == 11, (
-        f"the run was bounded at {seen['timeout']!r}, not the configured 11"
+        f"the parent wait was bounded at {seen['timeout']!r}, not configured 11"
     )
 
 
@@ -215,7 +224,8 @@ def test_the_service_runs_through_the_runner_it_resolved(monkeypatch, tmp_path):
         def command(self, ws):
             return ["true"]
 
-        def run(self, ws, timeout_s, on_start=None, on_finish=None):
+        def run(self, ws, timeout_s, on_start=None, on_finish=None,
+                on_line=None):
             used["ws"] = ws
             used["timeout_s"] = timeout_s
             return RunResult(0, "", "")
@@ -308,9 +318,11 @@ def test_failed_start_callback_does_not_leave_the_group_running(tmp_path):
         seen.append(pgid)
         raise RuntimeError("registration failed")
 
+    finished = []
     with pytest.raises(RuntimeError, match="registration failed"):
         _NeverEnds().run(_Workspace(tmp_path), timeout_s=30,
-                         on_start=cannot_register)
+                         on_start=cannot_register,
+                         on_finish=lambda: finished.append(True))
 
     assert seen
     deadline = time.time() + 5
@@ -326,6 +338,40 @@ def test_failed_start_callback_does_not_leave_the_group_running(tmp_path):
         except ProcessLookupError:
             pass
         pytest.fail("the callback failure left a process group running")
+    assert finished == [True]
+
+
+def test_a_reader_start_failure_does_not_leave_the_group_running(
+        tmp_path, monkeypatch):
+    real_start = threading.Thread.start
+    attempts = []
+
+    def fail_second_start(thread):
+        attempts.append(thread)
+        if len(attempts) == 2:
+            raise RuntimeError("reader could not start")
+        return real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_second_start)
+    handed_out = []
+    finished = []
+    with pytest.raises(RuntimeError, match="reader could not start"):
+        _NeverEnds().run(_Workspace(tmp_path), timeout_s=30,
+                         on_start=handed_out.append,
+                         on_finish=lambda: finished.append(True))
+
+    assert len(attempts) == 2
+    assert handed_out
+    assert finished == [True]
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            os.killpg(handed_out[0], 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("reader startup failure left the process group running")
 
 
 def test_an_unexpected_failure_does_not_leave_the_group_running(tmp_path,
@@ -344,18 +390,23 @@ def test_an_unexpected_failure_does_not_leave_the_group_running(tmp_path,
     import subprocess
 
     handed_out = []
-    real_communicate = subprocess.Popen.communicate
+    real_wait = subprocess.Popen.wait
 
-    def broken(self, *a, **k):
-        raise OSError("the pipe broke")
+    calls = []
 
-    monkeypatch.setattr(subprocess.Popen, "communicate", broken)
+    def broken_once(self, *a, **k):
+        calls.append(True)
+        if len(calls) == 1:
+            raise OSError("the pipe broke")
+        return real_wait(self, *a, **k)
+
+    # wait(), not communicate(): the runner reads the pipes itself and waits on
+    # the process, so this is where an unexpected failure now comes from.
+    monkeypatch.setattr(subprocess.Popen, "wait", broken_once)
 
     with pytest.raises(OSError):
         _NeverEnds().run(_Workspace(tmp_path), timeout_s=30,
                          on_start=handed_out.append)
-
-    monkeypatch.setattr(subprocess.Popen, "communicate", real_communicate)
 
     assert handed_out, "the run never started"
     pgid = handed_out[0]
@@ -385,3 +436,232 @@ def test_an_unexpected_failure_does_not_leave_the_group_running(tmp_path,
         f"process group {pgid} is still running after run() failed, and its id "
         f"has already been handed back -- nothing can stop it now"
     )
+
+
+def test_a_descendant_holding_output_pipes_cannot_outlive_success(tmp_path):
+    """The timeout also bounds pipe draining after the command's parent exits."""
+    import time as _time
+
+    class _LeavesChild(Runner):
+        name = "leaves-child-for-test"
+
+        def command(self, ws):
+            return ["sh", "-c", "sleep 30 & exit 0"]
+
+    handed_out = []
+    started = _time.monotonic()
+    result = _LeavesChild().run(_Workspace(tmp_path), timeout_s=0.3,
+                                on_start=handed_out.append)
+    elapsed = _time.monotonic() - started
+
+    assert result.returncode != 0, "parent exit was reported as successful"
+    assert elapsed < 3, f"reader drain exceeded the configured timeout: {elapsed}s"
+    assert handed_out
+    deadline = _time.monotonic() + 5
+    while _time.monotonic() < deadline:
+        try:
+            os.killpg(handed_out[0], 0)
+        except ProcessLookupError:
+            break
+        _time.sleep(0.05)
+    else:
+        pytest.fail("the descendant remained in the run's process group")
+
+
+def test_timeout_cleanup_does_not_wait_forever_for_a_line_callback(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _WritesThenWaits(Runner):
+        def command(self, ws):
+            return [sys.executable, "-c",
+                    "import time; print('started', flush=True); time.sleep(30)"]
+
+    def blocked_callback(stream, line):
+        entered.set()
+        release.wait()
+
+    # Release even a broken runner, so the regression fails instead of hanging.
+    watchdog = threading.Timer(15, release.set)
+    watchdog.start()
+    started = time.monotonic()
+    try:
+        result = _WritesThenWaits().run(
+            _Workspace(tmp_path), timeout_s=0.3, on_line=blocked_callback)
+        assert entered.is_set()
+        assert result.returncode != 0
+        assert time.monotonic() - started < 13
+    finally:
+        release.set()
+        watchdog.cancel()
+        watchdog.join()
+
+
+def test_invalid_utf8_does_not_stop_log_capture(tmp_path):
+    class _BinaryOutput(Runner):
+        name = "binary-output-for-test"
+
+        def command(self, ws):
+            return [sys.executable, "-c",
+                    "import os; os.write(1, b'good\\xff\\n'); os.write(2, b'bad\\xfe\\n')"]
+
+    result = _BinaryOutput().run(_Workspace(tmp_path), timeout_s=5)
+
+    assert result.returncode == 0
+    assert result.stdout == "good\ufffd\n"
+    assert result.stderr == "bad\ufffd\n"
+
+
+def test_a_reader_error_is_raised_after_runner_cleanup(monkeypatch, tmp_path):
+    import runner as runner_module
+
+    class _BrokenStream:
+        def __iter__(self):
+            raise OSError("reader failed")
+
+        def close(self):
+            pass
+
+    class _FakePopen:
+        pid = 123456789
+        returncode = 0
+        stdout = _BrokenStream()
+        stderr = io.StringIO("")
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(runner_module.os, "getpgid", lambda pid: pid)
+    killed = []
+    monkeypatch.setattr(runner_module, "_kill_group", killed.append)
+    finished = []
+
+    with pytest.raises(OSError, match="reader failed"):
+        _SleepRunner().run(_Workspace(tmp_path), timeout_s=5,
+                           on_finish=lambda: finished.append(True))
+
+    assert killed == [_FakePopen.pid]
+    assert finished == [True]
+
+
+# --------------------------------------------------------------------------
+# streaming, which is what makes per-step progress possible (#8)
+
+
+class _Chatty(Runner):
+    """A provider that writes to both streams and then exits."""
+
+    name = "chatty-for-test"
+
+    def command(self, ws):
+        return ["sh", "-c",
+                "echo out-one; echo err-one >&2; echo out-two; echo err-two >&2"]
+
+
+def test_the_runner_reports_each_line_as_it_reads_it(tmp_path):
+    """Nothing else drives this.
+
+    The progress tests stub run_snakemake and call on_line themselves, so
+    removing the callback from the real runner went unnoticed by every one of
+    them -- the same blind spot that hid the pgid hand-out and the hand-back.
+    """
+    seen = []
+
+    result = _Chatty().run(_Workspace(tmp_path), timeout_s=30,
+                           on_line=lambda stream, line: seen.append(
+                               (stream, line.strip())))
+
+    assert result.returncode == 0
+    assert ("stdout", "out-one") in seen, seen
+    assert ("stderr", "err-one") in seen, seen
+    assert {stream for stream, _ in seen} == {"stdout", "stderr"}, (
+        "both streams must be reported, and each labelled with which it was"
+    )
+
+
+def test_a_failure_in_the_line_callback_does_not_take_the_run_with_it(tmp_path):
+    """Reporting is not the job; running the workflow is.
+
+    A defect in whatever is watching the output must not turn a successful run
+    into a failed one, and the line must still be collected.
+    """
+    def explodes(stream, line):
+        raise RuntimeError("the watcher is broken")
+
+    result = _Chatty().run(_Workspace(tmp_path), timeout_s=30, on_line=explodes)
+
+    assert result.returncode == 0
+    # Every line, not just the first. The reader appends before it reports, so
+    # asserting only on line one passed even when the exception killed the
+    # reader thread and every later line was lost.
+    for expected in ("out-one", "out-two"):
+        assert expected in result.stdout, f"{expected} missing: {result.stdout!r}"
+    for expected in ("err-one", "err-two"):
+        assert expected in result.stderr, f"{expected} missing: {result.stderr!r}"
+
+
+class _Verbose(Runner):
+    """A provider that writes more than fits in a pipe buffer."""
+
+    name = "verbose-for-test"
+
+    def command(self, ws):
+        return ["sh", "-c", "i=0; while [ $i -lt 2000 ]; do "
+                            "echo \"line-$i\"; echo \"err-$i\" >&2; "
+                            "i=$((i+1)); done"]
+
+
+def test_every_line_is_collected_even_when_there_are_many(tmp_path):
+    """Two things at once, and both have bitten real programs.
+
+    Draining one pipe and not the other deadlocks as soon as the undrained one
+    fills -- which is the whole reason communicate() exists. And returning
+    before the readers have finished loses the tail, because the process can
+    exit while its output is still in flight.
+    """
+    result = _Verbose().run(_Workspace(tmp_path), timeout_s=60)
+
+    assert result.returncode == 0
+    assert result.stdout.count("\n") == 2000, (
+        f"{result.stdout.count(chr(10))} of 2000 stdout lines survived"
+    )
+    assert result.stderr.count("\n") == 2000, (
+        f"{result.stderr.count(chr(10))} of 2000 stderr lines survived"
+    )
+    assert "line-1999" in result.stdout, "the tail was lost"
+    assert "err-1999" in result.stderr, "the tail was lost"
+
+
+def test_output_still_in_flight_when_the_process_exits_is_not_lost(tmp_path):
+    """The readers are joined before the result is built.
+
+    A process can exit while its output is still being read, and returning at
+    that moment loses whatever had not been consumed yet. Ordinarily the readers
+    win the race and nothing is missing, which is why dropping the join passed
+    every other test here -- so this makes them lose it, by slowing the callback
+    down until the process is long gone.
+    """
+    import time as _time
+
+    class _Burst(Runner):
+        name = "burst-for-test"
+
+        def command(self, ws):
+            return ["sh", "-c", "i=0; while [ $i -lt 20 ]; do echo \"n-$i\"; "
+                                "i=$((i+1)); done"]
+
+    def slowly(stream, line):
+        _time.sleep(0.02)
+
+    result = _Burst().run(_Workspace(tmp_path), timeout_s=60, on_line=slowly)
+
+    assert result.returncode == 0
+    assert result.stdout.count("\n") == 20, (
+        f"only {result.stdout.count(chr(10))} of 20 lines survived; the result "
+        f"was built before the readers had finished"
+    )
+    assert "n-19" in result.stdout, "the tail was lost"

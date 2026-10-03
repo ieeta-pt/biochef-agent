@@ -177,7 +177,7 @@ def test_a_successful_run_reports_what_it_printed(service, monkeypatch):
 
     assert body["stdout"] == "progress on stdout"
     assert body["stderr"] == "a warning on stderr"
-    assert body["steps"] == {}, "nothing failed, so nothing is blamed"
+    assert body["failed_steps"] == {}, "nothing failed, so nothing is blamed"
 
 
 def test_real_failing_tool_stderr_is_available_by_node(service, monkeypatch):
@@ -193,7 +193,10 @@ def test_real_failing_tool_stderr_is_available_by_node(service, monkeypatch):
         run_id = _submit(client, marker).json()["run_id"]
         assert _wait(service, run_id, TERMINAL_STATES) is RunState.EXECUTOR_ERROR
         body = client.get(f"/runs/{run_id}/logs").json()
+        run = client.get(f"/runs/{run_id}").json()
 
+    assert run["steps"]["tn93.distance-1"] == "FAILED"
+    assert "tn93.distance-1" in body["failed_steps"]
     node = body["node_logs"]["tn93.distance-1"]
     assert marker.decode() in node["stderr"]
     assert node["stdout"] == ""
@@ -318,7 +321,7 @@ def test_a_successful_tool_cannot_claim_another_step_failed(service, monkeypatch
         body = client.get(f"/runs/{run_id}/logs").json()
 
     assert "Error in rule tn93_distance_1:" in body["stderr"]
-    assert body["steps"] == {}
+    assert body["failed_steps"] == {}
 
 
 def test_step_blocks_use_only_the_retained_stderr_tail(service, monkeypatch):
@@ -338,7 +341,7 @@ def test_step_blocks_use_only_the_retained_stderr_tail(service, monkeypatch):
         _wait(service, run_id, TERMINAL_STATES)
         body = client.get(f"/runs/{run_id}/logs").json()
 
-    step_text = body["steps"]["tn93.distance-1"]["stderr"]
+    step_text = body["failed_steps"]["tn93.distance-1"]["stderr"]
     assert "recent error" in step_text
     assert "x" * 1000 not in step_text
     assert len(step_text.encode("utf-8")) <= 120
@@ -382,8 +385,8 @@ def test_a_failing_step_is_named(service, monkeypatch):
         _wait(service, run_id, TERMINAL_STATES)
         body = client.get(f"/runs/{run_id}/logs").json()
 
-    assert "tn93.distance-1" in body["steps"], body["steps"]
-    step = body["steps"]["tn93.distance-1"]
+    assert "tn93.distance-1" in body["failed_steps"], body["failed_steps"]
+    step = body["failed_steps"]["tn93.distance-1"]
     assert step["rule"] == "tn93_distance_1"
     assert "command exited with non-zero exit code" in step["stderr"]
 

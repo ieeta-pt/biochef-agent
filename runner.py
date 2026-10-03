@@ -23,6 +23,8 @@ import os
 import re
 import signal
 import subprocess
+import threading
+import time
 from typing import List, NamedTuple
 
 
@@ -70,7 +72,8 @@ class Runner:
         """What this provider is, for an operator reading a log or an error."""
         return self.name
 
-    def run(self, ws, timeout_s: int, on_start=None, on_finish=None) -> RunResult:
+    def run(self, ws, timeout_s: int, on_start=None, on_finish=None,
+            on_line=None) -> RunResult:
         """Launch the command in its own process group and bound how long it lives.
 
         start_new_session puts the command and everything it spawns in one
@@ -88,6 +91,7 @@ class Runner:
             self.command(ws),
             cwd=ws.path, start_new_session=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace",
         )
         pgid = os.getpgid(process.pid)
         # Handed out so something other than the timeout can end this run.
@@ -95,27 +99,84 @@ class Runner:
         # a caller that has the group id can pull it without this class growing
         # a notion of why a run is being stopped.
         #
-        # Taken back the moment the child is reaped, which matters more than it
-        # sounds. A process group id is a number the kernel is free to reissue
-        # once the group is empty, so a caller still holding it after the run
-        # has ended is holding a loaded weapon aimed at whoever gets that number
-        # next. killpg only reaches a group LEADER, so the likely victim is
-        # another run of this same service -- every one is a leader by
-        # construction, and their creation rate rises with load.
+        # Taken back when runner cleanup finishes, which matters more than it sounds.
+        # A process group id is a number the kernel can reissue after the group
+        # disappears, so a caller still holding it can signal a later group.
+        # The id is the leader's pid, but killpg targets the whole group even
+        # after the original leader exits.
+        # Read lines as they arrive so the caller can report progress before
+        # the process exits. communicate() drains both pipes too, but returns
+        # buffered output only after the process has finished.
+        #
+        # Two threads, one per stream, because draining only one of them is the
+        # deadlock communicate() exists to avoid: a tool that fills the other
+        # pipe's buffer blocks forever waiting for someone to read it.
+        collected = {"stdout": [], "stderr": []}
+        reader_errors = []
+
+        def pump(stream, name):
+            try:
+                for line in stream:
+                    collected[name].append(line)
+                    if on_line is not None:
+                        try:
+                            on_line(name, line)
+                        except Exception:            # noqa: BLE001
+                            # A defect in reporting must not take the run with
+                            # it. The line is still collected either way.
+                            pass
+            except BaseException as error:  # noqa: BLE001
+                reader_errors.append(error)
+            finally:
+                try:
+                    stream.close()
+                except Exception:                    # noqa: BLE001
+                    pass
+
+        readers = [
+            threading.Thread(target=pump, args=(process.stdout, "stdout"),
+                             daemon=True),
+            threading.Thread(target=pump, args=(process.stderr, "stderr"),
+                             daemon=True),
+        ]
+        reader_streams = dict(zip(readers, (process.stdout, process.stderr)))
+        started_readers = []
+
         try:
             if on_start is not None:
                 on_start(pgid)
-            out, err = process.communicate(timeout=timeout_s)
-            return RunResult(process.returncode, out, err)
+            for reader in readers:
+                reader.start()
+                started_readers.append(reader)
+            # Pass the configured value unchanged to the parent wait (among
+            # other things, this keeps provider-level timeout observation
+            # precise), then spend only the remaining budget draining pipes.
+            deadline = time.monotonic() + timeout_s
+            process.wait(timeout=timeout_s)
+            returncode = process.returncode
+            for reader in started_readers:
+                reader.join(timeout=max(0, deadline - time.monotonic()))
+            if any(reader.is_alive() for reader in started_readers):
+                # A descendant can keep a pipe open after the parent exits.
+                # Treat unfinished reading as a timeout, even if the parent
+                # succeeded. Cleanup stays bounded if a child left the group
+                # or a line callback is still blocked.
+                _kill_group(pgid)
+                process.wait()
+                for reader in started_readers:
+                    reader.join(timeout=10)
+                if returncode == 0:
+                    returncode = -signal.SIGKILL
+            if reader_errors:
+                raise reader_errors[0]
         except subprocess.TimeoutExpired:
-            os.killpg(pgid, signal.SIGKILL)
-            out, err = process.communicate()
-            # The real code, not a constant. This used to return -SIGKILL
-            # literally, which reported the signal we meant to send rather than
-            # what happened -- so changing the signal, or the process dying some
-            # other way, still claimed SIGKILL. It also made the timeout test
-            # unable to tell the two apart.
-            return RunResult(process.returncode, out or "", err or "")
+            _kill_group(pgid)
+            process.wait()
+            for reader in started_readers:
+                reader.join(timeout=10)
+            returncode = process.returncode
+            if returncode == 0:
+                returncode = -signal.SIGKILL
         except BaseException:
             # Any other way out -- a broken pipe, an interpreter shutdown, a
             # KeyboardInterrupt -- and the child has NOT been reaped. The
@@ -123,7 +184,7 @@ class Runner:
             # the tool running with nothing able to stop it, against a workspace
             # perform_run is on its way to deleting.
             #
-            # Demonstrated by making communicate() raise OSError: the group was
+            # Demonstrated by making wait() raise OSError: the group was
             # still alive and the only handle to it had just been cleared.
             _kill_group(pgid)
             # Reaped as well as killed. SIGKILL ends the processes but leaves
@@ -136,14 +197,30 @@ class Runner:
                 process.wait(timeout=10)
             except Exception:                    # noqa: BLE001
                 pass
+            for reader in started_readers:
+                reader.join(timeout=10)
             raise
         finally:
             # Reached by every path, and by now the group is either reaped or
             # killed above. An earlier version of this comment said "both paths
             # reach here, and both have reaped the child", which was true of the
             # two paths it named and false of every other.
+            #
+            for reader in readers:
+                if reader not in started_readers:
+                    stream = reader_streams[reader]
+                    try:
+                        stream.close()
+                    except Exception:                # noqa: BLE001
+                        pass
             if on_finish is not None:
                 on_finish()
+
+        # Reading may exceed the deadline after the direct child exits 0.
+        # That must still be reported as a failed run.
+        return RunResult(returncode,
+                         "".join(collected["stdout"]),
+                         "".join(collected["stderr"]))
 
 
 class SubprocessRunner(Runner):
