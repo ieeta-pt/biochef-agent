@@ -138,6 +138,19 @@ def service(tmp_path, monkeypatch):
     convert.tools.clear()
 
 
+def _bare_request(request_id=None):
+    """A real Request for the two tests that call submit_run directly.
+
+    The handler takes one so it can read the id RequestIdMiddleware validated
+    (#84). A stub with the right attributes would do, but the real type means
+    these tests break if the way the id is read changes, which is the point.
+    """
+    from starlette.requests import Request
+
+    return Request({"type": "http", "method": "POST", "path": "/runs",
+                    "headers": [], "state": {"request_id": request_id}})
+
+
 def _submit(client):
     return client.post("/runs", data={"biochef_workflow": WORKFLOW},
                        files=[("files", ("input-1-out", b"in",
@@ -364,7 +377,8 @@ def test_upload_read_failure_releases_reserved_capacity(service, monkeypatch):
     store = RunStore(max_runs=1)
     monkeypatch.setattr(main, "RUNS", store)
     with pytest.raises(OSError, match="input stream failed"):
-        asyncio.run(main.submit_run(WORKFLOW, [BrokenUpload()]))
+        asyncio.run(main.submit_run(_bare_request(), WORKFLOW,
+                                    [BrokenUpload()]))
     assert store.create().state is RunState.QUEUED
 
 
@@ -383,7 +397,8 @@ def test_full_store_refuses_before_upload_is_read(service, monkeypatch):
     accepted = store.create()
     monkeypatch.setattr(main, "RUNS", store)
     with pytest.raises(HTTPException) as refused:
-        asyncio.run(main.submit_run(WORKFLOW, [UnreadUpload()]))
+        asyncio.run(main.submit_run(_bare_request("hub-7"), WORKFLOW,
+                                    [UnreadUpload()]))
     assert refused.value.status_code == 503
     assert store.get(accepted.run_id).state is RunState.QUEUED
 

@@ -1,10 +1,6 @@
-"""A hub cannot correlate what it sent with what this agent did (#84).
+"""Tying one of a hub's requests to what this agent did with it (#84).
 
-Recorded before the fix, as the roadmap asks. Every assertion here states
-something that is TRUE of the current service and should stop being true, so
-each one is expected to be deleted or inverted by the implementing commit.
-
-The gap is worst on the refusals. POST /runs answers 503 when run capacity is
+The gap this closes is worst on the refusals. POST /runs answers 503 when run capacity is
 reached and 401 when credentials are wrong, and both carry nothing but a detail
 string -- no run_id, because no run was created. A hub that submitted ten
 workflows and got three refusals cannot say which three without matching on the
@@ -15,8 +11,19 @@ On success it is only slightly better: the run_id is one the agent invented, so
 if the response is lost in transit the run is orphaned -- executing here,
 unknown there.
 
-Two of these tests record facts about the INSTRUMENTS rather than the service,
-because they decide what the implementing commit's tests are allowed to claim.
+Most of what follows is about the inbound value, because that is the whole risk:
+it is caller-supplied and gets written into a response header. The failure to
+guard against is not injection -- h11, which uvicorn speaks, refuses to write an
+illegal value -- but something worse in practice, an otherwise-fine response
+destroyed by LocalProtocolError over a cosmetic header. A caller could delete
+its own successful submissions.
+
+TestClient cannot show either failure: it does not go over the wire and carries
+a CRLF value through untouched, so a test that echoed a hostile id and looked
+for an injected header would pass against an implementation validating nothing.
+The tests below therefore check what this service EMITS against h11 itself,
+rather than against the pattern used to accept it -- a pattern I wrote agreeing
+with an implementation I wrote proves nothing about a real server.
 """
 
 import sys
@@ -47,7 +54,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 import auth
+import bodylimit
 import main
+import requestid
 from runs import RunState, RunStore
 
 TOKEN = "a-shared-secret"
@@ -72,7 +81,13 @@ def client(monkeypatch):
     for route in main.app.routes:
         if str(getattr(route, "path", "")).startswith("/runs"):
             app.router.routes.append(route)
+
+    # main.py's order, and the order matters: the body size limit is innermost,
+    # authentication next, the request id outermost. A separate test pins that
+    # main.py really is in this order, so this fixture keeps describing it.
+    app.add_middleware(bodylimit.BodySizeLimitMiddleware)
     app.add_middleware(auth.AuthenticationMiddleware, provider=provider)
+    app.add_middleware(requestid.RequestIdMiddleware)
     with TestClient(app) as c:
         yield c
 
@@ -86,24 +101,11 @@ def _full_store():
     return store
 
 
-# --- nothing carries an id --------------------------------------------------
+# --- the case the issue is about: a refusal a hub can place ----------------
 
-def test_no_request_id_middleware_exists():
-    """Searched by behaviour as well as by name, so a differently-named one
-    still counts: nothing in the tree reads or writes a correlation header."""
-    sources = {p.name: p.read_text() for p in REPO_ROOT.glob("*.py")}
-    joined = "\n".join(sources.values()).lower()
-    for spelling in ("x-request-id", "x-correlation-id", "request_id",
-                     "correlation_id", "traceparent"):
-        assert spelling not in joined, f"{spelling!r} appears already"
-
-
-def test_a_refused_submission_gives_the_hub_no_handle(client, monkeypatch):
-    """503 with a detail string and a Retry-After, and nothing else.
-
-    This is the case that matters most: there is no run_id to report, so the
-    hub has nothing at all to tie the refusal back to what it sent.
-    """
+def test_a_refusal_at_capacity_carries_the_id_the_hub_sent(client, monkeypatch):
+    """The headline. There is no run_id to report, because no run was created,
+    so this header is the only thing tying the 503 to what was submitted."""
     monkeypatch.setattr(main, "RUNS", _full_store())
     refused = client.post(
         "/runs",
@@ -112,86 +114,228 @@ def test_a_refused_submission_gives_the_hub_no_handle(client, monkeypatch):
         headers={"Authorization": f"Bearer {TOKEN}", "X-Request-Id": SENT},
     )
     assert refused.status_code == 503
-    assert set(refused.json()) == {"detail"}
-    assert "run_id" not in refused.text
-    assert refused.headers.get("x-request-id") is None, (
-        "the value the hub sent is not echoed"
-    )
-    assert SENT not in refused.text
+    assert refused.headers["x-request-id"] == SENT
+    assert "run_id" not in refused.text, "still no run, which is the point"
 
 
-def test_a_rejected_caller_gets_no_handle_either(client):
+def test_a_rejected_caller_is_told_which_request_was_rejected(client):
+    """A 401 is written by the authentication layer, which never calls the
+    application. An id on it means the middleware is genuinely outside it."""
     refused = client.post("/runs", headers={"X-Request-Id": SENT})
     assert refused.status_code == 401
-    assert refused.headers.get("x-request-id") is None
-    assert SENT not in refused.text
+    assert refused.headers["x-request-id"] == SENT
 
 
-def test_an_accepted_submission_echoes_nothing_the_hub_chose(client):
-    """The run_id comes back, but it is the agent's own invention."""
+def test_an_oversized_body_is_refused_with_an_id(client):
+    """413 comes from the body size limit, which answers without calling the
+    application either."""
+    refused = client.post("/runs", headers={
+        "Authorization": f"Bearer {TOKEN}", "content-length": "999999999999"})
+    assert refused.status_code == 413
+    assert refused.headers["x-request-id"]
+
+
+@pytest.mark.parametrize("call, expected", [
+    (lambda c, h: c.post("/runs", headers=h), 422),
+    (lambda c, h: c.get("/runs/nope", headers=h), 404),
+    (lambda c, h: c.post("/runs/nope/cancel", headers=h), 404),
+    (lambda c, h: c.get("/runs/nope/logs", headers=h), 404),
+])
+def test_every_other_outcome_carries_one_too(client, call, expected):
+    response = call(client, {"Authorization": f"Bearer {TOKEN}",
+                             "X-Request-Id": SENT})
+    assert response.status_code == expected
+    assert response.headers["x-request-id"] == SENT
+
+
+# --- the run remembers which request asked for it ---------------------------
+
+def test_an_accepted_run_carries_the_id_back(client):
     accepted = client.post(
         "/runs",
         data={"biochef_workflow": "not json"},
         files=[("files", ("input-1-out", b"in", "application/octet-stream"))],
         headers={"Authorization": f"Bearer {TOKEN}", "X-Request-Id": SENT},
     )
-    assert accepted.status_code == 202, (
-        "pinned so this cannot quietly start measuring a refusal instead"
+    assert accepted.status_code == 202
+    assert accepted.headers["x-request-id"] == SENT
+    assert accepted.json()["request_id"] == SENT, (
+        "in the body as well as the header: a hub whose response was lost in "
+        "transit never learned the run_id, and polling is how it recovers"
     )
-    assert set(accepted.json()) == {"run_id", "state"}
-    assert accepted.headers.get("x-request-id") is None
-    assert SENT not in accepted.text
 
 
-def test_a_run_record_cannot_say_which_request_asked_for_it():
-    store = RunStore()
-    run = store.create()
+def test_the_run_still_carries_it_when_polled_later(client):
+    run_id = client.post(
+        "/runs",
+        data={"biochef_workflow": "not json"},
+        files=[("files", ("input-1-out", b"in", "application/octet-stream"))],
+        headers={"Authorization": f"Bearer {TOKEN}", "X-Request-Id": SENT},
+    ).json()["run_id"]
+
+    polled = client.get(f"/runs/{run_id}",
+                        headers={"Authorization": f"Bearer {TOKEN}"})
+    assert polled.json()["request_id"] == SENT, (
+        "the run's own id, not the id of the request doing the polling"
+    )
+
+
+def test_a_run_with_no_request_behind_it_omits_the_field():
+    """Absent rather than null, matching how error and outputs behave."""
+    run = RunStore().create()
     assert "request_id" not in run.as_dict()
-    assert not hasattr(run, "request_id")
+    assert run.request_id is None
 
 
-# --- what the instruments can and cannot show -------------------------------
+# --- what gets accepted, and what gets replaced -----------------------------
 
-def test_the_test_client_cannot_demonstrate_header_injection():
-    """Recorded because it decides what the implementing commit may claim.
+def test_an_absent_id_is_generated(client):
+    response = client.get("/runs/nope",
+                          headers={"Authorization": f"Bearer {TOKEN}"})
+    generated = response.headers["x-request-id"]
+    assert len(generated) == 32 and all(c in "0123456789abcdef" for c in generated)
 
-    TestClient does not go over the wire, so a CRLF inside a header value is
-    carried through as one opaque value and no second header appears. A test
-    that echoed a hostile id and then asserted no injected header was present
-    would therefore pass against an implementation that validates nothing.
 
-    The implementing commit must assert the property on what it EMITS, checked
-    against something that actually parses headers -- see the next test.
+def test_two_requests_without_an_id_do_not_share_one(client):
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    first = client.get("/runs/nope", headers=headers).headers["x-request-id"]
+    second = client.get("/runs/nope", headers=headers).headers["x-request-id"]
+    assert first != second
+
+
+@pytest.mark.parametrize("hostile", [
+    "a\r\nX-Injected: yes",
+    "a\nX-Injected: yes",
+    "a\rb",
+    "a\x00b",
+    "a b",
+    "a\tb",
+    "\x7f",
+    "a" * (requestid.MAX_LENGTH + 1),
+    "",
+])
+def test_an_unusable_id_is_replaced_rather_than_echoed(client, hostile):
+    """Replaced, not refused: rejecting a workflow submission over a header
+    nobody needs would be a worse failure than ignoring the header."""
+    response = client.get("/runs/nope", headers={
+        "Authorization": f"Bearer {TOKEN}", "X-Request-Id": hostile})
+    assert response.status_code == 404, "the request itself still goes through"
+    emitted = response.headers["x-request-id"]
+    assert emitted != hostile
+    assert len(emitted) == 32
+
+
+@pytest.mark.parametrize("unsendable", [
+    "ol\u00e1", "\u65e5\u672c", "caf\u00e9", "\u200b", "a\u0085b",
+])
+def test_non_ascii_is_refused_at_the_seam_rather_than_over_http(unsendable):
+    """Tested against accept() directly, because httpx will not send it.
+
+    A header must be ASCII to leave the test client, so the parametrized HTTP
+    cases above cannot reach this -- the one that tried errored inside httpx
+    and never exercised the service at all. Over a real wire it can arrive: a
+    server decoding received header bytes as latin-1 hands up a string like
+    this. The guard lives in accept(), so that is where it is checked.
     """
-    from fastapi import FastAPI
-    from starlette.responses import JSONResponse
+    used, from_caller = requestid.accept(unsendable)
+    assert from_caller is False
+    assert used != unsendable
+    assert used.isascii()
 
-    app = FastAPI()
 
-    @app.get("/x")
-    async def x():
-        return JSONResponse({}, headers={"X-Request-Id": "a\r\nX-Injected: y"})
+def test_the_limit_is_wide_enough_for_the_ids_a_hub_would_actually_send():
+    """Stated as what it has to accommodate, not as the number.
 
-    response = TestClient(app).get("/x")
-    assert response.headers.get("x-injected") is None, (
-        "if this ever fails, TestClient has started splitting headers and the "
-        "weaker test shape would become valid"
+    The boundary tests below are written in terms of MAX_LENGTH, so they move
+    with it and cannot notice it changing -- a mutation lowering it to 127 left
+    the whole file green. Shrink it to 8 and every hub using a prefixed UUID
+    would silently lose correlation, because an id that is merely too long is
+    replaced rather than refused: nothing fails, work still runs, and the
+    correlation quietly stops working.
+
+    The upper bound matters too: the value is echoed on every response and kept
+    on a retained run record, so MAX_RUNS copies of it are held.
+    """
+    realistic = [
+        "123e4567-e89b-12d3-a456-426614174000",      # canonical UUID, 36
+        "biochef-hub/123e4567-e89b-12d3-a456-426614174000",
+        "run-2026-10-04T00:00:00Z-0001",
+        requestid.generate(),
+    ]
+    for candidate in realistic:
+        assert requestid.accept(candidate)[1] is True, (
+            f"{candidate!r} ({len(candidate)} chars) is the shape of id a hub "
+            f"sends, and MAX_LENGTH={requestid.MAX_LENGTH} refuses it"
+        )
+    assert requestid.MAX_LENGTH <= 256, (
+        "echoed on every response and kept on every retained run record"
     )
-    assert response.headers["x-request-id"] == "a\r\nX-Injected: y", (
-        "carried through untouched, which is why it proves nothing"
-    )
 
 
-def test_the_real_wire_protocol_refuses_an_illegal_header_value():
-    """So the failure to guard against is not injection but a dead response.
+def test_the_longest_acceptable_id_is_still_accepted(client):
+    """The boundary, from the usable side, so the limit is not off by one."""
+    longest = "a" * requestid.MAX_LENGTH
+    response = client.get("/runs/nope", headers={
+        "Authorization": f"Bearer {TOKEN}", "X-Request-Id": longest})
+    assert response.headers["x-request-id"] == longest
 
-    h11 -- what uvicorn speaks, and so what `fastapi run` serves -- raises
-    rather than writing the header. Echoing an unvalidated caller header
-    therefore turns a cosmetic header into the destruction of that caller's own
-    otherwise-fine response, which is a worse outcome than ignoring the header.
 
-    This is the arbiter the implementing commit should check its emitted ids
-    against, rather than against a charset of my own choosing.
+def test_a_caller_can_tell_its_value_was_not_taken(client):
+    """The only signal, and it is sufficient: compare what came back."""
+    sent = "a" * (requestid.MAX_LENGTH + 1)
+    got = client.get("/runs/nope", headers={
+        "Authorization": f"Bearer {TOKEN}", "X-Request-Id": sent}
+    ).headers["x-request-id"]
+    assert got != sent
+
+
+# --- the property that matters, checked against the real arbiter ------------
+
+def test_everything_this_service_can_emit_is_a_legal_header_value():
+    """Checked against h11, not against the pattern used to accept it.
+
+    h11 is what uvicorn speaks, and so what `fastapi run` serves. It raises
+    LocalProtocolError rather than writing an illegal header, which would turn
+    an otherwise-fine response into a dead one. Asserting the emitted id
+    matches requestid.ACCEPTABLE would be circular -- the pattern and the
+    implementation are the same decision.
+
+    Both halves of the output are covered: ids generated here, and ids taken
+    from a caller, including every character the pattern permits.
+    """
+    import h11
+
+    permitted = ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                 "0123456789._~:/+=@-")
+    candidates = [requestid.generate() for _ in range(200)]
+    candidates += [requestid.accept(permitted)[0],
+                   requestid.accept(permitted * 2)[0],
+                   requestid.accept("a" * requestid.MAX_LENGTH)[0]]
+    candidates += [requestid.accept(c)[0] for c in permitted]
+    candidates += [requestid.accept(h)[0] for h in (
+        "a\r\nX: y", "a\nb", "a\x00b", "a b", "ol\u00e1", "\x7f", None, "",
+        "a" * 5000)]
+
+    for candidate in candidates:
+        conn = h11.Connection(our_role=h11.SERVER)
+        conn.receive_data(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        conn.next_event()
+        conn.next_event()
+        try:
+            conn.send(h11.Response(
+                status_code=200,
+                headers=[("x-request-id", candidate), ("content-length", "0")]))
+        except h11.LocalProtocolError as refused:
+            raise AssertionError(
+                f"this service would emit {candidate!r}, which a real server "
+                f"refuses to write: {refused}") from None
+
+
+def test_the_instrument_can_actually_fail():
+    """Because the loop above passing means nothing if h11 accepts anything.
+
+    An earlier version of a test in this file reported a path as handled when
+    its own input never reached that path.
     """
     import h11
 
@@ -199,23 +343,95 @@ def test_the_real_wire_protocol_refuses_an_illegal_header_value():
     conn.receive_data(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
     conn.next_event()
     conn.next_event()
-
     with pytest.raises(h11.LocalProtocolError):
-        conn.send(h11.Response(
-            status_code=200,
-            headers=[("x-request-id", "a\r\nX-Injected: y"),
-                     ("content-length", "0")]))
+        conn.send(h11.Response(status_code=200,
+                               headers=[("x-request-id", "a\r\nX: y"),
+                                        ("content-length", "0")]))
 
 
-def test_nothing_bounds_how_long_an_inbound_header_may_be(client):
-    """A value this service would store on a retained run record.
+# --- the ambiguous cases ----------------------------------------------------
 
-    The server caps total header size, but this application caps nothing, and
-    the cap is the server's to change.
+def test_two_inbound_ids_resolve_to_the_first(client):
+    """A proxy adding its own alongside the caller's. The first wins, which is
+    what every header getter already does and what a caller is most likely
+    matching on. Recorded so it is a decision rather than an accident."""
+    response = client.get("/runs/nope", headers=[
+        ("Authorization", f"Bearer {TOKEN}"),
+        ("X-Request-Id", "first-one"),
+        ("X-Request-Id", "second-one"),
+    ])
+    assert response.headers["x-request-id"] == "first-one"
+
+
+def test_only_one_id_leaves_even_if_something_downstream_set_one():
+    """Assigned, not appended. Two values on the way out would be exactly the
+    ambiguity this refuses to accept on the way in."""
+    from fastapi import FastAPI
+    from starlette.responses import JSONResponse
+
+    app = FastAPI()
+
+    @app.get("/x")
+    async def x():
+        return JSONResponse({}, headers={"X-Request-Id": "set-by-the-handler"})
+
+    app.add_middleware(requestid.RequestIdMiddleware)
+    response = TestClient(app).get("/x", headers={"X-Request-Id": "from-caller"})
+    assert response.headers.get_list("x-request-id") == ["from-caller"]
+
+
+def test_an_unhandled_exception_comes_back_without_one():
+    """A known boundary, recorded rather than discovered later.
+
+    starlette's ServerErrorMiddleware sits outside every middleware the
+    application adds, so the 500 it writes never passes back through here.
+    Tagging it would mean owning the exception handler, which is a different
+    change. If this ever starts failing, the limitation has been fixed and the
+    docstring in requestid.py should stop claiming it.
     """
-    enormous = "a" * 100_000
-    response = client.get("/runs/nope",
-                          headers={"Authorization": f"Bearer {TOKEN}",
-                                   "X-Request-Id": enormous})
-    assert response.status_code == 404
+    from fastapi import FastAPI
+
+    app = FastAPI()
+
+    @app.get("/boom")
+    async def boom():
+        raise RuntimeError("unhandled")
+
+    app.add_middleware(requestid.RequestIdMiddleware)
+    response = TestClient(app, raise_server_exceptions=False).get("/boom")
+    assert response.status_code == 500
     assert response.headers.get("x-request-id") is None
+
+
+# --- where it sits in the stack ---------------------------------------------
+
+def test_it_is_the_outermost_layer():
+    """Added last, or the refusals it exists to label leave untagged.
+
+    Pinned on comment-stripped source, because grep matches a comment as
+    readily as code -- and the lines above this one are mostly comment.
+    """
+    import re
+
+    code = re.sub(r"#.*", "", (REPO_ROOT / "main.py").read_text())
+    positions = {
+        name: code.index(f"add_middleware({name}")
+        for name in ("BodySizeLimitMiddleware", "AuthenticationMiddleware",
+                     "RequestIdMiddleware")
+    }
+    assert positions["RequestIdMiddleware"] == max(positions.values()), (
+        f"RequestIdMiddleware must be added last; order is "
+        f"{sorted(positions, key=positions.get)}"
+    )
+
+
+def test_a_handler_reads_the_validated_value_and_not_the_raw_header():
+    """Because the raw header is the untrusted input this exists to contain.
+
+    If submit_run read request.headers directly, a hostile value would reach
+    the run record and the response body however careful the middleware was.
+    """
+    source = (REPO_ROOT / "main.py").read_text()
+    assert 'request.state, "request_id"' in source
+    assert 'headers.get("x-request-id")' not in source.lower()
+    assert 'headers["x-request-id"]' not in source.lower()
