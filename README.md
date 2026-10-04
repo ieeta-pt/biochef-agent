@@ -139,7 +139,7 @@ request.
 Two questions, two endpoints, because they have different audiences.
 
 `GET /health` (and `HEAD /health`) answers `{"status": "ok"}` and **is the one
-route that does not require authentication.** What probes it is an orchestrator,
+route exempt from authentication**, whatever `BIOCHEF_AUTH` is set to. What probes it is an orchestrator,
 not a person, and it has no credentials to offer; a liveness check that demanded
 a token would turn a mistyped token into a healthy service that looks dead and
 gets restarted forever. That is also why it says nothing else — it answers to
@@ -149,9 +149,11 @@ The exemption is matched on the exact method and path, so nothing beneath
 Behind a proxy that sets `root_path` the path will not match and liveness will
 ask for a token, which is the direction to fail in.
 
-`GET /capacity` answers the other question and **does require credentials**,
-because every field in it describes this deployment rather than merely whether
-it is up:
+`GET /capacity` answers the other question and **is authenticated like every
+other route**, because every field in it describes this deployment rather than
+merely whether it is up. (Under the default `BIOCHEF_AUTH=none` that means
+anybody, the same as everything else here — the point is that `/capacity` is
+not separately exempt the way liveness is.)
 
 ```json
 {
