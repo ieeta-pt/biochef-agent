@@ -106,6 +106,23 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/capacity": {
+      "get": {
+        "description": "What this agent is, and how much of it is free.\n\nFor a hub deciding where to send work. Authenticated, because every field\nhere describes the deployment rather than merely whether it is up.\n\nToday the only way to discover saturation is to submit and be refused with\n503, which is finding out after the work went to the wrong site.",
+        "operationId": "capacity_capacity_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Capacity"
+      }
+    },
     "/convert": {
       "post": {
         "description": "The editor's synchronous contract, sharing the execution limit.\n\nKept as it was because it is the contract the editor speaks today. /runs is\nthe same work without the wait.",
@@ -141,6 +158,38 @@
           }
         },
         "summary": "Convert"
+      }
+    },
+    "/health": {
+      "get": {
+        "description": "Up. Nothing else.\n\nAnswers without credentials -- see AuthenticationMiddleware.OPEN -- because\nthe thing that probes it is an orchestrator and not a person, and has none\nto offer. An endpoint that demanded a token would turn a mistyped token into\na healthy service that looks dead and is restarted forever.\n\nWhich is exactly why it says nothing else. Capacity, runner and provider all\ndescribe this deployment, they live behind authentication in /capacity, and\nputting any of them here would publish them to whatever can reach the port.",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health"
+      },
+      "head": {
+        "description": "The same answer to a HEAD probe, which several checkers send by default.\n\nDeclared separately rather than as api_route(methods=[\"GET\", \"HEAD\"]):\nfastapi derives one operation id per route, so a two-method route puts the\nsame id on both operations -- and labelled the GET one `..._head` -- which\ncollides in any generated client. The contract is exported and checked, so\nthat lands in openapi.json.\n\nfastapi's APIRoute, unlike starlette's Route, does not add HEAD to a GET\nroute on its own; without this a HEAD probe gets 405 from a service that is\nup, and 405 reads as unhealthy. A HEAD carries no body back, so this\nwithholds nothing the GET does not already say.",
+        "operationId": "health_probe_health_head",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health Probe"
       }
     },
     "/runs": {

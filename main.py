@@ -15,8 +15,8 @@ import base64
 
 from workspace import UnsafeName, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
-from runs import (IllegalTransition, RunCapacityError, RunState, RunStore,
-                  TERMINAL, UnknownRun)
+from runs import (IllegalTransition, MAX_RUNS, RunCapacityError, RunState,
+                  RunStore, TERMINAL, UnknownRun)
 from steplogs import (Progress, clamp, failing_steps, make_step_log_names,
                       read_node_logs)
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
@@ -545,6 +545,93 @@ async def cancel_run(run_id: str):
             pass
 
     return RUNS.get(run_id).as_dict()
+
+
+AGENT_VERSION = os.getenv("BIOCHEF_AGENT_VERSION", "")
+"""What this deployment calls itself, for a hub that talks to several.
+
+Empty by default and reported as null rather than invented. A version this
+service made up would be worse than none, because a hub routing work would
+believe it and act on it. A deployment that wants one sets it, usually to the
+commit it was built from.
+"""
+
+# The states that occupy an execution slot. QUEUED is admitted and waiting, so
+# counting it as busy would have a hub route away from an agent that is in fact
+# free; CANCELING still holds the slot until the worker lets go of it.
+BUSY_STATES = (RunState.INITIALIZING, RunState.RUNNING, RunState.CANCELING)
+
+
+@app.get("/health")
+async def health():
+    """Up. Nothing else.
+
+    Answers without credentials -- see AuthenticationMiddleware.OPEN -- because
+    the thing that probes it is an orchestrator and not a person, and has none
+    to offer. An endpoint that demanded a token would turn a mistyped token into
+    a healthy service that looks dead and is restarted forever.
+
+    Which is exactly why it says nothing else. Capacity, runner and provider all
+    describe this deployment, they live behind authentication in /capacity, and
+    putting any of them here would publish them to whatever can reach the port.
+    """
+    return {"status": "ok"}
+
+
+@app.head("/health")
+async def health_probe():
+    """The same answer to a HEAD probe, which several checkers send by default.
+
+    Declared separately rather than as api_route(methods=["GET", "HEAD"]):
+    fastapi derives one operation id per route, so a two-method route puts the
+    same id on both operations -- and labelled the GET one `..._head` -- which
+    collides in any generated client. The contract is exported and checked, so
+    that lands in openapi.json.
+
+    fastapi's APIRoute, unlike starlette's Route, does not add HEAD to a GET
+    route on its own; without this a HEAD probe gets 405 from a service that is
+    up, and 405 reads as unhealthy. A HEAD carries no body back, so this
+    withholds nothing the GET does not already say.
+    """
+    return {"status": "ok"}
+
+
+@app.get("/capacity")
+async def capacity():
+    """What this agent is, and how much of it is free.
+
+    For a hub deciding where to send work. Authenticated, because every field
+    here describes the deployment rather than merely whether it is up.
+
+    Today the only way to discover saturation is to submit and be refused with
+    503, which is finding out after the work went to the wrong site.
+    """
+    counts = RUNS.state_counts()
+    in_flight = sum(counts.get(state.value, 0) for state in BUSY_STATES)
+    return {
+        "version": AGENT_VERSION or None,
+        # The provider the middleware actually enforces with, not a second
+        # reading of the environment. A field that says `bearer` while the stack
+        # admits anyone is worse than no field.
+        "authentication": AUTH.name,
+        "runner": RUNNER.name,
+        "runs": {
+            "in_flight": in_flight,
+            "queued": counts.get(RunState.QUEUED.value, 0),
+            "slots": MAX_CONCURRENT_RUNS,
+            # Clamped. Slots are held by a semaphore and counted from run
+            # states, and the two can disagree for a moment around a
+            # transition. A hub has no sensible way to act on a negative
+            # number of free slots.
+            "free": max(0, MAX_CONCURRENT_RUNS - in_flight),
+            "by_state": counts,
+        },
+        "retained": {"runs": RUNS.retained(), "cap": MAX_RUNS},
+        # Null, not []. Which datasets a site holds comes from the DataSource
+        # interface (#12), which is not in this tree, so this build cannot say.
+        # An empty list would read as "this site holds none".
+        "datasets": None,
+    }
 
 
 @app.get("/runs/{run_id}/logs")

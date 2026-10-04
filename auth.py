@@ -134,12 +134,46 @@ class AuthenticationMiddleware:
     middleware outermost.
     """
 
+    # The only requests that answer without credentials, and the whole risk of
+    # this class. Anything added here answers to whatever can reach the port,
+    # so it is a set small enough to read at a glance and a test pins its
+    # contents.
+    #
+    # Liveness is exempt because an orchestrator's probe has no credentials to
+    # offer. Demanding a token turns a mistyped one into a healthy service that
+    # looks dead and is restarted forever -- and the handler behind this says
+    # nothing but "up", so there is nothing here to leak.
+    #
+    # HEAD as well as GET, because several checkers probe with HEAD and the
+    # handler is declared for both. (fastapi's APIRoute, unlike starlette's
+    # Route, does not add HEAD to a GET route on its own, so the handler says so
+    # explicitly.) A HEAD carries no body back, so it withholds nothing the GET
+    # does not already say.
+    #
+    # Matched on the exact method and path, never as a prefix: /health must not
+    # become a door to anything beneath it. scope["path"] arrives
+    # percent-decoded and normalised, which is what routing will match too, so
+    # the comparison is against the same string the router sees -- /pr%6fbe and
+    # /probe/../probe both arrive as /probe, and neither can slip past equality.
+    #
+    # Behind a mount or a proxy that sets root_path, scope["path"] may carry a
+    # prefix and this will simply not match, so liveness would require a token.
+    # That is the direction to fail in, and the deployment notices immediately.
+    OPEN = frozenset({("GET", "/health"), ("HEAD", "/health")})
+
     def __init__(self, app, provider: AuthProvider):
         self.app = app
         self.provider = provider
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        if (scope.get("method"), scope.get("path")) in self.OPEN:
+            # Passed inward, not short-circuited: everything below this --
+            # including the body size limit -- still applies. Skipping
+            # authentication must not skip the rest of the stack.
             await self.app(scope, receive, send)
             return
 

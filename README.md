@@ -134,6 +134,52 @@ Everything else about the tool — its binary, its inputs and outputs, its
 parameter flags — comes from the bundle fetched from the registry, not from the
 request.
 
+### Is it up, and is it free
+
+Two questions, two endpoints, because they have different audiences.
+
+`GET /health` (and `HEAD /health`) answers `{"status": "ok"}` and **is the one
+route that does not require authentication.** What probes it is an orchestrator,
+not a person, and it has no credentials to offer; a liveness check that demanded
+a token would turn a mistyped token into a healthy service that looks dead and
+gets restarted forever. That is also why it says nothing else — it answers to
+whatever can reach the port, so anything beyond "up" would be published to it.
+The exemption is matched on the exact method and path, so nothing beneath
+`/health` is reachable without credentials, and `POST /health` is still a `401`.
+Behind a proxy that sets `root_path` the path will not match and liveness will
+ask for a token, which is the direction to fail in.
+
+`GET /capacity` answers the other question and **does require credentials**,
+because every field in it describes this deployment rather than merely whether
+it is up:
+
+```json
+{
+  "version": null,
+  "authentication": "bearer",
+  "runner": "subprocess",
+  "runs": {"in_flight": 1, "queued": 2, "slots": 4, "free": 3,
+           "by_state": {"RUNNING": 1, "QUEUED": 2, "COMPLETE": 7}},
+  "retained": {"runs": 10, "cap": 256},
+  "datasets": null
+}
+```
+
+`in_flight` counts the states that occupy a slot — `INITIALIZING`, `RUNNING`,
+`CANCELING`. A `QUEUED` run is admitted and waiting, so it is reported
+separately and not counted against the slots. `by_state` is walked from the run
+store rather than kept as a tally, so it cannot drift from what the store holds.
+
+`version` is whatever `BIOCHEF_AGENT_VERSION` was set to, and `null` when it was
+not — a deployment that does not say which commit it is built from reports
+nothing rather than something invented. `datasets` is `null` for the same
+reason: which datasets a site holds comes from the DataSource interface, which
+this service does not implement yet, and `[]` would read as "this site holds
+none".
+
+Before this, the only way to discover a saturated agent was to submit work and
+be refused with `503`, which is finding out after sending it to the wrong site.
+
 ## Running it
 
 ```
@@ -161,6 +207,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_MAX_RUNS` | `256` | maximum run records retained for polling |
 | `BIOCHEF_MAX_LOG_BYTES` | `1048576` | retained bytes per run-wide stream and shared budget per node-log stream, tail first |
 | `BIOCHEF_MAX_CONCURRENT_RUNS` | `4` | execution slots shared by `/runs` and `/convert`; admitted `/runs` jobs wait in `QUEUED` |
+| `BIOCHEF_AGENT_VERSION` | *(unset)* | what this deployment reports as its version at `/capacity`; `null` when unset |
 | `BIOCHEF_AUTH` | `none` | who may call it: `none` or `bearer` |
 | `BIOCHEF_AUTH_TOKEN` | | the shared token, required when `BIOCHEF_AUTH=bearer` |
 | `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess` or `apptainer` |

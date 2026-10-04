@@ -1,24 +1,22 @@
 """Whether this agent can say it is alive, and how busy it is (#82).
 
-Recorded before anything changes. Nothing does.
-
 A hub orchestrating several sites needs two answers and they are different
-questions. A liveness probe is run by an orchestrator, not a person, and carries
-no credentials -- so if liveness needs a token, a misconfigured token makes a
-healthy service look dead and get restarted forever. Capacity, on the other
-hand, describes the deployment, and free slots and runner configuration are
-operational detail.
+questions with different audiences.
 
-Today there is neither. The only way the hub can discover that this agent is
-saturated is to submit work and be refused with 503, which is finding out by
-having already sent it to the wrong site.
+A liveness probe is run by an orchestrator, not a person, and carries no
+credentials. An endpoint that demands a token turns a mistyped token into a
+healthy service that looks dead and is restarted forever. So liveness answers
+unauthenticated, and therefore must say nothing whatever beyond "up".
 
-The tests here are expected to be REPLACED by the change that closes #82, so
-that commit has to delete a statement that this service cannot answer rather
-than quietly adding an endpoint nobody probed.
+Capacity is the opposite. Free slots, runner and provider describe the
+deployment, so they sit behind authentication. Before this, the only way the hub
+could discover saturation was to submit work and be refused with 503, which is
+finding out after sending it to the wrong site.
+
+Most of what follows is about the unauthenticated path, because that is the
+whole risk of this change.
 """
 
-import re
 import sys
 import types
 from pathlib import Path
@@ -43,68 +41,285 @@ if "oras" not in sys.modules:
     sys.modules["oras.client"] = client_mod
 
 
-def _source(name):
-    """Read rather than imported, for the reason the other modules here give:
-    each installs stubs in sys.modules, so what an import finds in a full run
-    depends on which test module got there first."""
-    return (REPO_ROOT / name).read_text()
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+import auth
+import main
+from runs import RunState, RunStore
+
+TOKEN = "a-shared-secret"
 
 
-def test_the_scan_finds_the_modules_it_claims_to_read():
-    """Guard against every assertion below passing over nothing."""
-    assert "@app.post(\"/runs\"" in _source("main.py")
-    assert "class AuthenticationMiddleware" in _source("auth.py")
+@pytest.fixture
+def client(monkeypatch):
+    """The real routes, behind bearer authentication actually in place.
 
+    Exercising these against the default `none` provider would prove nothing:
+    every path answers when nothing is checked, so the exemption would look
+    correct while being entirely untested.
 
-def test_no_endpoint_reports_liveness():
-    """The gap, as an assertion, so it cannot be argued about."""
-    routes = re.findall(r'@app\.(?:get|post|delete)\("([^"]+)"\)', _source("main.py"))
-    assert routes, "the route scan matched nothing"
-    for probe in ("/health", "/healthz", "/livez", "/readyz", "/ping"):
-        assert probe not in routes, (
-            f"{probe} exists; if liveness has landed, this test should be "
-            f"replaced by one asserting it answers without credentials"
-        )
-
-
-def test_no_endpoint_reports_capacity():
-    routes = re.findall(r'@app\.(?:get|post|delete)\("([^"]+)"\)', _source("main.py"))
-    for described in ("/capacity", "/service-info", "/describe", "/metrics"):
-        assert described not in routes, f"{described} exists"
-
-
-def test_every_request_is_authenticated_without_exception():
-    """There is no unauthenticated path today, so there is no exemption surface
-    to get wrong -- yet.
-
-    When one arrives it is the whole risk of that change, and it should be a set
-    small enough to read at a glance and pinned by a test, because anything in
-    it answers to whatever can reach the port.
+    main.AUTH is patched to the same provider the middleware enforces with,
+    which is how production wires it -- app.add_middleware(..., provider=AUTH).
+    A separate test pins that they are the same object.
     """
-    code = "\n".join(l.split("#", 1)[0] for l in _source("auth.py").splitlines())
-    middleware = code.split("class AuthenticationMiddleware")[1]
-    for escape in ("OPEN", "EXEMPT", "ALLOW", "PUBLIC", "skip"):
-        assert escape not in middleware, (
-            f"AuthenticationMiddleware now has {escape!r}; an unauthenticated "
-            f"path needs its own tests, not this one"
-        )
+    provider = auth.BearerAuth(TOKEN)
+    monkeypatch.setattr(main, "AUTH", provider)
+
+    app = FastAPI()
+    for route in main.app.routes:
+        if getattr(route, "path", None) in ("/health", "/capacity"):
+            app.router.routes.append(route)
+    app.add_middleware(auth.AuthenticationMiddleware, provider=provider)
+    return TestClient(app)
 
 
-def test_the_run_store_cannot_count_what_it_holds():
-    """A capacity answer needs this, and nothing provides it.
+def authorised():
+    return {"Authorization": f"Bearer {TOKEN}"}
 
-    Counting has to come from the store rather than a running tally: a tally
-    drifts the first time an eviction or a refused transition is not accounted
-    for, and a count that is quietly wrong is worse than one that costs a walk.
+
+# --- liveness, and what it refuses to say -----------------------------------
+
+def test_health_answers_without_credentials(client):
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_a_head_probe_is_not_refused(client):
+    """starlette answers HEAD on every GET route, so a HEAD probe reaches a path
+    that exists. Exempting only GET would refuse it, and a HEAD carries no body
+    back, so there is nothing to withhold."""
+    assert client.head("/health").status_code == 200
+
+
+def test_health_says_nothing_but_up(client):
+    """Anything else here is published to whatever can reach the port."""
+    body = client.get("/health").json()
+    assert set(body) == {"status"}
+    serialised = client.get("/health").text
+    for leaked in ("runner", "slot", "version", "bearer", "apptainer",
+                   "subprocess", "queued", "capacity"):
+        assert leaked not in serialised.lower(), f"liveness leaks {leaked!r}"
+
+
+# --- the exemption surface --------------------------------------------------
+
+def test_the_exemption_does_not_extend_to_other_methods(client):
+    """Exempting a path must not exempt what can be done to it."""
+    for call in (client.post, client.put, client.delete, client.patch):
+        assert call("/health").status_code == 401
+
+
+def test_the_exemption_does_not_extend_to_neighbouring_paths(client):
+    """Matched exactly, never as a prefix, so /health is not a door."""
+    for path in ("/health/", "/healthz", "/health/x", "/Health", "/HEALTH",
+                 "/health%20", " /health"):
+        assert client.get(path).status_code == 401, path
+
+
+def test_percent_encoding_cannot_slip_past_the_match(client):
+    """scope["path"] arrives decoded, which is also what the router matches, so
+    the comparison is against the same string routing sees. /he%61lth decodes to
+    /health and is therefore legitimately liveness, while an encoded traversal
+    decodes to a path that simply is not in the set."""
+    assert client.get("/he%61lth").status_code == 200
+    for sneaky in ("/health%2F..%2Fcapacity", "/capacity%00/health"):
+        assert client.get(sneaky).status_code == 401, sneaky
+
+
+def test_a_traversal_does_not_reach_capacity_unauthenticated(client):
+    assert client.get("/health/../capacity").status_code == 401
+
+
+def test_the_exemption_is_two_entries_and_both_are_liveness():
+    """Pinned so an addition is a decision rather than a drift. Anything in this
+    set answers to whatever can reach the port."""
+    assert auth.AuthenticationMiddleware.OPEN == frozenset(
+        {("GET", "/health"), ("HEAD", "/health")})
+
+
+def test_the_exemption_is_immutable():
+    """A set a caller can add to at runtime is not a reviewable surface."""
+    assert isinstance(auth.AuthenticationMiddleware.OPEN, frozenset)
+
+
+def test_skipping_authentication_does_not_skip_the_rest_of_the_stack():
+    """Measured, not read: an oversized body on the exempt path is still 413.
+
+    The exemption passes the request inward instead of answering it, so
+    everything below the auth layer still applies. An exemption that
+    short-circuited would hand the one unauthenticated route an unbounded body,
+    which is the opposite of what an exemption should cost.
+
+    The order mirrors main.py: BodySizeLimitMiddleware is added first and is
+    therefore inner, AuthenticationMiddleware is added last and is outer.
     """
-    code = _source("runs.py")
-    for counter in ("def state_counts", "def retained"):
-        assert counter not in code, f"{counter} exists in runs.py"
+    import bodylimit
+
+    app = FastAPI()
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    app.add_middleware(bodylimit.BodySizeLimitMiddleware, max_bytes=8)
+    app.add_middleware(auth.AuthenticationMiddleware,
+                       provider=auth.BearerAuth(TOKEN))
+    probe = TestClient(app)
+
+    assert probe.get("/health").status_code == 200
+    oversized = probe.request("GET", "/health", content=b"x" * 64)
+    assert oversized.status_code == 413, (
+        "the body limit no longer applies to the unauthenticated route"
+    )
 
 
-def test_the_hub_can_only_learn_saturation_by_being_refused():
-    """Which is finding out after sending work to the wrong site."""
-    code = _source("main.py")
-    assert "RunCapacityError" in code
-    assert "503" in code
-    assert "Retry-After" in code
+def test_the_order_of_the_two_middlewares_is_the_one_measured_above():
+    """So the test above keeps describing production.
+
+    Swapping the two would put the body limit outside authentication, where it
+    would also bound bodies that are about to be refused anyway -- harmless --
+    but would mean the exempt path is no longer the one measured. Pinned on the
+    stripped source, because grep matches a comment as readily as code.
+    """
+    import re
+
+    source = (REPO_ROOT / "main.py").read_text()
+    code = re.sub(r"#.*", "", source)
+    limit = code.index("add_middleware(BodySizeLimitMiddleware")
+    authn = code.index("add_middleware(AuthenticationMiddleware")
+    assert limit < authn, (
+        "authentication must be added last so it is the outermost layer"
+    )
+
+
+# --- capacity ---------------------------------------------------------------
+
+def test_capacity_needs_credentials(client):
+    refused = client.get("/capacity")
+    assert refused.status_code == 401
+    assert refused.headers.get("www-authenticate") == "Bearer"
+
+
+def test_capacity_reports_what_a_hub_routes_on(client):
+    body = client.get("/capacity", headers=authorised()).json()
+    assert body["runner"] in ("subprocess", "apptainer")
+    assert body["authentication"] == "bearer"
+    assert body["runs"]["slots"] >= 1
+    assert 0 <= body["runs"]["free"] <= body["runs"]["slots"]
+    assert body["retained"]["cap"] >= 1
+
+
+def test_capacity_reports_the_provider_the_stack_enforces():
+    """Not a second reading of the environment. A field saying `bearer` while
+    the stack admits anyone is worse than no field at all, so production has to
+    hand the middleware the same object this endpoint reports."""
+    source = (REPO_ROOT / "main.py").read_text()
+    assert "app.add_middleware(AuthenticationMiddleware, provider=AUTH)" in source
+    assert '"authentication": AUTH.name' in source
+
+
+def test_an_undeclared_version_is_null_and_not_invented(client):
+    """A number this service made up would be worse than none, because a hub
+    routing work would believe it."""
+    assert client.get("/capacity", headers=authorised()).json()["version"] is None
+
+
+def test_datasets_are_null_rather_than_an_empty_list(client):
+    """Which datasets a site holds comes from the DataSource interface, which is
+    not in this tree. [] would read as "this site holds none"."""
+    assert client.get("/capacity", headers=authorised()).json()["datasets"] is None
+
+
+# --- the counting behind it -------------------------------------------------
+
+def test_queued_runs_are_not_counted_as_busy():
+    """A QUEUED run is admitted and waiting, not occupying a slot. Counting it
+    as busy would have a hub route away from an agent that is in fact free."""
+    store = RunStore()
+    waiting, running = store.create(), store.create()
+    store.advance(running.run_id, RunState.INITIALIZING)
+    store.advance(running.run_id, RunState.RUNNING)
+
+    counts = store.state_counts()
+    busy = sum(counts.get(s.value, 0) for s in main.BUSY_STATES)
+    assert counts[RunState.QUEUED.value] == 1
+    assert busy == 1, "a queued run was counted against the slots"
+
+
+def test_canceling_still_holds_its_slot():
+    """The worker has not let go of it yet."""
+    assert RunState.CANCELING in main.BUSY_STATES
+
+
+def test_a_finished_run_frees_its_slot():
+    store = RunStore()
+    run = store.create()
+    store.advance(run.run_id, RunState.INITIALIZING)
+    store.advance(run.run_id, RunState.RUNNING)
+    store.advance(run.run_id, RunState.COMPLETE)
+    busy = sum(store.state_counts().get(s.value, 0) for s in main.BUSY_STATES)
+    assert busy == 0
+
+
+def test_the_counts_are_walked_and_not_tallied():
+    """A tally drifts the first time an eviction is not accounted for, and a
+    wrong count is harder to notice than a slow one."""
+    store = RunStore(max_runs=2)
+    first = store.create()
+    store.advance(first.run_id, RunState.INITIALIZING)
+    store.advance(first.run_id, RunState.RUNNING)
+    store.advance(first.run_id, RunState.COMPLETE)
+    store.create()
+    store.create()
+    assert store.retained() == 2
+    assert sum(store.state_counts().values()) == 2, (
+        "the counts disagree with what the store holds"
+    )
+
+
+def test_counting_is_safe_while_runs_are_admitted_and_evicted():
+    """Requests arrive while a walk of the store is happening.
+
+    The dangerous neighbour is admission, not advancement: create() inserts and
+    may evict, which changes the dict's size mid-iteration -- a RuntimeError in
+    whichever thread is unlucky. Advancing a run only changes a value, so a test
+    that advances alone proves nothing, and the first version of this test
+    passed with the lock removed.
+
+    max_runs is small so eviction runs constantly, which is the deletion half.
+    """
+    import threading
+
+    store = RunStore(max_runs=8)
+    errors = []
+    stop = threading.Event()
+
+    def churn():
+        try:
+            while not stop.is_set():
+                run = store.create()
+                store.advance(run.run_id, RunState.INITIALIZING)
+                store.advance(run.run_id, RunState.RUNNING)
+                store.advance(run.run_id, RunState.COMPLETE)
+        except Exception as exc:
+            errors.append(exc)
+
+    def count():
+        try:
+            for _ in range(4000):
+                store.state_counts()
+                store.retained()
+        except Exception as exc:
+            errors.append(exc)
+
+    writer = threading.Thread(target=churn, daemon=True)
+    reader = threading.Thread(target=count)
+    writer.start()
+    reader.start()
+    reader.join()
+    stop.set()
+    writer.join(timeout=5)
+    assert not errors, errors
