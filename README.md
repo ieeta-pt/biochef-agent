@@ -96,6 +96,50 @@ until the run ends. This setting is a retention bound, not a peak resource
 limit. Logs may contain sensitive tool output; this prototype has no local
 log-release policy for TRE use.
 
+### Which request was that
+
+Every response carries an `X-Request-Id` header, and `POST /runs` records the
+value on the run.
+
+A hub fanning work out to several agents needs a handle it chose itself. Today
+the refusals give it nothing: `POST /runs` answers `503` at capacity and `401`
+on bad credentials, and both carry a detail string and no `run_id`, because no
+run was created. A hub that sent ten workflows and got three refusals cannot
+say which three. On success it is only slightly better — the `run_id` is the
+agent's own invention, so if the response is lost in transit the run is
+orphaned, executing here and unknown there.
+
+Send `X-Request-Id` and it comes back on the response, on the run record, and
+on every later `GET /runs/{run_id}` and `GET /runs/{run_id}/logs`. Send nothing and one is generated, so
+there is always an id to quote.
+
+**An unusable value is replaced, not refused.** Up to 128 characters of
+`A-Za-z0-9._~:/+=@-`; anything else — a newline, a control character, a
+non-ASCII byte, something longer — and a generated id is used instead. Refusing
+a workflow submission over a header nobody needs would be a worse failure than
+ignoring the header. The response always carries the id that was actually used,
+so comparing it against what you sent tells you whether your value was taken.
+
+The reason for validating at all is not what it looks like. `h11`, which
+uvicorn speaks and so what `fastapi run` serves, refuses to write an illegal
+header value — so an unvalidated echo would not inject a header, it would
+destroy the response with a protocol error. A caller could delete its own
+successful submissions by sending one bad header.
+
+Two inbound values — a proxy adding its own alongside yours — and the first
+wins.
+
+**One response does not carry an id:** the `500` from an unhandled exception,
+which starlette writes outside every middleware this application adds. Note
+that `/convert` currently answers `500` to a workflow that is merely malformed
+(issue #86), so this gap is reachable by ordinary client error and not only by
+a crash.
+
+This is not tracing and not logging. W3C `traceparent` is the standard for
+tracing and needs span ids and sampling decisions; this service currently logs
+nothing at all, so there is no log line for an id to tag. Both are separate
+work, and neither is blocked by this.
+
 Both take the same fields:
 
 | field | what it is |

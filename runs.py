@@ -89,8 +89,19 @@ if MAX_RUNS < 1:
 class Run:
     """One submitted workflow, and whatever is known about it so far."""
 
-    def __init__(self, run_id: str):
+    def __init__(self, run_id: str, request_id: str = None):
         self.run_id = run_id
+        self.request_id = request_id
+        """The id of the request that asked for this run, when there was one.
+
+        A hub whose submission response was lost in transit -- a timeout, a
+        proxy hiccup -- never learned the run_id, and the run is then executing
+        here and unknown there. Carrying the caller's own id back means it can
+        recognise the run as the one it asked for.
+
+        None for a run created without a request behind it, which is every run
+        in a test that builds a store directly.
+        """
         self.state = RunState.QUEUED
         self.outputs = None
         self.error = None
@@ -114,7 +125,7 @@ class Run:
         stderr headings. Tool output can imitate those headings. `node_logs`
         comes from separate files opened for each executed rule.
         """
-        return {
+        body = {
             "run_id": self.run_id,
             "state": self.state.value,
             "stdout": self.stdout,
@@ -122,6 +133,12 @@ class Run:
             "failed_steps": self.failed_steps,
             "node_logs": self.node_logs,
         }
+        if self.request_id is not None:
+            # Same as as_dict. This endpoint already repeats run_id and state,
+            # and a hub fetching logs should not have to fetch the run as well
+            # to learn which of its submissions they belong to.
+            body["request_id"] = self.request_id
+        return body
 
     def as_dict(self) -> dict:
         """What a caller is told about this run.
@@ -133,6 +150,11 @@ class Run:
         is not one.
         """
         body = {"run_id": self.run_id, "state": self.state.value}
+        if self.request_id is not None:
+            # Present whenever a request asked for this run, which is every run
+            # the route creates. Absent rather than null when there was none, to
+            # match how error and outputs behave.
+            body["request_id"] = self.request_id
         if self.step_status:
             # What the editor paints on each node. Present as soon as the
             # workflow starts, because the output is read as it arrives rather
@@ -160,10 +182,10 @@ class RunStore:
         if self._max < 1:
             raise ValueError("max_runs must be positive")
 
-    def create(self) -> Run:
+    def create(self, request_id: str = None) -> Run:
         with self._lock:
             self._evict_if_needed()
-            run = Run(uuid.uuid4().hex)
+            run = Run(uuid.uuid4().hex, request_id=request_id)
             self._runs[run.run_id] = run
         return run
 

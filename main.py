@@ -2,7 +2,7 @@ from convert import *
 from convert import rule_name_for
 import asyncio
 import weakref
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from typing import List
@@ -20,6 +20,7 @@ from runs import (IllegalTransition, RunCapacityError, RunState, RunStore,
 from steplogs import (Progress, clamp, failing_steps, make_step_log_names,
                       read_node_logs)
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
+from requestid import RequestIdMiddleware
 from evidence_verification import EvidenceVerificationError
 from runner import SubprocessRunner, get_runner
 from signing import SignatureError
@@ -42,6 +43,12 @@ for bearer without a token, fails to start rather than accepting work.
 # before any of the body is accepted. An anonymous caller should not be able to
 # make this service buffer half a gigabyte before being told no (#10).
 app.add_middleware(AuthenticationMiddleware, provider=AUTH)
+
+# Added last, so it is the outermost layer. Everything it exists to label --
+# the 401 above, the 413 from the body size limit, the 503 at capacity -- is
+# written beneath it, and a response that leaves without passing back through
+# here leaves without an id.
+app.add_middleware(RequestIdMiddleware)
 
 
 @app.exception_handler(UnsafeName)
@@ -451,6 +458,7 @@ def _advance(run_id, state, **detail):
     503: {"description": "Agent capacity reached; retry later"},
 })
 async def submit_run(
+    request: Request,
     biochef_workflow: str = Form(...),
     files: List[UploadFile] = File(...)
 ):
@@ -460,9 +468,14 @@ async def submit_run(
     work runs there is no request left to read them from -- which is the whole
     difference between this and /convert, and the reason it cannot simply call
     the same handler in the background.
+
+    The run records the id of the request that asked for it, taken from
+    request.state where RequestIdMiddleware put the validated value. Not read
+    from the header here: that would be the raw caller input, and the whole
+    point of the middleware is that nothing downstream handles that.
     """
     try:
-        run = RUNS.create()
+        run = RUNS.create(request_id=getattr(request.state, "request_id", None))
     except RunCapacityError:
         raise HTTPException(
             status_code=503, detail="agent run capacity reached; retry later",

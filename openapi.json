@@ -145,7 +145,7 @@
     },
     "/runs": {
       "post": {
-        "description": "Accept a workflow and answer immediately with something to poll.\n\nThe uploads are read here, while the request is still open. By the time the\nwork runs there is no request left to read them from -- which is the whole\ndifference between this and /convert, and the reason it cannot simply call\nthe same handler in the background.",
+        "description": "Accept a workflow and answer immediately with something to poll.\n\nThe uploads are read here, while the request is still open. By the time the\nwork runs there is no request left to read them from -- which is the whole\ndifference between this and /convert, and the reason it cannot simply call\nthe same handler in the background.\n\nThe run records the id of the request that asked for it, taken from\nrequest.state where RequestIdMiddleware put the validated value. Not read\nfrom the header here: that would be the raw caller input, and the whole\npoint of the middleware is that nothing downstream handles that.",
         "operationId": "submit_run_runs_post",
         "requestBody": {
           "content": {
