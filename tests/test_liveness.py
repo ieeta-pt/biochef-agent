@@ -228,6 +228,40 @@ def test_an_undeclared_version_is_null_and_not_invented(client):
     assert client.get("/capacity", headers=authorised()).json()["version"] is None
 
 
+def test_a_version_of_nothing_but_whitespace_is_not_a_version():
+    """Which is what a CI template substituting an empty variable produces.
+
+    The setting is read at import, so this reads it in a fresh interpreter
+    rather than reloading the module in this one -- a reload replaces RUNS, AUTH
+    and app while other tests in the session hold the old ones, and patching the
+    constant afterwards would pass even if the value were never stripped where
+    it is read.
+    """
+    import os
+    import subprocess
+
+    def version_for(value):
+        env = dict(os.environ, BIOCHEF_AGENT_VERSION=value)
+        probe = subprocess.run(
+            [sys.executable, "-c",
+             "import sys, types\n"
+             "m = types.ModuleType('oras'); c = types.ModuleType('oras.client')\n"
+             "class C:\n"
+             "    def __init__(s, *a, **k): pass\n"
+             "    def login(s, *a, **k): pass\n"
+             "c.OrasClient = C; m.client = c\n"
+             "sys.modules['oras'] = m; sys.modules['oras.client'] = c\n"
+             "import main; print(repr(main.AGENT_VERSION))"],
+            cwd=REPO_ROOT, env=env, capture_output=True, text=True)
+        assert probe.returncode == 0, probe.stderr[-2000:]
+        return eval(probe.stdout.strip())
+
+    assert version_for("  \t ") == "", "whitespace is not a version"
+    assert version_for("  2026.10-abc123 ") == "2026.10-abc123", (
+        "a version is reported without the whitespace around it"
+    )
+
+
 def test_datasets_are_null_rather_than_an_empty_list(client):
     """Which datasets a site holds comes from the DataSource interface, which is
     not in this tree. [] would read as "this site holds none"."""

@@ -585,13 +585,17 @@ async def cancel_run(run_id: str):
     return RUNS.get(run_id).as_dict()
 
 
-AGENT_VERSION = os.getenv("BIOCHEF_AGENT_VERSION", "")
+AGENT_VERSION = os.getenv("BIOCHEF_AGENT_VERSION", "").strip()
 """What this deployment calls itself, for a hub that talks to several.
 
 Empty by default and reported as null rather than invented. A version this
 service made up would be worse than none, because a hub routing work would
 believe it and act on it. A deployment that wants one sets it, usually to the
 commit it was built from.
+
+Stripped, because a value that is only whitespace is a deployment that did not
+set one. A CI template substituting an empty variable produces exactly that,
+and "   " reported as a version is believed as readily as a real one.
 """
 
 # The states that occupy an execution slot. QUEUED is admitted and waiting, so
