@@ -407,9 +407,16 @@ def test_an_unhandled_exception_comes_back_without_one():
     """A known boundary, recorded rather than discovered later.
 
     starlette's ServerErrorMiddleware sits outside every middleware the
-    application adds, so the 500 it writes never passes back through here.
-    Tagging it would mean owning the exception handler, which is a different
-    change. If this ever starts failing, the limitation has been fixed and the
+    application adds, so the 500 it writes never passes back through here, and
+    a catch-all handler would not help -- starlette gives Exception to that
+    same outermost layer.
+
+    Found to matter more than expected while auditing: /convert answers 500 to
+    a workflow that is merely malformed (#86), so the uncorrelatable response
+    is reachable by ordinary client error rather than only by a crash. The fix
+    belongs in #86 -- stop answering 500 to bad input -- not here.
+
+    If this ever starts failing, the limitation has been lifted and the
     docstring in requestid.py should stop claiming it.
     """
     from fastapi import FastAPI

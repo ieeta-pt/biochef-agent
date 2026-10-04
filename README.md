@@ -130,7 +130,10 @@ Two inbound values — a proxy adding its own alongside yours — and the first
 wins.
 
 **One response does not carry an id:** the `500` from an unhandled exception,
-which starlette writes outside every middleware this application adds.
+which starlette writes outside every middleware this application adds. Note
+that `/convert` currently answers `500` to a workflow that is merely malformed
+(issue #86), so this gap is reachable by ordinary client error and not only by
+a crash.
 
 This is not tracing and not logging. W3C `traceparent` is the standard for
 tracing and needs span ids and sampling decisions; this service currently logs

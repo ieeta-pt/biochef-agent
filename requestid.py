@@ -87,8 +87,15 @@ class RequestIdMiddleware:
 
     One thing it does not reach: the 500 that starlette's own
     ServerErrorMiddleware writes sits outside every middleware the application
-    adds, so an unhandled exception comes back without an id. Tagging that would
-    mean owning the exception handler, which is a different change.
+    adds, so an unhandled exception comes back without an id. A catch-all
+    handler would not help -- starlette gives Exception to that same outermost
+    layer, so the response would still be built beyond this one.
+
+    That matters more than it sounds, because /convert reaches a 500 on an
+    ordinary malformed workflow rather than only on a genuine crash (#86), and
+    an uncorrelatable response to a routine client mistake is the case a hub
+    most wants to report back. The fix is to stop answering 500 to bad input,
+    not to tag the 500.
     """
 
     def __init__(self, app):
