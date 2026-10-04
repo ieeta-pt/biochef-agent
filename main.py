@@ -2,10 +2,11 @@ from convert import *
 from convert import rule_name_for
 import asyncio
 import weakref
-from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
+from fastapi import (FastAPI, Header, HTTPException, File, Form, Request,
+                     UploadFile)
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
-from typing import List
+from typing import Annotated, List
 import json
 from pydantic import BaseModel
 import os
@@ -15,12 +16,14 @@ import base64
 
 from workspace import UnsafeName, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
-from runs import (IllegalTransition, RunCapacityError, RunState, RunStore,
+from runs import (IllegalTransition, KeyInFlight, Replay, RunCapacityError,
+                  RunState, RunStore,
                   TERMINAL, UnknownRun)
 from steplogs import (Progress, clamp, failing_steps, make_step_log_names,
                       read_node_logs)
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
 from requestid import RequestIdMiddleware
+import idempotency
 from evidence_verification import EvidenceVerificationError
 from runner import SubprocessRunner, get_runner
 from signing import SignatureError
@@ -455,12 +458,25 @@ def _advance(run_id, state, **detail):
 
 
 @app.post("/runs", status_code=202, responses={
+    200: {"description": "This Idempotency-Key already created this run"},
+    400: {"description": "The Idempotency-Key cannot be used; nothing was run"},
+    409: {"description": "A request with this Idempotency-Key is still being "
+                         "admitted; retry shortly"},
+    422: {"description": "This Idempotency-Key was used for a different "
+                         "submission"},
     503: {"description": "Agent capacity reached; retry later"},
 })
 async def submit_run(
     request: Request,
     biochef_workflow: str = Form(...),
-    files: List[UploadFile] = File(...)
+    files: List[UploadFile] = File(...),
+    # Annotated, so the actual default is None. With the older
+    # `= Header(default=None)` spelling the default IS the Header object, and
+    # the two tests that call this handler directly -- bypassing fastapi's
+    # dependency resolution -- received that object and passed it to the
+    # validator.
+    idempotency_key: Annotated[str | None,
+                               Header(alias="Idempotency-Key")] = None,
 ):
     """Accept a workflow and answer immediately with something to poll.
 
@@ -473,18 +489,72 @@ async def submit_run(
     request.state where RequestIdMiddleware put the validated value. Not read
     from the header here: that would be the raw caller input, and the whole
     point of the middleware is that nothing downstream handles that.
+
+    With an Idempotency-Key (#87), a key that already created a run returns
+    that run instead of starting a second one. The lookup and the creation are
+    one operation inside the store, because two retries that each looked first
+    and then created would both find nothing -- and two retries racing is the
+    likeliest shape for a retry to arrive in.
+
+    A replay still reads the uploads. It has to: whether this is the same
+    submission or the same key used for a different one cannot be known
+    without looking at the body, and answering either without checking would
+    be the worse of the two mistakes.
     """
     try:
-        run = RUNS.create(request_id=getattr(request.state, "request_id", None))
+        key = idempotency.validated(idempotency_key)
+    except idempotency.MalformedKey as unusable:
+        # Refused rather than run without it. Accepting the submission while
+        # quietly dropping the key would return a 202 that looks like
+        # protection and is not -- see idempotency.py.
+        raise HTTPException(status_code=400, detail=str(unusable)) from None
+
+    try:
+        run = RUNS.create(request_id=getattr(request.state, "request_id", None),
+                          idempotency_key=key)
     except RunCapacityError:
+        # Before any key was recorded, so a transient refusal does not become a
+        # permanent one: the same key can be retried when a slot frees up.
         raise HTTPException(
             status_code=503, detail="agent run capacity reached; retry later",
             headers={"Retry-After": "1"},
         ) from None
+    except KeyInFlight:
+        raise HTTPException(
+            status_code=409,
+            detail="a request with this Idempotency-Key is still being "
+                   "admitted; retry shortly",
+            headers={"Retry-After": "1"},
+        ) from None
+    except Replay as replay:
+        uploads = [(f.filename, await f.read()) for f in files]
+        if idempotency.fingerprint(biochef_workflow, uploads) != \
+                replay.run.fingerprint:
+            raise HTTPException(
+                status_code=422,
+                detail="this Idempotency-Key was used for a different "
+                       "submission; use a new key for new work",
+            ) from None
+        # 200 rather than the route's 202: nothing was accepted here, and a
+        # hub reading its own log should be able to tell a replay from an
+        # acceptance. Returned as a response rather than by mutating an
+        # injected one, which keeps this handler callable with the same
+        # positional arguments it had before.
+        return JSONResponse(status_code=200, content=replay.run.as_dict())
+
     try:
         uploads = [(f.filename, await f.read()) for f in files]
+        if key is not None:
+            # Only now can a concurrent retry be compared against this one, so
+            # until this point the key reads as in flight rather than done.
+            RUNS.settle_fingerprint(
+                run.run_id,
+                idempotency.fingerprint(biochef_workflow, uploads))
         task = asyncio.create_task(_execute(run.run_id, biochef_workflow, uploads))
     except BaseException:
+        # Takes the key with it, or a submission that never ran would hold its
+        # key for the life of the store and every retry would be told the work
+        # is already done.
         RUNS.discard(run.run_id)
         raise
     # Held until it finishes, then dropped. See _running above: without this the

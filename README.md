@@ -140,6 +140,61 @@ tracing and needs span ids and sampling decisions; this service currently logs
 nothing at all, so there is no log line for an id to tag. Both are separate
 work, and neither is blocked by this.
 
+### Retrying a submission without running it twice
+
+`POST /runs` takes an optional `Idempotency-Key`. A key not seen before creates
+a run as usual. A key already seen returns the run it created, with `200`
+instead of `202`, and starts nothing.
+
+Without a key nothing changes: two identical submissions are two runs and the
+tool executes twice. That is what a hub does when a submission times out, when
+a proxy drops the response, or when it restarts and replays its queue — and it
+costs more than duplicated compute, because two runs for one request double the
+pressure on both the slot bound and `BIOCHEF_MAX_RUNS`, so retrying under load
+pushes the agent further into the `503` that caused the retry.
+
+The run carries the key back on `GET /runs/{run_id}`, so a caller can confirm
+the run it was given is the one its key created rather than taking it on trust.
+
+| outcome | status |
+|---|---|
+| new key | `202`, a run is created |
+| same key, same submission | `200`, the original run, nothing started |
+| same key, different submission | `422` |
+| key still being admitted | `409` with `Retry-After` |
+| key unusable | `400`, nothing ran |
+
+**The same key for a different submission is refused rather than replayed.**
+Two submissions are the same submission when the workflow and every uploaded
+byte match; the uploads are already read into memory, so this costs a hash of
+what is there. Comparison is by name and content with lengths included, so a
+file named `a` holding `bc` is not the same as one named `ab` holding `c`, and
+the order the parts arrive in does not matter because a retrying client does
+not control it. A replay therefore does read the body — it has to, since
+whether this is the same submission cannot be known without looking.
+
+**An unusable key is refused, not ignored** — up to 255 characters of
+`A-Za-z0-9._~:/+=@-`. This is the opposite of what `X-Request-Id` does with a
+bad value, deliberately. Ignoring a bad request id costs a lost correlation;
+ignoring a bad idempotency key costs the caller the exact protection it asked
+for, because it believes a retry is safe, retries, and the work runs twice.
+Silently degrading a safety guarantee is worse than refusing the request, and
+nothing ran, so it is safe to retry with a usable key.
+
+**A key is remembered for exactly as long as the run it created.** The index
+lives in the run store and an entry is dropped by whatever drops the run, so
+there is no second thing to bound and no way for a key to outlive what it
+points at. A retry arriving after the original was evicted creates a new run —
+duplicating work, but only long after the original finished and aged out of
+`BIOCHEF_MAX_RUNS`.
+
+**A refusal does not burn a key.** A submission rejected at capacity with
+`503`, or one whose upload failed to arrive, leaves the key free: nothing
+happened, and a transient refusal must not become a permanent one.
+
+`/convert` does not take a key. It is synchronous and returns the outputs, so a
+retry there is wasteful but not orphaning.
+
 Both take the same fields:
 
 | field | what it is |

@@ -86,6 +86,27 @@ if MAX_RUNS < 1:
     raise ValueError("BIOCHEF_MAX_RUNS must be positive")
 
 
+class KeyInFlight(Exception):
+    """A request with this idempotency key is still being admitted (#87).
+
+    Two retries racing is what retrying looks like, so this is not a mistake in
+    the caller -- but the agent cannot yet say which run the key belongs to,
+    and inventing a second one is the thing being prevented.
+    """
+
+
+class Replay(Exception):
+    """This idempotency key already created a run (#87).
+
+    Carries the run so the caller's body can be compared against its
+    fingerprint before the run is handed back.
+    """
+
+    def __init__(self, run):
+        super().__init__(run.run_id)
+        self.run = run
+
+
 class Run:
     """One submitted workflow, and whatever is known about it so far."""
 
@@ -101,6 +122,22 @@ class Run:
 
         None for a run created without a request behind it, which is every run
         in a test that builds a store directly.
+        """
+        self.idempotency_key = None
+        """The key that created this run, when the caller offered one (#87).
+
+        Set by RunStore.create, which also indexes it. Kept on the record
+        rather than only in the index so eviction cannot leave the two
+        disagreeing: whatever drops the run drops the key.
+        """
+        self.fingerprint = None
+        """What the submission that created this run looked like.
+
+        None until the uploads have been read -- a run exists before its body
+        does, because admission is refused before a large body is read. A key
+        whose run has no fingerprint yet is a submission still being admitted,
+        which is why a concurrent retry gets told to wait rather than given
+        this run.
         """
         self.state = RunState.QUEUED
         self.outputs = None
@@ -155,6 +192,10 @@ class Run:
             # the route creates. Absent rather than null when there was none, to
             # match how error and outputs behave.
             body["request_id"] = self.request_id
+        if self.idempotency_key is not None:
+            # So a caller holding a key can confirm the run it got back is the
+            # one that key created, rather than taking it on trust.
+            body["idempotency_key"] = self.idempotency_key
         if self.step_status:
             # What the editor paints on each node. Present as soon as the
             # workflow starts, because the output is read as it arrives rather
@@ -177,22 +218,79 @@ class RunStore:
 
     def __init__(self, max_runs: int = None):
         self._runs = OrderedDict()
+        self._by_key = {}
+        """Idempotency key -> run_id, for the runs still retained (#87).
+
+        Not a second store with its own bound. Every entry here points at a
+        live entry in _runs, and _evict_if_needed and discard remove both
+        together under this lock -- so the window in which a key is honoured
+        is exactly the retention window that is already documented, and there
+        is no way for the index to outlive what it indexes or to grow without
+        limit.
+        """
         self._lock = threading.Lock()
         self._max = MAX_RUNS if max_runs is None else max_runs
         if self._max < 1:
             raise ValueError("max_runs must be positive")
 
-    def create(self, request_id: str = None) -> Run:
+    def create(self, request_id: str = None, idempotency_key: str = None):
+        """Admit a run, or refuse because this key already admitted one.
+
+        Looking the key up and creating the run have to be ONE operation under
+        this lock. Two concurrent retries that each checked first and then
+        created would both find nothing and both create -- which is the exact
+        duplicate this exists to prevent, and it is the likeliest shape for a
+        retry to arrive in.
+
+        Raises Replay when the key already has a run, carrying it so the
+        caller can compare bodies before handing it back; KeyInFlight when the
+        key has a run whose body has not been read yet, because the agent
+        cannot yet say whether this is the same submission; RunCapacityError
+        as before.
+
+        A key is recorded only once the run exists, and the capacity refusal
+        happens before that, so a request refused with 503 does not burn its
+        key -- a transient refusal must not become a permanent one.
+        """
         with self._lock:
+            if idempotency_key is not None:
+                prior = self._runs.get(self._by_key.get(idempotency_key))
+                if prior is not None:
+                    if prior.fingerprint is None:
+                        raise KeyInFlight(idempotency_key)
+                    raise Replay(prior)
+
+            # Eviction cannot take this key's run: the check above means the
+            # key has none, so there is nothing here to protect from it.
             self._evict_if_needed()
             run = Run(uuid.uuid4().hex, request_id=request_id)
+            run.idempotency_key = idempotency_key
             self._runs[run.run_id] = run
+            if idempotency_key is not None:
+                self._by_key[idempotency_key] = run.run_id
         return run
 
-    def discard(self, run_id: str) -> None:
-        """Undo admission when request upload fails before a run is launched."""
+    def settle_fingerprint(self, run_id: str, value: str) -> None:
+        """Record what the submission looked like, once its body has been read.
+
+        Until this happens the run's key reads as in flight, so a concurrent
+        retry is told to wait rather than handed a run whose body is unknown.
+        """
         with self._lock:
-            del self._runs[run_id]
+            run = self._runs.get(run_id)
+            if run is not None:
+                run.fingerprint = value
+
+    def discard(self, run_id: str) -> None:
+        """Undo admission when request upload fails before a run is launched.
+
+        Takes the key index with it, or a submission that never ran would hold
+        its key for as long as the store lives and every retry would be told
+        the work is already done.
+        """
+        with self._lock:
+            run = self._runs.pop(run_id)
+            self._forget_key(run)
 
     def get(self, run_id: str) -> Run:
         with self._lock:
@@ -278,12 +376,25 @@ class RunStore:
             if run is not None:
                 run.pgid = None
 
+    def _forget_key(self, run) -> None:
+        """Called with the lock held. Drop a run's key, if it still owns it.
+
+        Checked rather than assumed: a key is reassigned when the run it
+        pointed at has been evicted and a retry creates a new one, and the
+        later run then owns the entry. Deleting unconditionally would remove
+        the live run's key when the stale one is discarded.
+        """
+        key = getattr(run, "idempotency_key", None)
+        if key is not None and self._by_key.get(key) == run.run_id:
+            del self._by_key[key]
+
     def _evict_if_needed(self):
         """Called with the lock held."""
         while len(self._runs) >= self._max:
             for run_id, run in self._runs.items():
                 if run.state in TERMINAL:
                     del self._runs[run_id]
+                    self._forget_key(run)
                     break
             else:
                 raise RunCapacityError("all remembered runs are still in flight")
