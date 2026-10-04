@@ -194,12 +194,17 @@ to `upload` alone — bytes pushed in the request, which is what the editor does
 Adding `localpath` lets a workflow name a file already on the agent's host, which
 is the ordinary case inside a TRE where the data is already on the machine.
 
-**`localpath` requires `BIOCHEF_LOCAL_ROOT`,** and refuses to start without it.
+**`localpath` requires `BIOCHEF_LOCAL_ROOT` to be an existing directory,** and
+refuses to start without it.
 The client chooses the path, so a source that could read anywhere would be an
 arbitrary-file-read with a workflow engine attached: a workflow naming
 `/etc/shadow` as an input would have it copied into a workspace and returned as a
 tool's output. Paths are resolved before being checked against the root, so a
 symlink inside it pointing outward is refused too.
+
+The root and its parent directories must not be modifiable by untrusted users
+or tools: validation and opening are separate operations. This provider does
+not enforce filesystem permissions or prevent changes between those operations.
 
 Three more decide how isolated a run is, and are worth reading twice before
 changing.

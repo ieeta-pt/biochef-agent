@@ -87,6 +87,10 @@ class LocalPathSource(DataSource):
                 "guessing at one, because the client chooses the path."
             )
         self.root = os.path.realpath(root)
+        if not os.path.isdir(self.root):
+            raise ValueError(
+                f"BIOCHEF_LOCAL_ROOT {self.root!r} is not an existing directory"
+            )
 
     def describe(self) -> str:
         return f"{self.name} ({self.root})"
@@ -97,6 +101,9 @@ class LocalPathSource(DataSource):
                 f"{name!r}: the localpath source expects a path, got "
                 f"{type(spec).__name__}"
             )
+
+        if "\x00" in spec:
+            raise DataSourceError(f"{name!r}: the localpath path contains a NUL byte")
 
         # Resolved and then checked against the root, rather than checked and
         # then resolved. A symlink inside the root pointing outside it passes
