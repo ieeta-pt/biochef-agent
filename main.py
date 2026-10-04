@@ -679,6 +679,11 @@ async def capacity():
             # with a queue still has free slots the moment one is released, and
             # a hub told otherwise would route away from a site that is free.
             "queued": counts.get(RunState.QUEUED.value, 0),
+            # Whether a submission would be admitted at all, which free slots
+            # do not answer: a full set of non-terminal runs refuses with 503
+            # even with every slot idle. A hub told only about slots routes
+            # work to an agent that will refuse it.
+            "accepting": RUNS.accepting(),
             "by_state": counts,
         },
         "retained": {"runs": RUNS.retained(), "cap": MAX_RUNS},

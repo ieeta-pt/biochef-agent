@@ -191,6 +191,24 @@ class RunStore:
                 counts[run.state.value] = counts.get(run.state.value, 0) + 1
         return counts
 
+    def accepting(self) -> bool:
+        """Whether create() would admit a run right now.
+
+        Separate from free slots, and not derivable from them. A full set of
+        non-terminal runs refuses new work with 503 even with every execution
+        slot idle -- reachable with MAX_RUNS queued runs and nothing running --
+        so an agent can be simultaneously `free: 4` and refusing everything. A
+        hub told only about slots routes work there and gets the 503.
+
+        This restates _evict_if_needed's rule, which is a drift risk, so a test
+        compares this against what create() actually does at each boundary
+        rather than against a second copy of the condition.
+        """
+        with self._lock:
+            return (len(self._runs) < self._max
+                    or any(run.state in TERMINAL
+                           for run in self._runs.values()))
+
     def retained(self) -> int:
         """How many run records are held, against the cap that evicts them."""
         with self._lock:

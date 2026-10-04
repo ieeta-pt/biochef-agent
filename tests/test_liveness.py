@@ -47,7 +47,7 @@ from fastapi.testclient import TestClient
 
 import auth
 import main
-from runs import RunState, RunStore
+from runs import RunCapacityError, RunState, RunStore
 
 TOKEN = "a-shared-secret"
 
@@ -507,4 +507,87 @@ def test_capacity_sees_a_held_slot_that_has_no_run_record(monkeypatch):
     assert held["runs"]["by_state"] == {}
     assert "slots" not in held["runs"], (
         "slots moved out of runs, because they are not only runs"
+    )
+
+
+# --- whether work would be taken at all -------------------------------------
+
+def _finish(store, run):
+    store.advance(run.run_id, RunState.INITIALIZING)
+    store.advance(run.run_id, RunState.RUNNING)
+    store.advance(run.run_id, RunState.COMPLETE)
+
+
+def _start(store, run):
+    store.advance(run.run_id, RunState.INITIALIZING)
+    store.advance(run.run_id, RunState.RUNNING)
+
+
+def _at_the_cap(terminal=0, running=0):
+    """A store with MAX_RUNS records in the states asked for."""
+    store = RunStore(max_runs=3)
+    runs = [store.create() for _ in range(3)]
+    for run in runs[:terminal]:
+        _finish(store, run)
+    for run in runs[terminal:terminal + running]:
+        _start(store, run)
+    return store
+
+
+@pytest.mark.parametrize("label, store", [
+    ("empty", RunStore(max_runs=3)),
+    ("under the cap", None),
+    ("at the cap, all queued", _at_the_cap()),
+    ("at the cap, one terminal", _at_the_cap(terminal=1)),
+    ("at the cap, all running", _at_the_cap(running=3)),
+])
+def test_accepting_agrees_with_what_submitting_actually_does(label, store):
+    """Compared against the behaviour, not against a second copy of the rule.
+
+    accepting() restates _evict_if_needed's condition, and a restatement drifts.
+    Asserting it against another spelling of the same condition would drift with
+    it, so each case asks the predicate and then actually submits.
+    """
+    if store is None:
+        store = RunStore(max_runs=3)
+        store.create()
+        store.create()
+
+    predicted = store.accepting()
+    try:
+        store.create()
+        admitted = True
+    except RunCapacityError:
+        admitted = False
+
+    assert predicted == admitted, (
+        f"{label}: accepting() said {predicted}, submitting gave {admitted}"
+    )
+
+
+def test_an_agent_can_be_entirely_free_and_still_refuse_everything():
+    """Which is why `accepting` exists and free slots do not answer it.
+
+    MAX_RUNS runs admitted and queued, nothing executing: every slot idle, and
+    the next submission is refused with 503.
+    """
+    store = _at_the_cap()
+    counts = store.state_counts()
+    busy = sum(counts.get(s.value, 0) for s in main.BUSY_STATES)
+
+    assert busy == 0, "nothing is executing"
+    assert store.accepting() is False, "and yet no further work can be admitted"
+
+
+def test_capacity_says_whether_it_is_accepting(client):
+    body = client.get("/capacity", headers=authorised()).json()
+    assert body["runs"]["accepting"] is True
+
+
+def test_capacity_says_so_when_it_is_not_accepting(client, monkeypatch):
+    monkeypatch.setattr(main, "RUNS", _at_the_cap())
+    body = client.get("/capacity", headers=authorised()).json()
+    assert body["runs"]["accepting"] is False
+    assert body["slots"]["free"] == body["slots"]["total"], (
+        "the slots really are idle, which is the point"
     )

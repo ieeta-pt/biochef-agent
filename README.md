@@ -161,7 +161,7 @@ not separately exempt the way liveness is.)
   "authentication": "bearer",
   "runner": "subprocess",
   "slots": {"total": 4, "busy": 2, "free": 2},
-  "runs": {"in_flight": 1, "queued": 2,
+  "runs": {"in_flight": 1, "queued": 2, "accepting": true,
            "by_state": {"RUNNING": 1, "QUEUED": 2, "COMPLETE": 7}},
   "retained": {"runs": 10, "cap": 256},
   "datasets": null
@@ -179,6 +179,15 @@ slot, `INITIALIZING`, `RUNNING` and `CANCELING`. The gap between it and
 admitted and waiting rather than executing, so it is reported separately and is
 not counted as busy. `by_state` is walked from the run store rather than kept as
 a tally, so it cannot drift from what the store holds.
+
+**`runs.accepting` is a separate question from free slots, and free slots do not
+answer it.** `BIOCHEF_MAX_RUNS` bounds how many run records are retained, and a
+full set of non-terminal ones refuses new work with `503` *even with every
+execution slot idle* — reachable with `MAX_RUNS` runs admitted and queued and
+nothing executing. An agent can therefore report `free: 4` and refuse
+everything, and a hub told only about slots would route work there and get the
+refusal. The field answers the admission question directly rather than leaving
+a hub to re-derive it from the retention counts.
 
 `version` is whatever `BIOCHEF_AGENT_VERSION` was set to, and `null` when it was
 not — a deployment that does not say which commit it is built from reports
