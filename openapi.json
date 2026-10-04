@@ -145,8 +145,26 @@
     },
     "/runs": {
       "post": {
-        "description": "Accept a workflow and answer immediately with something to poll.\n\nThe uploads are read here, while the request is still open. By the time the\nwork runs there is no request left to read them from -- which is the whole\ndifference between this and /convert, and the reason it cannot simply call\nthe same handler in the background.\n\nThe run records the id of the request that asked for it, taken from\nrequest.state where RequestIdMiddleware put the validated value. Not read\nfrom the header here: that would be the raw caller input, and the whole\npoint of the middleware is that nothing downstream handles that.",
+        "description": "Accept a workflow and answer immediately with something to poll.\n\nThe uploads are read here, while the request is still open. By the time the\nwork runs there is no request left to read them from -- which is the whole\ndifference between this and /convert, and the reason it cannot simply call\nthe same handler in the background.\n\nThe run records the id of the request that asked for it, taken from\nrequest.state where RequestIdMiddleware put the validated value. Not read\nfrom the header here: that would be the raw caller input, and the whole\npoint of the middleware is that nothing downstream handles that.\n\nWith an Idempotency-Key (#87), a key that already created a run returns\nthat run instead of starting a second one. The lookup and the creation are\none operation inside the store, because two retries that each looked first\nand then created would both find nothing -- and two retries racing is the\nlikeliest shape for a retry to arrive in.\n\nA replay still reads the uploads. It has to: whether this is the same\nsubmission or the same key used for a different one cannot be known\nwithout looking at the body, and answering either without checking would\nbe the worse of the two mistakes.",
         "operationId": "submit_run_runs_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "multipart/form-data": {
@@ -158,6 +176,9 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "description": "This Idempotency-Key already created this run"
+          },
           "202": {
             "content": {
               "application/json": {
@@ -166,15 +187,14 @@
             },
             "description": "Successful Response"
           },
+          "400": {
+            "description": "The Idempotency-Key cannot be used; nothing was run"
+          },
+          "409": {
+            "description": "A request with this Idempotency-Key is still being admitted; retry shortly"
+          },
           "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
+            "description": "This Idempotency-Key was used for a different submission"
           },
           "503": {
             "description": "Agent capacity reached; retry later"
