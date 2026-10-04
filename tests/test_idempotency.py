@@ -468,3 +468,52 @@ def test_a_racing_retry_over_http_gets_409_and_not_a_second_run(
                              idempotency.fingerprint(WORKFLOW,
                                                      [("input-1-out", b"in")]))
     assert _post(client).status_code == 200
+
+
+# --- boundaries an audit turned up, pinned so they are not accidental -------
+
+def test_retrying_after_cancelling_returns_the_cancelled_run(service, counted):
+    """Not a fresh run, which is the surprising-but-correct answer.
+
+    A key identifies one submission. The caller asked for this submission and
+    then asked to stop it, so the honest reply to the same key is the run it
+    created and the state it reached. Resubmitting the same work is a new
+    attempt and takes a new key -- which is how keys are normally minted,
+    per attempt rather than per workflow.
+
+    Pinned because someone will hit it and should find it decided.
+    """
+    client, _ = counted
+    first = _post(client)
+    run_id = first.json()["run_id"]
+    client.post(f"/runs/{run_id}/cancel")
+
+    retried = _post(client)
+    assert retried.status_code == 200
+    assert retried.json()["run_id"] == run_id
+    assert retried.json()["state"] in ("CANCELING", "CANCELED")
+
+
+def test_a_key_is_opaque_and_compared_exactly(service, counted):
+    """No trimming, no case folding, no normalising.
+
+    A client reproduces its key byte for byte on a retry, and anything this
+    service did to it would be one more thing the client has to predict to get
+    protection. Two keys differing only in case are two keys.
+    """
+    client, _ = counted
+    upper = _post(client, key="CaseKey")
+    lower = _post(client, key="casekey")
+    assert upper.status_code == lower.status_code == 202
+    assert upper.json()["run_id"] != lower.json()["run_id"]
+
+
+def test_the_longest_usable_key_works_end_to_end(service, counted):
+    """The boundary from the usable side, over HTTP rather than at the seam."""
+    client, _ = counted
+    longest = "k" * idempotency.MAX_LENGTH
+    first = _post(client, key=longest)
+    replay = _post(client, key=longest)
+    assert first.status_code == 202
+    assert replay.status_code == 200
+    assert replay.json()["run_id"] == first.json()["run_id"]
