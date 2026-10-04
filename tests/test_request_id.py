@@ -180,10 +180,33 @@ def test_the_run_still_carries_it_when_polled_later(client):
     )
 
 
+def test_the_logs_say_which_request_they_belong_to(client):
+    """Found by auditing: the logs repeated run_id and state but not this, so
+    the same object answered the question through one endpoint and not the
+    other, and a hub fetching logs had to fetch the run as well."""
+    run_id = client.post(
+        "/runs",
+        data={"biochef_workflow": "not json"},
+        files=[("files", ("input-1-out", b"in", "application/octet-stream"))],
+        headers={"Authorization": f"Bearer {TOKEN}", "X-Request-Id": SENT},
+    ).json()["run_id"]
+
+    logs = client.get(f"/runs/{run_id}/logs",
+                      headers={"Authorization": f"Bearer {TOKEN}"})
+    assert logs.json()["request_id"] == SENT
+
+
+def test_both_views_of_a_run_agree_about_which_request_asked_for_it():
+    """They are two shapes of the same record, so they cannot disagree."""
+    run = RunStore().create(request_id="hub-9")
+    assert run.as_dict()["request_id"] == run.logs_as_dict()["request_id"]
+
+
 def test_a_run_with_no_request_behind_it_omits_the_field():
     """Absent rather than null, matching how error and outputs behave."""
     run = RunStore().create()
     assert "request_id" not in run.as_dict()
+    assert "request_id" not in run.logs_as_dict()
     assert run.request_id is None
 
 

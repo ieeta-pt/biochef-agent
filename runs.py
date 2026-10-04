@@ -125,7 +125,7 @@ class Run:
         stderr headings. Tool output can imitate those headings. `node_logs`
         comes from separate files opened for each executed rule.
         """
-        return {
+        body = {
             "run_id": self.run_id,
             "state": self.state.value,
             "stdout": self.stdout,
@@ -133,6 +133,12 @@ class Run:
             "failed_steps": self.failed_steps,
             "node_logs": self.node_logs,
         }
+        if self.request_id is not None:
+            # Same as as_dict. This endpoint already repeats run_id and state,
+            # and a hub fetching logs should not have to fetch the run as well
+            # to learn which of its submissions they belong to.
+            body["request_id"] = self.request_id
+        return body
 
     def as_dict(self) -> dict:
         """What a caller is told about this run.

@@ -110,7 +110,7 @@ agent's own invention, so if the response is lost in transit the run is
 orphaned, executing here and unknown there.
 
 Send `X-Request-Id` and it comes back on the response, on the run record, and
-on every later `GET /runs/{run_id}`. Send nothing and one is generated, so
+on every later `GET /runs/{run_id}` and `GET /runs/{run_id}/logs`. Send nothing and one is generated, so
 there is always an id to quote.
 
 **An unusable value is replaced, not refused.** Up to 128 characters of
