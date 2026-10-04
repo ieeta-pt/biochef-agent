@@ -660,3 +660,49 @@ def test_the_bound_survives_a_second_event_loop(service):
     finally:
         main.MAX_CONCURRENT_RUNS = 4
         main._slots_by_loop.clear()
+
+
+def test_capacity_shows_a_real_run_holding_a_real_slot(service, monkeypatch):
+    """End to end, through the route rather than by holding a slot by hand.
+
+    tests/test_liveness.py exercises the counting by entering _slots() directly,
+    which proves the counter works but not that /runs goes through it. This
+    submits an actual run, blocks its runner inside the threadpool, and asks
+    /capacity while it is there -- so a future change that acquires the
+    semaphore without the counting wrapper fails here.
+    """
+    import threading
+
+    from fastapi.testclient import TestClient
+
+    inside = threading.Event()
+    release = threading.Event()
+    original = main.run_snakemake
+
+    def blocking_run(ws, timeout_s=None, **kwargs):
+        inside.set()
+        release.wait(timeout=10)
+        return original(ws, timeout_s=timeout_s, **kwargs)
+
+    monkeypatch.setattr(main, "run_snakemake", blocking_run)
+    main._slots_by_loop.clear()
+    main._occupied_by_loop.clear()
+
+    with TestClient(main.app) as client:
+        assert client.get("/capacity").json()["slots"]["busy"] == 0
+
+        run_id = _submit(client).json()["run_id"]
+        assert inside.wait(timeout=10), "the run never reached the runner"
+
+        held = client.get("/capacity").json()
+        assert held["slots"]["busy"] == 1, (
+            "a run executing right now was not counted against the slots"
+        )
+        assert held["slots"]["free"] == main.MAX_CONCURRENT_RUNS - 1
+        assert held["runs"]["in_flight"] == 1
+
+        release.set()
+        _poll(client, run_id)
+        assert client.get("/capacity").json()["slots"]["busy"] == 0, (
+            "the slot was not given back once the run finished"
+        )

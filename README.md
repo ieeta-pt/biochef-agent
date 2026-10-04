@@ -134,6 +134,71 @@ Everything else about the tool — its binary, its inputs and outputs, its
 parameter flags — comes from the bundle fetched from the registry, not from the
 request.
 
+### Is it up, and is it free
+
+Two questions, two endpoints, because they have different audiences.
+
+`GET /health` (and `HEAD /health`) answers `{"status": "ok"}` and **is the one
+route exempt from authentication**, whatever `BIOCHEF_AUTH` is set to. What probes it is an orchestrator,
+not a person, and it has no credentials to offer; a liveness check that demanded
+a token would turn a mistyped token into a healthy service that looks dead and
+gets restarted forever. That is also why it says nothing else — it answers to
+whatever can reach the port, so anything beyond "up" would be published to it.
+The exemption is matched on the exact method and path, so nothing beneath
+`/health` is reachable without credentials, and `POST /health` is still a `401`.
+Behind a proxy that sets `root_path` the path will not match and liveness will
+ask for a token, which is the direction to fail in.
+
+`GET /capacity` answers the other question and **is authenticated like every
+other route**, because every field in it describes this deployment rather than
+merely whether it is up. (Under the default `BIOCHEF_AUTH=none` that means
+anybody, the same as everything else here — the point is that `/capacity` is
+not separately exempt the way liveness is.)
+
+```json
+{
+  "version": null,
+  "authentication": "bearer",
+  "runner": "subprocess",
+  "slots": {"total": 4, "busy": 2, "free": 2},
+  "runs": {"in_flight": 1, "queued": 2, "accepting": true,
+           "by_state": {"RUNNING": 1, "QUEUED": 2, "COMPLETE": 7}},
+  "retained": {"runs": 10, "cap": 256},
+  "datasets": null
+}
+```
+
+**`slots` is what a hub routes on.** `busy` is read from the slot semaphore
+itself, not derived from run states, because `/convert` holds a slot for a whole
+synchronous conversion without ever creating a run record — an agent with every
+slot busy converting would otherwise report itself entirely free.
+
+`runs.in_flight` is the asynchronous subset of that: the states that occupy a
+slot, `INITIALIZING`, `RUNNING` and `CANCELING`. The gap between it and
+`slots.busy` is exactly the `/convert` calls in progress. A `QUEUED` run is
+admitted and waiting rather than executing, so it is reported separately and is
+not counted as busy. `by_state` is walked from the run store rather than kept as
+a tally, so it cannot drift from what the store holds.
+
+**`runs.accepting` is a separate question from free slots, and free slots do not
+answer it.** `BIOCHEF_MAX_RUNS` bounds how many run records are retained, and a
+full set of non-terminal ones refuses new work with `503` *even with every
+execution slot idle* — reachable with `MAX_RUNS` runs admitted and queued and
+nothing executing. An agent can therefore report `free: 4` and refuse
+everything, and a hub told only about slots would route work there and get the
+refusal. The field answers the admission question directly rather than leaving
+a hub to re-derive it from the retention counts.
+
+`version` is whatever `BIOCHEF_AGENT_VERSION` was set to, and `null` when it was
+not — a deployment that does not say which commit it is built from reports
+nothing rather than something invented. `datasets` is `null` for the same
+reason: which datasets a site holds comes from the DataSource interface, which
+this service does not implement yet, and `[]` would read as "this site holds
+none".
+
+Before this, the only way to discover a saturated agent was to submit work and
+be refused with `503`, which is finding out after sending it to the wrong site.
+
 ## Running it
 
 ```
@@ -161,6 +226,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_MAX_RUNS` | `256` | maximum run records retained for polling |
 | `BIOCHEF_MAX_LOG_BYTES` | `1048576` | retained bytes per run-wide stream and shared budget per node-log stream, tail first |
 | `BIOCHEF_MAX_CONCURRENT_RUNS` | `4` | execution slots shared by `/runs` and `/convert`; admitted `/runs` jobs wait in `QUEUED` |
+| `BIOCHEF_AGENT_VERSION` | *(unset)* | what this deployment reports as its version at `/capacity`; `null` when unset |
 | `BIOCHEF_AUTH` | `none` | who may call it: `none` or `bearer` |
 | `BIOCHEF_AUTH_TOKEN` | | the shared token, required when `BIOCHEF_AUTH=bearer` |
 | `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess` or `apptainer` |
