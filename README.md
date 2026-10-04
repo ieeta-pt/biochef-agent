@@ -158,17 +158,25 @@ it is up:
   "version": null,
   "authentication": "bearer",
   "runner": "subprocess",
-  "runs": {"in_flight": 1, "queued": 2, "slots": 4, "free": 3,
+  "slots": {"total": 4, "busy": 2, "free": 2},
+  "runs": {"in_flight": 1, "queued": 2,
            "by_state": {"RUNNING": 1, "QUEUED": 2, "COMPLETE": 7}},
   "retained": {"runs": 10, "cap": 256},
   "datasets": null
 }
 ```
 
-`in_flight` counts the states that occupy a slot — `INITIALIZING`, `RUNNING`,
-`CANCELING`. A `QUEUED` run is admitted and waiting, so it is reported
-separately and not counted against the slots. `by_state` is walked from the run
-store rather than kept as a tally, so it cannot drift from what the store holds.
+**`slots` is what a hub routes on.** `busy` is read from the slot semaphore
+itself, not derived from run states, because `/convert` holds a slot for a whole
+synchronous conversion without ever creating a run record — an agent with every
+slot busy converting would otherwise report itself entirely free.
+
+`runs.in_flight` is the asynchronous subset of that: the states that occupy a
+slot, `INITIALIZING`, `RUNNING` and `CANCELING`. The gap between it and
+`slots.busy` is exactly the `/convert` calls in progress. A `QUEUED` run is
+admitted and waiting rather than executing, so it is reported separately and is
+not counted as busy. `by_state` is walked from the run store rather than kept as
+a tally, so it cannot drift from what the store holds.
 
 `version` is whatever `BIOCHEF_AGENT_VERSION` was set to, and `null` when it was
 not — a deployment that does not say which commit it is built from reports

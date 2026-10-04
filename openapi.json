@@ -108,7 +108,7 @@
   "paths": {
     "/capacity": {
       "get": {
-        "description": "What this agent is, and how much of it is free.\n\nFor a hub deciding where to send work. Authenticated, because every field\nhere describes the deployment rather than merely whether it is up.\n\nToday the only way to discover saturation is to submit and be refused with\n503, which is finding out after the work went to the wrong site.",
+        "description": "What this agent is, and how much of it is free.\n\nFor a hub deciding where to send work. Authenticated, because every field\nhere describes the deployment rather than merely whether it is up.\n\nToday the only way to discover saturation is to submit and be refused with\n503, which is finding out after the work went to the wrong site.\n\nOccupancy is read from the slot semaphore and not from run states, because\n/convert holds a slot for a whole synchronous conversion without creating a\nrun record. Counting run states would report an agent with every slot busy\nconverting as entirely free. `runs.in_flight` is the asynchronous subset,\nso the gap between it and `slots.busy` is exactly the /convert calls in\nprogress.",
         "operationId": "capacity_capacity_get",
         "responses": {
           "200": {

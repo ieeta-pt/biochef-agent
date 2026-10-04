@@ -207,8 +207,9 @@ def test_capacity_reports_what_a_hub_routes_on(client):
     body = client.get("/capacity", headers=authorised()).json()
     assert body["runner"] in ("subprocess", "apptainer")
     assert body["authentication"] == "bearer"
-    assert body["runs"]["slots"] >= 1
-    assert 0 <= body["runs"]["free"] <= body["runs"]["slots"]
+    assert body["slots"]["total"] >= 1
+    assert body["slots"]["busy"] + body["slots"]["free"] == body["slots"]["total"]
+    assert 0 <= body["slots"]["free"] <= body["slots"]["total"]
     assert body["retained"]["cap"] >= 1
 
 
@@ -323,3 +324,153 @@ def test_counting_is_safe_while_runs_are_admitted_and_evicted():
     stop.set()
     writer.join(timeout=5)
     assert not errors, errors
+
+
+# --- occupancy, which is not the same as run records ------------------------
+
+def test_a_synchronous_conversion_shows_as_a_busy_slot():
+    """The defect this test was written for: /convert holds a slot for the whole
+    of a synchronous conversion and never creates a run record, so a /capacity
+    that counted run states reported `free: 4` on an agent whose every slot was
+    busy -- the exact mistake the endpoint exists to stop a hub making.
+
+    Measured by holding real slots through the real chokepoint, not by faking
+    the count.
+    """
+    import asyncio
+
+    async def exercise():
+        main._occupied_by_loop.clear()
+        main._slots_by_loop.clear()
+        assert main.slots_busy() == 0
+
+        held = []
+        async with main._slots():
+            held.append(main.slots_busy())
+            async with main._slots():
+                held.append(main.slots_busy())
+            held.append(main.slots_busy())
+        held.append(main.slots_busy())
+        return held
+
+    assert asyncio.run(exercise()) == [1, 2, 1, 0]
+
+
+def test_a_slot_is_given_back_in_the_count_when_the_request_fails():
+    """Released in a finally. A slot that stays counted after the holder raised
+    makes the agent look permanently busier than it is, and nothing short of a
+    restart corrects it."""
+    import asyncio
+
+    async def exercise():
+        main._occupied_by_loop.clear()
+        main._slots_by_loop.clear()
+        try:
+            async with main._slots():
+                raise RuntimeError("the conversion failed")
+        except RuntimeError:
+            pass
+        return main.slots_busy()
+
+    assert asyncio.run(exercise()) == 0
+
+
+def test_a_cancelled_holder_gives_its_slot_back_too():
+    """Cancellation is a BaseException, not an Exception, and a cleanup written
+    as `except Exception` would miss it."""
+    import asyncio
+
+    async def exercise():
+        main._occupied_by_loop.clear()
+        main._slots_by_loop.clear()
+
+        async def holder(entered):
+            async with main._slots():
+                entered.set()
+                await asyncio.sleep(3600)
+
+        entered = asyncio.Event()
+        task = asyncio.create_task(holder(entered))
+        await entered.wait()
+        assert main.slots_busy() == 1
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return main.slots_busy()
+
+    assert asyncio.run(exercise()) == 0
+
+
+def test_the_free_count_can_never_be_reported_out_of_bounds():
+    """A wrong free count is the one thing this endpoint must not produce, so
+    the reading is clamped rather than trusted."""
+    import asyncio
+
+    async def exercise():
+        loop = asyncio.get_running_loop()
+        main._occupied_by_loop[loop] = -5
+        below = main.slots_busy()
+        main._occupied_by_loop[loop] = main.MAX_CONCURRENT_RUNS + 99
+        above = main.slots_busy()
+        main._occupied_by_loop.clear()
+        return below, above
+
+    below, above = asyncio.run(exercise())
+    assert below == 0
+    assert above == main.MAX_CONCURRENT_RUNS
+
+
+def test_capacity_sees_a_held_slot_that_has_no_run_record(monkeypatch):
+    """The one that pins the fix.
+
+    A slot is held the way /convert holds one -- through the real chokepoint,
+    with no run record behind it -- and /capacity is asked while it is held, on
+    the same loop. An endpoint that derived occupancy from run states answers
+    `busy: 0, free: total` here, because there is nothing in the store to
+    count, which is how the defect got as far as a pushed branch.
+
+    The earlier version of this test only asserted busy >= in_flight, and that
+    holds trivially when both are zero; the mutation reverting occupancy to run
+    states passed against it.
+    """
+    import asyncio
+
+    import httpx
+
+    provider = auth.BearerAuth(TOKEN)
+    monkeypatch.setattr(main, "AUTH", provider)
+
+    app = FastAPI()
+    for route in main.app.routes:
+        if getattr(route, "path", None) == "/capacity":
+            app.router.routes.append(route)
+    app.add_middleware(auth.AuthenticationMiddleware, provider=provider)
+
+    async def exercise():
+        main._occupied_by_loop.clear()
+        main._slots_by_loop.clear()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://agent") as remote:
+            idle = (await remote.get("/capacity", headers=authorised())).json()
+            async with main._slots():
+                held = (await remote.get("/capacity",
+                                         headers=authorised())).json()
+        return idle, held
+
+    idle, held = asyncio.run(exercise())
+    total = idle["slots"]["total"]
+
+    assert idle["slots"] == {"total": total, "busy": 0, "free": total}
+    assert held["slots"] == {"total": total, "busy": 1, "free": total - 1}, (
+        "a held slot with no run record was reported as free"
+    )
+    assert held["runs"]["in_flight"] == 0, (
+        "nothing in the run store, which is the whole point"
+    )
+    assert held["runs"]["by_state"] == {}
+    assert "slots" not in held["runs"], (
+        "slots moved out of runs, because they are not only runs"
+    )

@@ -1,6 +1,7 @@
 from convert import *
 from convert import rule_name_for
 import asyncio
+import contextlib
 import weakref
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
@@ -294,6 +295,7 @@ if MAX_CONCURRENT_RUNS < 1:
     raise ValueError("BIOCHEF_MAX_CONCURRENT_RUNS must be positive")
 
 _slots_by_loop = weakref.WeakKeyDictionary()
+_occupied_by_loop = weakref.WeakKeyDictionary()
 
 
 def _slots():
@@ -315,13 +317,49 @@ def _slots():
     much of a bound.
 
     Weakly keyed, so a finished loop takes its semaphore with it.
+
+    It also counts how many slots are held, because /capacity has to report
+    that and a Semaphore's own count is private. Counting run states instead
+    would be wrong: /convert holds a slot for the whole of a synchronous
+    conversion without ever creating a run record, so an agent with every slot
+    busy converting would report itself entirely free -- which is the exact
+    mistake /capacity exists to stop a hub making.
+
+    Decremented in a finally, so a cancelled or failed request gives its slot
+    back in the count as well as in the semaphore. The two are released
+    together or the number drifts until a restart.
     """
     loop = asyncio.get_running_loop()
     semaphore = _slots_by_loop.get(loop)
     if semaphore is None:
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_RUNS)
         _slots_by_loop[loop] = semaphore
-    return semaphore
+    return _holding(loop, semaphore)
+
+
+@contextlib.asynccontextmanager
+async def _holding(loop, semaphore):
+    """Hold a slot, and be counted while holding it."""
+    async with semaphore:
+        _occupied_by_loop[loop] = _occupied_by_loop.get(loop, 0) + 1
+        try:
+            yield
+        finally:
+            _occupied_by_loop[loop] = _occupied_by_loop.get(loop, 1) - 1
+
+
+def slots_busy() -> int:
+    """Slots held right now on the running loop, by either route.
+
+    Clamped, because a number outside the bounds would be reported as fact. If
+    the count ever drifts, a wrong free count is the one thing this endpoint
+    must not produce.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return 0
+    return max(0, min(MAX_CONCURRENT_RUNS, _occupied_by_loop.get(loop, 0)))
 
 _running = set()
 """Strong references to the tasks in flight.
@@ -605,9 +643,16 @@ async def capacity():
 
     Today the only way to discover saturation is to submit and be refused with
     503, which is finding out after the work went to the wrong site.
+
+    Occupancy is read from the slot semaphore and not from run states, because
+    /convert holds a slot for a whole synchronous conversion without creating a
+    run record. Counting run states would report an agent with every slot busy
+    converting as entirely free. `runs.in_flight` is the asynchronous subset,
+    so the gap between it and `slots.busy` is exactly the /convert calls in
+    progress.
     """
     counts = RUNS.state_counts()
-    in_flight = sum(counts.get(state.value, 0) for state in BUSY_STATES)
+    busy = slots_busy()
     return {
         "version": AGENT_VERSION or None,
         # The provider the middleware actually enforces with, not a second
@@ -615,15 +660,21 @@ async def capacity():
         # admits anyone is worse than no field.
         "authentication": AUTH.name,
         "runner": RUNNER.name,
+        # What a hub routes on. Both routes draw on these.
+        "slots": {
+            "total": MAX_CONCURRENT_RUNS,
+            "busy": busy,
+            "free": MAX_CONCURRENT_RUNS - busy,
+        },
         "runs": {
-            "in_flight": in_flight,
+            # Runs occupying a slot: INITIALIZING, RUNNING, CANCELING. Not the
+            # same as slots.busy, which also counts synchronous /convert.
+            "in_flight": sum(counts.get(state.value, 0)
+                             for state in BUSY_STATES),
+            # Admitted and waiting for a slot, so not counted as busy: an agent
+            # with a queue still has free slots the moment one is released, and
+            # a hub told otherwise would route away from a site that is free.
             "queued": counts.get(RunState.QUEUED.value, 0),
-            "slots": MAX_CONCURRENT_RUNS,
-            # Clamped. Slots are held by a semaphore and counted from run
-            # states, and the two can disagree for a moment around a
-            # transition. A hub has no sensible way to act on a negative
-            # number of free slots.
-            "free": max(0, MAX_CONCURRENT_RUNS - in_flight),
             "by_state": counts,
         },
         "retained": {"runs": RUNS.retained(), "cap": MAX_RUNS},
