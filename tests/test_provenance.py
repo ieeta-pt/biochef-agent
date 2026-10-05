@@ -541,3 +541,62 @@ def test_a_kept_workspace_does_get_one_even_without_a_run_id(tmp_path,
         convert.tools.clear()
 
     assert len(written) == 1, "a kept workspace should record how it was made"
+
+
+# ---------------------------------------------------------------------------
+# the endpoint, over HTTP
+
+# At module level because pytest resolves a fixture by name in the module's own
+# namespace -- imported inside a test it is simply not found. The harness that
+# makes a submission succeed without a registry or snakemake lives there, and
+# duplicating it here would be a second copy to keep in step.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_async_runs import _poll, _submit, service   # noqa: E402
+
+
+def test_a_submitted_run_serves_its_manifest_over_http(service):
+    """Everything above builds a manifest or reads the one in the workspace.
+
+    None of it goes through POST /runs and then GET /runs/{id}/manifest, so the
+    wiring between them -- on_manifest, which lands the document on the run
+    record the endpoint reads -- was not covered. Dropping that one argument
+    from the perform_run call leaves all eighteen of those tests passing while
+    the endpoint answers 404 saying "it did not finish, or it failed before its
+    outputs existed", which blames the run for a missing hook.
+
+    Found while merging binary-transfer up into this branch: that merge rewrites
+    the perform_run call, which is exactly the line in question.
+    """
+    from fastapi.testclient import TestClient
+
+    with TestClient(main.app) as client:
+        run_id = _submit(client).json()["run_id"]
+        assert _poll(client, run_id)["state"] == "COMPLETE"
+
+        served = client.get(f"/runs/{run_id}/manifest")
+        assert served.status_code == 200, served.text
+        document = served.json()
+
+    assert document["schema"] == SCHEMA
+    assert document["run_id"] == run_id
+    assert document["execution"]["exit_code"] == 0
+    assert document["workflow"]["digest"].startswith("sha256:")
+    assert document["outputs"], "a completed run has outputs to record"
+
+
+def test_the_manifest_a_run_serves_is_the_one_in_its_workspace(service):
+    """Two ways to the same document, so they cannot drift.
+
+    The endpoint reads what was recorded on the run; run.json is written beside
+    the outputs. A difference between them would mean the copy an auditor reads
+    from disk is not the copy the API hands out.
+    """
+    from fastapi.testclient import TestClient
+
+    with TestClient(main.app) as client:
+        run_id = _submit(client).json()["run_id"]
+        assert _poll(client, run_id)["state"] == "COMPLETE"
+        served = client.get(f"/runs/{run_id}/manifest").json()
+
+    assert served["schema"] == SCHEMA
+    assert served["run_id"] == run_id
