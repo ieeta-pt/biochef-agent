@@ -13,6 +13,8 @@ persistent store is its own piece of work.
 import os
 import threading
 import uuid
+
+import audit
 from collections import OrderedDict
 from enum import Enum
 
@@ -166,10 +168,16 @@ class RunStore:
         if self._max < 1:
             raise ValueError("max_runs must be positive")
 
-    def create(self) -> Run:
+    def create(self, caller=None, authenticated_by=None) -> Run:
         with self._lock:
             self._evict_if_needed()
             run = Run(uuid.uuid4().hex)
+            # Set before the run is published into _runs, and inside the lock
+            # that publishes it, so no reader can ever see a run whose caller is
+            # not yet recorded -- an audit trail with a gap in it is worse than
+            # one that is late.
+            run.caller = caller
+            run.authenticated_by = authenticated_by
             self._runs[run.run_id] = run
         return run
 
@@ -207,6 +215,23 @@ class RunStore:
                 )
 
             run.state = state
+            # Here rather than at each call site, because this is the only place
+            # a state changes. A hook at the call sites is one a new transition
+            # forgets to add, and the gap in an audit trail is invisible from
+            # inside the thing that should have written it.
+            audit.record(
+                "run.state",
+                run_id=run_id,
+                # .value, not str(): this is a str-Enum, and str() gives
+                # "RunState.RUNNING" rather than the WES term "RUNNING". #64
+                # adopted that vocabulary precisely so the states would be
+                # legible to something that is not this service, and an
+                # exported trail is exactly that reader.
+                state=state.value,
+                caller=getattr(run, "caller", None),
+                authenticated_by=getattr(run, "authenticated_by", None),
+                error=error,
+            )
             if outputs is not None:
                 run.outputs = outputs
             if error is not None:

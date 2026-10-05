@@ -139,6 +139,22 @@ def service(tmp_path, monkeypatch):
     convert.tools.clear()
 
 
+def _bare_request(caller=None, authenticated_by=None):
+    """A real Request for the two tests that call submit_run directly.
+
+    The handler takes one because the audit trail records who asked (#19), and
+    these two bypass fastapi's dependency resolution -- so the request is theirs
+    to supply. A real Request rather than a stub, so they break if the way the
+    caller is read changes, which is the point of them.
+    """
+    from starlette.requests import Request
+
+    return Request({
+        "type": "http", "method": "POST", "path": "/runs", "headers": [],
+        "state": {"caller": caller, "authenticated_by": authenticated_by},
+    })
+
+
 def _submit(client):
     return client.post("/runs", data={"biochef_workflow": WORKFLOW},
                        files=[("files", ("input-1-out", b"in",
@@ -380,7 +396,8 @@ def test_upload_read_failure_releases_reserved_capacity(service, monkeypatch,
     store = RunStore(max_runs=1)
     monkeypatch.setattr(main, "RUNS", store)
     with pytest.raises(OSError, match="input stream failed"):
-        asyncio.run(main.submit_run(WORKFLOW, [BrokenUpload()]))
+        asyncio.run(main.submit_run(_bare_request(), WORKFLOW,
+                                    [BrokenUpload()]))
     assert store.create().state is RunState.QUEUED
     assert list(tmp_path.iterdir()) == [], (
         f"a failed submission left {[p.name for p in tmp_path.iterdir()]} behind"
@@ -402,7 +419,8 @@ def test_full_store_refuses_before_upload_is_read(service, monkeypatch):
     accepted = store.create()
     monkeypatch.setattr(main, "RUNS", store)
     with pytest.raises(HTTPException) as refused:
-        asyncio.run(main.submit_run(WORKFLOW, [UnreadUpload()]))
+        asyncio.run(main.submit_run(_bare_request("someone"), WORKFLOW,
+                                    [UnreadUpload()]))
     assert refused.value.status_code == 503
     assert store.get(accepted.run_id).state is RunState.QUEUED
 

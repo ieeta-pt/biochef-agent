@@ -40,10 +40,51 @@ up in a process listing or in shell history.
 """
 
 
+def check_declares_identity(provider) -> None:
+    """Refuse a provider that has not said whether its return names a caller.
+
+    Raises ValueError, which both callers turn into a failure to start. At
+    startup rather than on the first request, for the same reason BearerAuth
+    refuses an empty token there: a deployment that looked configured and then
+    wrote a trail with a hole in it is worse than one that did not come up.
+    """
+    declared = getattr(provider, "identifies", None)
+    if declared is not True and declared is not False:
+        raise ValueError(
+            f"{type(provider).__name__} does not declare `identifies`. Set it "
+            f"True if what authenticate() returns names a caller, and False if "
+            f"it is a marker that every holder shares -- the audit trail records "
+            f"the caller only when it is True, so leaving it unset would drop "
+            f"identities this provider does know. Refusing to start rather than "
+            f"write a trail that is quietly missing them."
+        )
+
+
 class AuthProvider:
     """Decides whether a request may proceed, and on whose behalf."""
 
     name = "provider"
+
+    identifies = None
+    """Whether what authenticate() returns names a caller. Every provider must
+    say, and None means it has not.
+
+    Not a default of False, which is the version this replaced. A default is the
+    wrong shape for this: a provider written later that forgets to declare would
+    inherit "its return is not an identity", and the audit trail would record
+    None for callers it genuinely knows -- silently, because nothing the new
+    provider tests would change. PassportAuth returns issuer#subject precisely
+    so two brokers' identical subjects do not merge into one caller, and
+    inheriting False would throw that away at the last step.
+
+    Not inferred from the returned value either. The trail is read by people who
+    were not here, and the difference between "nobody knows" and "someone called
+    bearer-token" is exactly the one it must not blur.
+
+    So: undeclared is a refusal to start, checked in get_auth and again where
+    the middleware is constructed. A deployment that cannot say whether it knows
+    who is calling should not be the one writing the audit trail.
+    """
 
     def authenticate(self, request: Request) -> Optional[str]:
         """Return an identity for the caller, or raise Unauthenticated.
@@ -69,6 +110,10 @@ class NoAuth(AuthProvider):
 
     name = "none"
 
+    identifies = False
+    """It returns None, so there is nothing to record either way -- but it says
+    so rather than inheriting, because nothing inherits this any more."""
+
     def authenticate(self, request: Request) -> Optional[str]:
         return None
 
@@ -82,6 +127,13 @@ class BearerAuth(AuthProvider):
     """
 
     name = "bearer"
+
+    identifies = False
+    """A shared secret names nobody. authenticate() returns the marker
+    "bearer-token" so a caller is distinguishable from an unauthenticated one,
+    and that marker must not reach the trail's `caller` field: every holder
+    presents the same one, and a log read years later would take it for a name.
+    """
 
     def __init__(self, token: str = None):
         token = AUTH_TOKEN if token is None else token
@@ -135,6 +187,11 @@ class AuthenticationMiddleware:
     """
 
     def __init__(self, app, provider: AuthProvider):
+        # The backstop. get_auth checks what BIOCHEF_AUTH resolved to, but a
+        # provider can also be handed straight to this -- which is how every
+        # test wires one, and how an embedding would. Nothing should be able to
+        # enforce authentication while unable to say whether it knows who.
+        check_declares_identity(provider)
         self.app = app
         self.provider = provider
 
@@ -144,7 +201,26 @@ class AuthenticationMiddleware:
             return
 
         try:
-            self.provider.authenticate(Request(scope))
+            # Kept, not discarded. authenticate() is documented to return an
+            # identity, and until now nothing held onto it -- so the audit trail
+            # had no way to say who, and a provider that knows more about the
+            # caller had nowhere to put it.
+            identity = self.provider.authenticate(Request(scope))
+
+            # Recorded as a caller only when the provider says it is one. This
+            # used to assign the return value directly, on the belief that the
+            # bearer provider returned None -- it returns the marker
+            # "bearer-token", which is #63's tested contract for
+            # authenticated-without-identity. Assigning it put a string that
+            # reads like a name into the `caller` field of an audit trail,
+            # contradicting what audit.py promises about that field and what the
+            # provider's own docstring says it does not pretend to be. Found by
+            # a test that submitted a run over HTTP; the ones that built a store
+            # by hand and passed caller=None themselves could not see it.
+            scope.setdefault("state", {})["caller"] = (
+                identity if self.provider.identifies else None
+            )
+            scope["state"]["authenticated_by"] = self.provider.name
         except HTTPException as refusal:
             body = json.dumps({"detail": refusal.detail}).encode()
             headers = [(b"content-type", b"application/json"),
@@ -180,4 +256,8 @@ def get_auth(name: str) -> AuthProvider:
             f"BIOCHEF_AUTH={name!r} is not an authentication provider. "
             f"Available: {', '.join(sorted(PROVIDERS))}."
         ) from None
-    return provider()
+    resolved = provider()
+    # Here as well as in the middleware, so the failure arrives at startup with
+    # the setting that chose this provider still in hand.
+    check_declares_identity(resolved)
+    return resolved

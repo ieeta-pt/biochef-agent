@@ -5,7 +5,7 @@ import asyncio
 import provenance
 import tempfile
 import weakref
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from datetime import datetime, timezone
@@ -618,6 +618,7 @@ def _advance(run_id, state, **detail):
     503: {"description": "Agent capacity reached; retry later"},
 })
 async def submit_run(
+    request: Request,
     biochef_workflow: str = Form(...),
     files: List[UploadFile] = File(...)
 ):
@@ -628,11 +629,18 @@ async def submit_run(
     difference between this and /convert, and the reason it cannot simply call
     the same handler in the background.
     """
+    # Whatever the authentication provider knew about the caller, which for the
+    # bearer provider is nothing. Recorded as None rather than as a guess: the
+    # audit trail says which provider authorised the request, so "we do not know
+    # who" reads as a fact about the deployment and not as a hole in the log.
+    state = getattr(request, "scope", {}).get("state") or {}
+
     # Admission first, and the upload read only after it. Master added this
     # refusal so a submission the agent is about to turn away is never read, and
     # a test pins it -- spooling first would write every byte of it to disk.
     try:
-        run = RUNS.create()
+        run = RUNS.create(caller=state.get("caller"),
+                          authenticated_by=state.get("authenticated_by"))
     except RunCapacityError:
         raise HTTPException(
             status_code=503, detail="agent run capacity reached; retry later",
