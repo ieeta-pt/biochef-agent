@@ -1,6 +1,7 @@
 from convert import *
 from convert import rule_name_for
 import asyncio
+import contextlib
 import weakref
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
@@ -15,8 +16,8 @@ import base64
 
 from workspace import UnsafeName, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
-from runs import (IllegalTransition, RunCapacityError, RunState, RunStore,
-                  TERMINAL, UnknownRun)
+from runs import (IllegalTransition, MAX_RUNS, RunCapacityError, RunState,
+                  RunStore, TERMINAL, UnknownRun)
 from datasource import DataSourceError, get_sources
 from steplogs import (Progress, clamp, failing_steps, make_step_log_names,
                       read_node_logs)
@@ -319,6 +320,7 @@ if MAX_CONCURRENT_RUNS < 1:
     raise ValueError("BIOCHEF_MAX_CONCURRENT_RUNS must be positive")
 
 _slots_by_loop = weakref.WeakKeyDictionary()
+_occupied_by_loop = weakref.WeakKeyDictionary()
 
 
 def _slots():
@@ -340,13 +342,49 @@ def _slots():
     much of a bound.
 
     Weakly keyed, so a finished loop takes its semaphore with it.
+
+    It also counts how many slots are held, because /capacity has to report
+    that and a Semaphore's own count is private. Counting run states instead
+    would be wrong: /convert holds a slot for the whole of a synchronous
+    conversion without ever creating a run record, so an agent with every slot
+    busy converting would report itself entirely free -- which is the exact
+    mistake /capacity exists to stop a hub making.
+
+    Decremented in a finally, so a cancelled or failed request gives its slot
+    back in the count as well as in the semaphore. The two are released
+    together or the number drifts until a restart.
     """
     loop = asyncio.get_running_loop()
     semaphore = _slots_by_loop.get(loop)
     if semaphore is None:
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_RUNS)
         _slots_by_loop[loop] = semaphore
-    return semaphore
+    return _holding(loop, semaphore)
+
+
+@contextlib.asynccontextmanager
+async def _holding(loop, semaphore):
+    """Hold a slot, and be counted while holding it."""
+    async with semaphore:
+        _occupied_by_loop[loop] = _occupied_by_loop.get(loop, 0) + 1
+        try:
+            yield
+        finally:
+            _occupied_by_loop[loop] = _occupied_by_loop.get(loop, 1) - 1
+
+
+def slots_busy() -> int:
+    """Slots held right now on the running loop, by either route.
+
+    Clamped, because a number outside the bounds would be reported as fact. If
+    the count ever drifts, a wrong free count is the one thing this endpoint
+    must not produce.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return 0
+    return max(0, min(MAX_CONCURRENT_RUNS, _occupied_by_loop.get(loop, 0)))
 
 _running = set()
 """Strong references to the tasks in flight.
@@ -570,6 +608,118 @@ async def cancel_run(run_id: str):
             pass
 
     return RUNS.get(run_id).as_dict()
+
+
+AGENT_VERSION = os.getenv("BIOCHEF_AGENT_VERSION", "").strip()
+"""What this deployment calls itself, for a hub that talks to several.
+
+Empty by default and reported as null rather than invented. A version this
+service made up would be worse than none, because a hub routing work would
+believe it and act on it. A deployment that wants one sets it, usually to the
+commit it was built from.
+
+Stripped, because a value that is only whitespace is a deployment that did not
+set one. A CI template substituting an empty variable produces exactly that,
+and "   " reported as a version is believed as readily as a real one.
+"""
+
+# The states that occupy an execution slot. QUEUED is admitted and waiting, so
+# counting it as busy would have a hub route away from an agent that is in fact
+# free; CANCELING still holds the slot until the worker lets go of it.
+BUSY_STATES = (RunState.INITIALIZING, RunState.RUNNING, RunState.CANCELING)
+
+
+@app.get("/health")
+async def health():
+    """Up. Nothing else.
+
+    Answers without credentials -- see AuthenticationMiddleware.OPEN -- because
+    the thing that probes it is an orchestrator and not a person, and has none
+    to offer. An endpoint that demanded a token would turn a mistyped token into
+    a healthy service that looks dead and is restarted forever.
+
+    Which is exactly why it says nothing else. Capacity, runner and provider all
+    describe this deployment, they live behind authentication in /capacity, and
+    putting any of them here would publish them to whatever can reach the port.
+    """
+    return {"status": "ok"}
+
+
+@app.head("/health")
+async def health_probe():
+    """The same answer to a HEAD probe, which several checkers send by default.
+
+    Declared separately rather than as api_route(methods=["GET", "HEAD"]):
+    fastapi derives one operation id per route, so a two-method route puts the
+    same id on both operations -- and labelled the GET one `..._head` -- which
+    collides in any generated client. The contract is exported and checked, so
+    that lands in openapi.json.
+
+    fastapi's APIRoute, unlike starlette's Route, does not add HEAD to a GET
+    route on its own; without this a HEAD probe gets 405 from a service that is
+    up, and 405 reads as unhealthy. A HEAD carries no body back, so this
+    withholds nothing the GET does not already say.
+    """
+    return {"status": "ok"}
+
+
+@app.get("/capacity")
+async def capacity():
+    """What this agent is, and how much of it is free.
+
+    For a hub deciding where to send work. Authenticated, because every field
+    here describes the deployment rather than merely whether it is up.
+
+    Today the only way to discover saturation is to submit and be refused with
+    503, which is finding out after the work went to the wrong site.
+
+    Occupancy is read from the slot semaphore and not from run states, because
+    /convert holds a slot for a whole synchronous conversion without creating a
+    run record. Counting run states would report an agent with every slot busy
+    converting as entirely free. `runs.in_flight` is the asynchronous subset,
+    so the gap between it and `slots.busy` is exactly the /convert calls in
+    progress.
+    """
+    counts = RUNS.state_counts()
+    busy = slots_busy()
+    return {
+        "version": AGENT_VERSION or None,
+        # The provider the middleware actually enforces with, not a second
+        # reading of the environment. A field that says `bearer` while the stack
+        # admits anyone is worse than no field.
+        "authentication": AUTH.name,
+        "runner": RUNNER.name,
+        # What a hub routes on. Both routes draw on these.
+        "slots": {
+            "total": MAX_CONCURRENT_RUNS,
+            "busy": busy,
+            "free": MAX_CONCURRENT_RUNS - busy,
+        },
+        "runs": {
+            # Runs occupying a slot: INITIALIZING, RUNNING, CANCELING. Not the
+            # same as slots.busy, which also counts synchronous /convert.
+            "in_flight": sum(counts.get(state.value, 0)
+                             for state in BUSY_STATES),
+            # Admitted and waiting for a slot, so not counted as busy: an agent
+            # with a queue still has free slots the moment one is released, and
+            # a hub told otherwise would route away from a site that is free.
+            "queued": counts.get(RunState.QUEUED.value, 0),
+            # Whether a submission would be admitted at all, which free slots
+            # do not answer: a full set of non-terminal runs refuses with 503
+            # even with every slot idle. A hub told only about slots routes
+            # work to an agent that will refuse it.
+            "accepting": RUNS.accepting(),
+            "by_state": counts,
+        },
+        "retained": {"runs": RUNS.retained(), "cap": MAX_RUNS},
+        # Null, not []. The DataSource interface is now in this tree, but
+        # neither provider it ships with can enumerate what a site holds: an
+        # upload source has nothing until a caller sends it, and a localpath
+        # source has a root directory rather than a catalogue. So this build
+        # still cannot answer, and [] would read as "this site holds none".
+        # A provider that can enumerate -- DRS (#80) -- is what fills this in.
+        "datasets": None,
+    }
 
 
 @app.get("/runs/{run_id}/logs")
