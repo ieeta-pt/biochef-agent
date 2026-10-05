@@ -29,6 +29,7 @@ version of that which fits inside one HTTP request.
 """
 
 import inspect
+import tempfile
 import sys
 import types
 from pathlib import Path
@@ -64,7 +65,8 @@ import time
 import pytest
 
 import convert
-from runs import ALLOWED, TERMINAL, IllegalTransition, RunState, RunStore, UnknownRun
+from runs import (ALLOWED, TERMINAL, IllegalTransition, RunCapacityError,
+                  RunState, RunStore, UnknownRun)
 
 BUNDLE = {"id": "tool", "name": "tool", "bin": "tool",
           "io": {"inputs": [{"name": "in", "types": ["T"], "mode": "file"}],
@@ -313,9 +315,150 @@ def test_a_run_still_in_flight_is_never_forgotten():
     for run_id in in_flight:
         store.advance(run_id, RunState.INITIALIZING)
 
-    store.create()
+    with pytest.raises(RunCapacityError):
+        store.create()
     for run_id in in_flight:
         assert store.get(run_id).state is RunState.INITIALIZING
+
+
+def test_concurrent_admission_cannot_exceed_one_slot():
+    import threading
+
+    store = RunStore(max_runs=1)
+    start = threading.Barrier(8)
+    admitted = []
+    refused = []
+    guard = threading.Lock()
+
+    def submit():
+        start.wait()
+        try:
+            run = store.create()
+        except RunCapacityError:
+            with guard:
+                refused.append(True)
+        else:
+            with guard:
+                admitted.append(run.run_id)
+
+    threads = [threading.Thread(target=submit) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(admitted) == 1
+    assert len(refused) == 7
+    assert store.get(admitted[0]).state is RunState.QUEUED
+
+
+def test_upload_read_failure_releases_reserved_capacity(service, monkeypatch,
+                                                        tmp_path):
+    """And leaves no half-written spool behind.
+
+    read() takes a size now, because the submission copies the upload to disk a
+    megabyte at a time rather than calling read() for the whole of it -- which
+    is what starlette's own UploadFile.read(size=-1) has always accepted. The
+    stub followed the code.
+
+    The second assertion is new with that change: the copy creates a temporary
+    file of our own, and the handedover source only deletes it once a workspace
+    has taken it. A submission that fails here never reaches the source, so the
+    file is the handler's to remove, and a service built for large inputs cannot
+    leak one per failed input.
+    """
+    import asyncio
+
+    class BrokenUpload:
+        filename = "input-1-out"
+        size = 1
+
+        async def read(self, size=-1):
+            raise OSError("input stream failed")
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    store = RunStore(max_runs=1)
+    monkeypatch.setattr(main, "RUNS", store)
+    with pytest.raises(OSError, match="input stream failed"):
+        asyncio.run(main.submit_run(WORKFLOW, [BrokenUpload()]))
+    assert store.create().state is RunState.QUEUED
+    assert list(tmp_path.iterdir()) == [], (
+        f"a failed submission left {[p.name for p in tmp_path.iterdir()]} behind"
+    )
+
+
+def test_full_store_refuses_before_upload_is_read(service, monkeypatch):
+    import asyncio
+    from fastapi import HTTPException
+
+    class UnreadUpload:
+        filename = "input-1-out"
+        size = 0
+
+        async def read(self):
+            raise AssertionError("the rejected request read its upload")
+
+    store = RunStore(max_runs=1)
+    accepted = store.create()
+    monkeypatch.setattr(main, "RUNS", store)
+    with pytest.raises(HTTPException) as refused:
+        asyncio.run(main.submit_run(WORKFLOW, [UnreadUpload()]))
+    assert refused.value.status_code == 503
+    assert store.get(accepted.run_id).state is RunState.QUEUED
+
+
+def test_a_full_agent_refuses_new_work_and_keeps_the_accepted_run(
+        service, monkeypatch):
+    import threading
+    from fastapi.testclient import TestClient
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked(ws, timeout_s=None, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        with open(os.path.join(ws.path, "tool-1-out"), "wb") as output:
+            output.write(b"done")
+        return 0, "", ""
+
+    import os
+    monkeypatch.setattr(main, "run_snakemake", blocked)
+    monkeypatch.setattr(main, "RUNS", RunStore(max_runs=1))
+    with TestClient(main.app) as client:
+        accepted = _submit(client)
+        assert accepted.status_code == 202
+        run_id = accepted.json()["run_id"]
+        assert entered.wait(5)
+        rejected = _submit(client)
+        assert rejected.status_code == 503
+        assert rejected.headers["retry-after"] == "1"
+        assert "run_id" not in rejected.json()
+        assert client.get(f"/runs/{run_id}").json()["state"] == "RUNNING"
+        release.set()
+        assert _poll(client, run_id)["state"] == "COMPLETE"
+        assert _submit(client).status_code == 202
+
+
+def test_bearer_protects_submission_and_polling(service):
+    from auth import AuthenticationMiddleware, BearerAuth
+    from fastapi.testclient import TestClient
+
+    guarded = AuthenticationMiddleware(main.app, provider=BearerAuth(token="test-secret"))
+    payload = {
+        "data": {"biochef_workflow": WORKFLOW},
+        "files": [("files", ("input-1-out", b"in", "application/octet-stream"))],
+    }
+    with TestClient(guarded) as client:
+        assert client.post("/runs", **payload).status_code == 401
+        admitted = client.post(
+            "/runs", headers={"Authorization": "Bearer test-secret"}, **payload)
+        assert admitted.status_code == 202
+        run_id = admitted.json()["run_id"]
+        assert client.get(f"/runs/{run_id}").status_code == 401
+        assert client.get(
+            f"/runs/{run_id}", headers={"Authorization": "Bearer test-secret"}
+        ).status_code == 200
 
 
 # --------------------------------------------------------------------------
@@ -441,6 +584,58 @@ def test_execution_is_bounded_and_the_rest_wait_in_QUEUED(service, monkeypatch):
     assert live["peak"] <= 2, (
         f"{live['peak']} runs executed at once against a limit of 2"
     )
+
+
+def test_convert_and_runs_share_the_same_execution_slot(service, monkeypatch):
+    import os
+    import threading
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(main, "MAX_CONCURRENT_RUNS", 1)
+    main._slots_by_loop.clear()
+    entered = threading.Event()
+    release = threading.Event()
+    live = {"now": 0, "peak": 0}
+    guard = threading.Lock()
+
+    def blocked(ws, timeout_s=None, **kwargs):
+        with guard:
+            live["now"] += 1
+            live["peak"] = max(live["peak"], live["now"])
+        entered.set()
+        if live["now"] == 1:
+            assert release.wait(5)
+        with open(os.path.join(ws.path, "tool-1-out"), "wb") as output:
+            output.write(b"done")
+        with guard:
+            live["now"] -= 1
+        return 0, "", ""
+
+    monkeypatch.setattr(main, "run_snakemake", blocked)
+    with TestClient(main.app) as client:
+        run_id = _submit(client).json()["run_id"]
+        assert entered.wait(5)
+        result = {}
+
+        def legacy():
+            result["response"] = client.post(
+                "/convert", data={"biochef_workflow": WORKFLOW},
+                files=[("files", ("input-1-out", b"in",
+                                   "application/octet-stream"))],
+            )
+
+        thread = threading.Thread(target=legacy)
+        thread.start()
+        try:
+            assert _poll(client, run_id, until={RunState.RUNNING})["state"] == "RUNNING"
+        finally:
+            release.set()
+            thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert result["response"].status_code == 200
+        assert _poll(client, run_id)["state"] == "COMPLETE"
+        assert live["peak"] == 1
 
 
 def test_the_default_limit_is_well_below_the_threadpool_size():
