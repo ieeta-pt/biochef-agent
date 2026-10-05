@@ -23,6 +23,7 @@ import re
 import signal
 import subprocess
 import threading
+import time
 from typing import List, NamedTuple
 
 from steplogs import TailBuffer
@@ -91,6 +92,7 @@ class Runner:
             self.command(ws),
             cwd=ws.path, start_new_session=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace",
         )
         pgid = os.getpgid(process.pid)
         # Handed out so something other than the timeout can end this run.
@@ -98,20 +100,14 @@ class Runner:
         # a caller that has the group id can pull it without this class growing
         # a notion of why a run is being stopped.
         #
-        # Taken back the moment the child is reaped, which matters more than it
-        # sounds. A process group id is a number the kernel is free to reissue
-        # once the group is empty, so a caller still holding it after the run
-        # has ended is holding a loaded weapon aimed at whoever gets that number
-        # next. killpg only reaches a group LEADER, so the likely victim is
-        # another run of this same service -- every one is a leader by
-        # construction, and their creation rate rises with load.
-        if on_start is not None:
-            on_start(pgid)
-
-        # Read as it arrives rather than with communicate(), which returns only
-        # when the process has exited. Nothing could be reported about a run in
-        # progress while its output sat in a pipe nobody was reading -- not the
-        # logs, and not which step was on.
+        # Taken back when runner cleanup finishes, which matters more than it sounds.
+        # A process group id is a number the kernel can reissue after the group
+        # disappears, so a caller still holding it can signal a later group.
+        # The id is the leader's pid, but killpg targets the whole group even
+        # after the original leader exits.
+        # Read lines as they arrive so the caller can report progress before
+        # the process exits. communicate() drains both pipes too, but returns
+        # buffered output only after the process has finished.
         #
         # Two threads, one per stream, because draining only one of them is the
         # deadlock communicate() exists to avoid: a tool that fills the other
@@ -120,6 +116,7 @@ class Runner:
         # uses. Nothing is lost that would have survived being recorded: the
         # store keeps MAX_LOG_BYTES of a stream either way.
         collected = {"stdout": TailBuffer(), "stderr": TailBuffer()}
+        reader_errors = []
 
         def pump(stream, name):
             try:
@@ -132,6 +129,8 @@ class Runner:
                             # A defect in reporting must not take the run with
                             # it. The line is still collected either way.
                             pass
+            except BaseException as error:  # noqa: BLE001
+                reader_errors.append(error)
             finally:
                 try:
                     stream.close()
@@ -144,14 +143,44 @@ class Runner:
             threading.Thread(target=pump, args=(process.stderr, "stderr"),
                              daemon=True),
         ]
-        for reader in readers:
-            reader.start()
+        reader_streams = dict(zip(readers, (process.stdout, process.stderr)))
+        started_readers = []
 
         try:
+            if on_start is not None:
+                on_start(pgid)
+            for reader in readers:
+                reader.start()
+                started_readers.append(reader)
+            # Pass the configured value unchanged to the parent wait (among
+            # other things, this keeps provider-level timeout observation
+            # precise), then spend only the remaining budget draining pipes.
+            deadline = time.monotonic() + timeout_s
             process.wait(timeout=timeout_s)
+            returncode = process.returncode
+            for reader in started_readers:
+                reader.join(timeout=max(0, deadline - time.monotonic()))
+            if any(reader.is_alive() for reader in started_readers):
+                # A descendant can keep a pipe open after the parent exits.
+                # Treat unfinished reading as a timeout, even if the parent
+                # succeeded. Cleanup stays bounded if a child left the group
+                # or a line callback is still blocked.
+                _kill_group(pgid)
+                process.wait()
+                for reader in started_readers:
+                    reader.join(timeout=10)
+                if returncode == 0:
+                    returncode = -signal.SIGKILL
+            if reader_errors:
+                raise reader_errors[0]
         except subprocess.TimeoutExpired:
-            os.killpg(pgid, signal.SIGKILL)
+            _kill_group(pgid)
             process.wait()
+            for reader in started_readers:
+                reader.join(timeout=10)
+            returncode = process.returncode
+            if returncode == 0:
+                returncode = -signal.SIGKILL
         except BaseException:
             # Any other way out -- a broken pipe, an interpreter shutdown, a
             # KeyboardInterrupt -- and the child has NOT been reaped. The
@@ -159,7 +188,7 @@ class Runner:
             # the tool running with nothing able to stop it, against a workspace
             # perform_run is on its way to deleting.
             #
-            # Demonstrated by making communicate() raise OSError: the group was
+            # Demonstrated by making wait() raise OSError: the group was
             # still alive and the only handle to it had just been cleared.
             _kill_group(pgid)
             # Reaped as well as killed. SIGKILL ends the processes but leaves
@@ -172,25 +201,31 @@ class Runner:
                 process.wait(timeout=10)
             except Exception:                    # noqa: BLE001
                 pass
+            for reader in started_readers:
+                reader.join(timeout=10)
             raise
         finally:
             # Reached by every path, and by now the group is either reaped
             # normally or killed above -- including the paths that raise, which
             # is why the kill is in an except rather than only in the timeout.
             #
-            # The readers are joined with a bound rather than indefinitely. A
-            # grandchild that inherited the pipes and outlived its parent holds
-            # them open, and waiting forever for that is the hang the process
-            # group exists to prevent -- so a run that gets there returns what
-            # was read by then rather than never returning.
             for reader in readers:
-                reader.join(timeout=10)
+                if reader not in started_readers:
+                    stream = reader_streams[reader]
+                    try:
+                        stream.close()
+                    except Exception:                # noqa: BLE001
+                        pass
             if on_finish is not None:
                 on_finish()
 
-        # The process's real code, not a constant: reporting the signal we
-        # meant to send would claim SIGKILL however the process actually ended.
-        return RunResult(process.returncode,
+        # The local, not process.returncode. Both branches of this merge were
+        # guarding the same line against different mistakes and the one below
+        # already covers both: it takes the process's real code -- so a run that
+        # had already exited 3 does not come back claiming the signal we sent --
+        # and substitutes only when that code is 0 after we killed the group,
+        # because reading that overran the deadline did not produce a success.
+        return RunResult(returncode,
                          collected["stdout"].text(),
                          collected["stderr"].text())
 
@@ -237,7 +272,7 @@ created and destroyed per run, so an image cached inside one would be pulled
 again every time.
 """
 
-APPTAINER_ARGS = os.getenv("BIOCHEF_APPTAINER_ARGS", "--contain")
+APPTAINER_ARGS = os.getenv("BIOCHEF_APPTAINER_ARGS", "--contain --cleanenv")
 """Extra flags for the apptainer invocation itself.
 
 --contain by default, and the default is the point. Apptainer binds the host's
@@ -249,8 +284,10 @@ workspace, which for a service whose reason to exist is keeping one dataset away
 from another is the wrong half to get right. The container runs as the same
 user, so the 0700 mode on a workspace does not help.
 
-Emptying this variable turns containment off, for an operator who needs the host
-/tmp visible and knows what that means.
+--cleanenv stops ordinary Agent environment variables, including registry
+credentials, being inherited by the tool process. It does not isolate /proc or
+the network. Emptying this variable turns both protections off, for an operator
+who needs host access and knows what that means.
 """
 
 _IMAGE_SHAPE = re.compile(r"\A[A-Za-z0-9/][A-Za-z0-9._:/@+-]{0,255}\Z")

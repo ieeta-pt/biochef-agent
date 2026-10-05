@@ -170,6 +170,29 @@ def test_bearer_without_a_token_refuses_to_start():
             BearerAuth(token=empty) if empty is not None else BearerAuth(token="")
 
 
+def test_non_ascii_bearer_input_is_refused_without_breaking_the_next_request():
+    from fastapi import Request
+    from auth import BearerAuth, Unauthenticated
+
+    provider = BearerAuth(token="s3cret")
+
+    def request(value):
+        return Request({"type": "http", "headers": [(b"authorization", value)]})
+
+    with pytest.raises(Unauthenticated) as refusal:
+        provider.authenticate(request(b"Bearer \xff"))
+    assert refusal.value.status_code == 401
+    assert refusal.value.headers["WWW-Authenticate"] == "Bearer"
+    assert provider.authenticate(request(b"Bearer s3cret")) == "bearer-token"
+
+
+def test_non_ascii_configured_bearer_token_refuses_to_start():
+    from auth import BearerAuth
+
+    with pytest.raises(ValueError, match="BIOCHEF_AUTH_TOKEN.*ASCII"):
+        BearerAuth(token="s\u00e9cret")
+
+
 def test_an_unknown_provider_stops_the_process():
     """A typo in BIOCHEF_AUTH must not quietly leave the service open.
 

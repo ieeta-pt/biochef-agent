@@ -45,6 +45,21 @@ class AuthProvider:
 
     name = "provider"
 
+    identifies = False
+    """Whether what authenticate() returns names a caller.
+
+    False by default, and deliberately. A shared secret returns a marker meaning
+    "the holder presented the right token", which is not an identity -- so the
+    audit trail records None for it, and "we do not know who" stays legible as a
+    fact about the deployment rather than as a gap in the log. A provider that
+    does carry identity (F3, Passports) sets this True and the same field starts
+    being useful without the format changing.
+
+    Not inferred from the marker's value. The trail is read by people who were
+    not here, and the difference between "nobody knows" and "someone called
+    bearer-token" is exactly the difference it must not blur.
+    """
+
     def authenticate(self, request: Request) -> Optional[str]:
         """Return an identity for the caller, or raise Unauthenticated.
 
@@ -95,6 +110,8 @@ class BearerAuth(AuthProvider):
                 "non-empty value. Refusing to start rather than run with a "
                 "token nobody has to guess."
             )
+        if not token.isascii():
+            raise ValueError("BIOCHEF_AUTH_TOKEN must contain only ASCII characters")
         self._token = token
 
     def authenticate(self, request: Request) -> Optional[str]:
@@ -105,6 +122,8 @@ class BearerAuth(AuthProvider):
         scheme, _, presented = header.partition(" ")
         if scheme.lower() != "bearer" or not presented:
             raise Unauthenticated("expected an Authorization: Bearer <token>")
+        if not presented.isascii():
+            raise Unauthenticated("the token presented is not the one configured")
 
         # compare_digest, not ==. String comparison returns as soon as it finds a
         # difference, so how long it takes leaks how much of the token was right,
@@ -143,10 +162,21 @@ class AuthenticationMiddleware:
             # Kept, not discarded. authenticate() is documented to return an
             # identity, and until now nothing held onto it -- so the audit trail
             # had no way to say who, and a provider that knows more about the
-            # caller had nowhere to put it. None is a real answer here and is
-            # recorded as one: the bearer provider has no identity to give.
+            # caller had nowhere to put it.
+            identity = self.provider.authenticate(Request(scope))
+
+            # Recorded as a caller only when the provider says it is one. This
+            # used to assign the return value directly, on the belief that the
+            # bearer provider returned None -- it returns the marker
+            # "bearer-token", which is #63's tested contract for
+            # authenticated-without-identity. Assigning it put a string that
+            # reads like a name into the `caller` field of an audit trail,
+            # contradicting what audit.py promises about that field and what the
+            # provider's own docstring says it does not pretend to be. Found by
+            # a test that submitted a run over HTTP; the ones that built a store
+            # by hand and passed caller=None themselves could not see it.
             scope.setdefault("state", {})["caller"] = (
-                self.provider.authenticate(Request(scope))
+                identity if self.provider.identifies else None
             )
             scope["state"]["authenticated_by"] = self.provider.name
         except HTTPException as refusal:

@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-import errno
+import fcntl
 import hashlib
 import json
 import oras.client
@@ -7,13 +7,15 @@ import os
 import shutil
 import stat
 import threading
-import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 
 from dotenv import load_dotenv
 
+import signing
+import evidence_verification
 from workspace import check_name
 
 load_dotenv()
@@ -92,12 +94,10 @@ class Workflow:
 TOOL_CACHE = os.path.realpath(os.getenv("BIOCHEF_TOOL_CACHE", "tool-cache"))
 """Where pulled bundles live, shared by every run.
 
-Splitting the cache out of the run directory is forced by giving each run its
-own directory, not a tidy-up. fetch_tool memoises and returns early on a hit, so
-it never re-copied the binary; with one shared directory that made the copy
-survive between runs, and with a fresh directory per run it would simply be
-missing on the second. The pull is cached here, and materialise_tools puts a
-copy in whichever workspace needs it.
+Each run has its own workspace, while downloaded bundles can be reused. On
+every fetch, the cached files are checked against the registry manifest; a
+matching entry avoids another pull. materialise_tools copies the executable
+into whichever run workspace needs it.
 """
 
 tools = {}
@@ -109,26 +109,27 @@ _fetch_locks = {}
 _fetch_locks_guard = threading.Lock()
 
 
+@contextmanager
 def _fetch_lock(tool_id):
-    """One lock per tool, so two runs never pull the same one at once.
-
-    Without this, concurrent runs raced on the shared staging directory and
-    destroyed each other's work: both would rmtree it, both makedirs it, and
-    then one would os.replace a directory the other had already moved. Measured
-    with twenty simultaneous submissions, nineteen failed --
-
-      [Errno 17] File exists: .../cache/tool.part
-      [Errno  2] No such file or directory: .../cache/tool.part
-
-    -- and the one that survived did so by being first. The race predates
-    asynchronous runs, since two concurrent /convert calls could always hit it,
-    but nothing made concurrency easy to reach until now.
-
-    Per tool rather than one global lock: two different tools have no reason to
-    wait for each other, and a pull can be slow.
-    """
+    """Lock one local cache entry across cooperating threads and processes."""
     with _fetch_locks_guard:
-        return _fetch_locks.setdefault(tool_id, threading.Lock())
+        thread_lock = _fetch_locks.setdefault(tool_id, threading.Lock())
+
+    with thread_lock:
+        os.makedirs(TOOL_CACHE, exist_ok=True)
+        # Keep this file: recreating it could let processes lock different inodes.
+        lock_path = os.path.join(TOOL_CACHE, f".{tool_id}.lock")
+        lock_fd = os.open(
+            lock_path,
+            os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
 
 class ToolIntegrityError(Exception):
@@ -246,34 +247,63 @@ def verify_against_manifest(target, staging, manifest=None):
             )
 
 
-def fetch_tool(tool_id, repo, attempts=4):
-    """Pull a bundle into the shared cache and return it.
+# Taken from oras rather than restated: a manifest media type oras would accept
+# must not be refused here just because this file has an older list.
+try:
+    import oras.defaults
+    _MANIFEST_TYPES = ", ".join(oras.defaults.default_manifest_accepted_media_types)
+except Exception:  # pragma: no cover - a stubbed oras in the test suite
+    _MANIFEST_TYPES = "application/vnd.oci.image.manifest.v1+json"
 
-    Retried, because the cache is shared between processes and the promote is
-    not atomic across them. Another process replacing this tool deletes the
-    cached directory a moment before putting the new one in its place, and a
-    reader arriving in that window finds nothing -- reproduced with six
-    processes on one cold cache as
 
-      FileNotFoundError: .../shared-cache/tool/bundle.json
+def fetch_manifest(target):
+    """The manifest and the digest that names it, from a single fetch, along with the raw bytes.
 
-    The per-tool lock covers threads in this process; nothing covers processes,
-    and a directory cannot be swapped atomically on POSIX. The state is
-    self-healing -- whatever the other process was putting there arrives a
-    moment later, verified -- so looking again is the honest answer. Doing it
-    properly means an indirection that CAN be swapped atomically, which is a
-    change of on-disk layout and its own piece of work.
+    oras parses the response and throws it away, so the manifest digest -- which
+    is defined as the hash of the exact bytes served, not of anything we could
+    re-serialise -- is not recoverable from what get_manifest returns. Signature
+    verification needs that digest, and needs it to name the same artifact the
+    blobs are pulled from, so the request happens here and both are kept.
+
+    The digest is computed from the bytes rather than taken from the registry's
+    Docker-Content-Digest header. The header is advisory and comes from the same
+    party as the manifest; if both are present and disagree, that is refused,
+    because a registry answering one thing and labelling it another is not a
+    situation to pick a winner in.
+
+    Falls back to oras's own accessor for any client that cannot do a raw
+    request, returning no digest -- which strict mode refuses, so the fallback
+    cannot quietly become a way to skip verification.
     """
-    for remaining in range(attempts - 1, -1, -1):
-        try:
-            return _fetch_tool_once(tool_id, repo)
-        except (FileNotFoundError, NotADirectoryError):
-            if remaining == 0:
-                raise
-            time.sleep(0.05)
+    container = client.get_container(target)
+    if not (hasattr(client, "do_request") and hasattr(client, "prefix")):
+        return client.get_manifest(container), None, None
+
+    url = f"{client.prefix}://{container.manifest_url()}"
+    response = client.do_request(url, "GET", headers={"Accept": _MANIFEST_TYPES})
+    if response.status_code != 200:
+        raise ToolIntegrityError(
+            f"{target}: the registry answered {response.status_code} for its manifest"
+        )
+
+    body = response.content
+    digest = "sha256:" + hashlib.sha256(body).hexdigest()
+    advertised = response.headers.get("Docker-Content-Digest")
+    if advertised and advertised != digest:
+        raise ToolIntegrityError(
+            f"{target}: the registry served a manifest whose digest is {digest} "
+            f"but labelled it {advertised}"
+        )
+    requested = getattr(container, "digest", None)
+    if requested and requested != digest:
+        raise ToolIntegrityError(
+            f"{target}: the registry served manifest {digest}, but the requested "
+            f"immutable reference names {requested}"
+        )
+    return json.loads(body), digest, body
 
 
-def _fetch_tool_once(tool_id, repo):
+def fetch_tool(tool_id, repo):
     """Pull a bundle into the shared cache and return it.
 
     The signature is unchanged on purpose: parse_biochef_workflow calls this,
@@ -285,62 +315,48 @@ def _fetch_tool_once(tool_id, repo):
 
     outdir = os.path.join(TOOL_CACHE, tool_id)
     target = f"{REGISTRY_URL}/{repo}"
+    current_mode = signing.mode()
+    if current_mode == signing.STRICT and not signing.is_immutable(target):
+        raise signing.SignatureError(
+            f"{target}: strict verification requires the caller to select an "
+            "immutable OCI manifest digest"
+        )
 
-    # Fetched once, and used for both the cache check and the verification of
-    # anything pulled, so the two are talking about the same artifact. Two
-    # separate fetches made an ordinary push to the same tag, mid-pull, look
-    # exactly like tampering.
-    manifest = client.get_manifest(client.get_container(target))
-
-    # On EVERY call, not only on a miss. The cache is what materialise_tools
-    # copies into a run and chmods 0700, so verifying only the pull that created
-    # it proves something about a moment in the past rather than about the bytes
-    # being executed. It is a plain directory, written by this service, and a
-    # tool running under the subprocess runner is unconfined and runs as the
-    # same user -- so one run can rewrite what every later run executes. That is
-    # not a clever attack, it is the ordinary consequence of a shared cache.
-    #
-    # The cost is a manifest fetch and a local re-hash per tool per request. The
-    # blobs are not downloaded again.
     with _fetch_lock(tool_id):
-        # Re-checked inside the lock. Another run may have pulled this very
-        # tool while this one waited, in which case there is nothing to do --
-        # and pulling again would be both wasteful and another chance to race.
-        if not cache_matches(outdir, manifest, target):
-            # Staged, then moved into place, so an interrupted pull cannot leave
-            # a half-written bundle that the next run would read as complete.
-            #
-            # The staging name is unique per attempt. A fixed ".part" was
-            # shared between concurrent runs, which is what let them delete
-            # each other's work.
-            #
-            # An earlier version of this comment claimed the unique name also
-            # made a second PROCESS sharing the cache safe. It does not, and
-            # saying so was worse than saying nothing, because it told the next
-            # reader not to look. _fetch_lock is a threading.Lock and reaches
-            # only this process; the promote below is two syscalls and is not
-            # atomic across processes. Both halves of that are handled where
-            # they happen -- _promote tolerates losing the race, and fetch_tool
-            # retries a read that lands in the gap -- but neither is the same as
-            # being atomic, and a shared cache between replicas is eventually
-            # consistent rather than safe by construction.
-            staging = f"{outdir}.part.{uuid.uuid4().hex}"
-            os.makedirs(staging, exist_ok=True)
-            try:
-                client.pull(target=target, outdir=staging)
-                # Before the staged directory becomes the cached one, and so
-                # before anything in it can be copied into a run. A bundle that
-                # does not match is removed, never promoted.
-                verify_against_manifest(target, staging, manifest=manifest)
-                _promote(staging, outdir, manifest, target)
-            finally:
-                # Whatever happened, this attempt's directory does not outlive
-                # it. os.replace moved it on success, so this is a no-op then.
-                shutil.rmtree(staging, ignore_errors=True)
+        manifest, manifest_digest, raw_manifest = fetch_manifest(target)
+        try:
+            subject = signing.immutable_reference(target, manifest_digest)
+        except signing.SignatureError:
+            subject = None
 
-        # Read while the lock is still held. The promote deletes the cached
-        # directory before putting the new one in its place, so a reader in
-        # another THREAD could otherwise find it missing between the two.
+        signing.check(target, manifest_digest, log=print)
+        evidence = evidence_verification.check(
+            subject,
+            raw_manifest,
+            client,
+            fetch_manifest,
+            log=print,
+        )
+
+        pull_target = subject if current_mode != signing.OFF and subject else target
+        if not cache_matches(outdir, manifest, pull_target):
+            staging = f"{outdir}.part.{uuid.uuid4().hex}"
+            os.makedirs(staging)
+            try:
+                client.pull(target=pull_target, outdir=staging)
+                verify_against_manifest(pull_target, staging, manifest=manifest)
+                evidence_verification.verify_pulled(
+                    staging, subject, tool_id, evidence, log=print
+                )
+                shutil.rmtree(outdir, ignore_errors=True)
+                os.replace(staging, outdir)
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+        else:
+            evidence_verification.verify_pulled(
+                outdir, subject, tool_id, evidence, log=print
+            )
+
         with open(os.path.join(outdir, "bundle.json"), "r") as f:
             bundle = json.load(f)
 
@@ -350,10 +366,12 @@ def _fetch_tool_once(tool_id, repo):
         # and was, until now, thrown away.
         evidence = _bundle_evidence(outdir, manifest, target)
 
-    tools[tool_id] = bundle
-    provenance[tool_id] = evidence
-    return bundle
-
+        # Inside the lock, which is where master moved them: the cache entry and
+        # what this process believes about it are set together or a second
+        # fetcher can read one without the other.
+        tools[tool_id] = bundle
+        provenance[tool_id] = evidence
+        return bundle
 
 def _bundle_evidence(directory, manifest, target):
     """What this bundle is, in the terms the registry stated it.
@@ -392,54 +410,6 @@ def _bundle_evidence(directory, manifest, target):
             "operation": document.get("operation"),
         }
     return evidence
-
-
-def _promote(staging, outdir, manifest, target, attempts=5):
-    """Put a verified staging directory in place, against other processes.
-
-    os.replace will not overwrite a non-empty directory, and the promote is two
-    syscalls -- rmtree then replace -- so two processes sharing a cache trip
-    over each other. Measured with four processes on one cache: two failed in
-    every trial.
-
-    _fetch_lock does not help; it is a threading.Lock and reaches only this
-    process. Multi-process is opt-in -- run.sh starts one worker -- but a shared
-    cache volume between replicas is a real deployment, so this handles it.
-
-    A clash is not a failure. Whoever won had also passed
-    verify_against_manifest against this same manifest, so their copy is as good
-    as ours: if what is now in place matches, we use it. Retried because the
-    re-check races too, a third process can rmtree between our clash and our
-    look, and one attempt left roughly one failure in twenty-four.
-    """
-    last = None
-    for _ in range(attempts):
-        shutil.rmtree(outdir, ignore_errors=True)
-        try:
-            os.replace(staging, outdir)
-            return
-        except OSError as clash:
-                    # Another process promoted the same tool between our rmtree
-                    # and our replace. os.replace will not overwrite a
-                    # non-empty directory, so it raises ENOTEMPTY (66 on
-                    # darwin, 39 on Linux) and this run failed for no reason
-                    # other than losing a footrace. Measured at two failures in
-                    # four processes, in every trial.
-                    #
-                    # Their copy is as good as ours -- both passed
-                    # verify_against_manifest against the same manifest before
-                    # either got here -- so the answer is to check that what is
-                    # now in place matches, and use it. If it does not, this is
-                    # a real failure and it is raised.
-            if clash.errno not in (errno.ENOTEMPTY, errno.EEXIST):
-                raise
-            last = clash
-            if cache_matches(outdir, manifest, target):
-                return          # someone else put an equivalent copy in place
-    raise ToolIntegrityError(
-        f"{target}: could not put the verified bundle in place after "
-        f"{attempts} attempts; another process kept replacing it. Last: {last}"
-    )
 
 
 def expected_uploads(workflow):
@@ -490,11 +460,8 @@ def materialise_tools(workflow, ws):
 def rule_name_for(node_id):
     """The snakemake rule name a node is emitted as.
 
-    Extracted so there is one of these rather than two. Attribution of a failing
-    step reads "Error in rule <name>:" out of snakemake's output and has to turn
-    that back into a node id; a second copy of this transform would go on
-    working right up until someone changed the emitter, and then attribute
-    failures to nothing at all.
+    Snakemake's diagnostic error headings use this name. The separate per-rule
+    log files are indexed by node id and do not depend on parsing a heading.
     """
     return node_id.replace(".", "_").replace("-", "_")
 
@@ -560,7 +527,13 @@ def parse_biochef_workflow(biochef_workflow):
     return new_workflow
 
 
-def convert_to_snakemake(workflow: Workflow):
+def convert_to_snakemake(workflow: Workflow, step_logs=None):
+    if step_logs is not None and len(step_logs) != len(workflow.nodes):
+        raise ValueError("one pair of log names is required for each node")
+    if step_logs is not None:
+        names = [check_name(name) for pair in step_logs for name in pair]
+        if len(set(names)) != len(names):
+            raise ValueError("step log names must be distinct")
     result = []
     result.append("rule all:\n    input:")
 
@@ -568,7 +541,7 @@ def convert_to_snakemake(workflow: Workflow):
         for output in node.outputs.values():
             result.append(f"        \"{output.file}\",")
 
-    for node in workflow.nodes:
+    for index, node in enumerate(workflow.nodes):
         # print(node)
         result.append(f"rule {rule_name_for(node.id)}:")
         cmd = [f"./{node.bin}"]
@@ -607,11 +580,22 @@ def convert_to_snakemake(workflow: Workflow):
                     extra_cms.append(f"        cp {output.hardcoded_file} {{output.{output_var}}}")
             i += 1
 
+        if step_logs is not None:
+            stdout_name, stderr_name = step_logs[index]
+            result.append(
+                f"    log: stdout={json.dumps(check_name(stdout_name))}, "
+                f"stderr={json.dumps(check_name(stderr_name))}"
+            )
+
         result.append(f"    shell:")
         result.append(f"        \"\"\"")
+        if step_logs is not None:
+            result.append("        (")
         result.append(f"        {" ".join(cmd)}")
         for command in extra_cms:
             result.append(command)
+        if step_logs is not None:
+            result.append("        ) > {log.stdout} 2> {log.stderr}")
         result.append(f"        \"\"\"")
 
     return "\n".join(result)
