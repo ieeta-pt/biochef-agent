@@ -96,6 +96,35 @@ until the run ends. This setting is a retention bound, not a peak resource
 limit. Logs may contain sensitive tool output; this prototype has no local
 log-release policy for TRE use.
 
+### A workflow you got wrong is your error, not the agent's
+
+A `biochef_workflow` this service cannot read is a `400` naming what was wrong:
+not valid JSON, no `nodes`, a node without an `id`, a tool node whose
+`data.repo` is not a string, an edge that is a number. On `/runs` the same
+mistakes settle the run as `EXECUTOR_ERROR`, which is WES's word for the
+submission or its tools, rather than `SYSTEM_ERROR`, which is this service
+saying it broke.
+
+Both used to be the other way round. `/convert` answered `500` to nine of ten
+malformed documents and `/runs` recorded five of six as `SYSTEM_ERROR`, in both
+cases carrying the Python exception's own text — so a caller was told `'id'`, or
+`'int' object is not subscriptable`. A hub triaging a federated run would have
+gone looking for a fault here.
+
+The document is checked **before** a run directory exists, so a refused
+submission leaves nothing behind.
+
+The check is on shape only, and it is explicit rather than a `try/except`
+around the parse. Catching `KeyError` and `TypeError` there would cover every
+field for free and would also turn a genuine bug in our own parsing into a tidy
+`400`, telling a caller their workflow was wrong when it was not. The cost is
+that the check knows which fields the parser reads; a test drives a matrix of
+malformed documents through both routes and asserts none of them reaches a
+`500`, and another asserts that an internal fault still does.
+
+Whether a repo exists, whether a tool has the operation named, whether an
+edge's handles match — those need the registry and are still answered later.
+
 Both take the same fields:
 
 | field | what it is |

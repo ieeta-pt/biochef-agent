@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 import fcntl
 import hashlib
 import json
@@ -416,6 +416,149 @@ def rule_name_for(node_id):
 
 def get_node_data(node_id, node_list):
     return next(node for node in node_list if node["id"] == node_id)
+
+
+def read_workflow_document(text):
+    """Parse the submitted workflow and refuse a shape this cannot run (#86).
+
+    Every mistake reachable from here belongs to whoever submitted the document,
+    so every one of them is a 400 naming what was wrong. Without this they were
+    raw KeyErrors and TypeErrors out of parse_biochef_workflow: `/convert`
+    answered 500 to nine of ten malformed documents, and `/runs` recorded them
+    as SYSTEM_ERROR -- which in WES means this service failed -- with the
+    exception's own text as the error, so `'id'` and
+    `'int' object is not subscriptable` were what a client got told.
+
+    Deliberately not a try/except around the parse. Catching KeyError and
+    TypeError there would need no knowledge of the document at all, and would
+    also turn a genuine bug in our own parsing into a tidy 400 -- the same
+    mistake as an `except Exception` that reports everything as a refusal. The
+    cost of checking explicitly is that this knows which fields the parser
+    reads, and a field added there without being added here goes back to being
+    a 500. A test drives a matrix of malformed documents through both routes
+    and asserts none of them reaches one.
+
+    Shape only. Whether a repo exists, whether a tool has the operation named,
+    whether an edge's handles match -- those need the registry and stay where
+    they are.
+    """
+    try:
+        document = json.loads(text)
+    except ValueError as malformed:
+        # The position comes from json and describes the caller's own input, so
+        # it is theirs to see; nothing here is ours.
+        raise HTTPException(
+            status_code=400,
+            detail=f"biochef_workflow is not valid JSON: {malformed}",
+        ) from None
+
+    if not isinstance(document, dict):
+        raise HTTPException(
+            status_code=400,
+            detail=f"biochef_workflow must be a JSON object with 'nodes' and "
+                   f"'edges'; this is {_json_kind(document)}",
+        )
+
+    for key in ("nodes", "edges"):
+        if key not in document:
+            raise HTTPException(
+                status_code=400,
+                detail=f"biochef_workflow has no {key!r}",
+            )
+        if not isinstance(document[key], list):
+            raise HTTPException(
+                status_code=400,
+                detail=f"biochef_workflow's {key!r} must be a list, not "
+                       f"{_json_kind(document[key])}",
+            )
+
+    for index, node in enumerate(document["nodes"]):
+        _check_node(index, node)
+    for index, edge in enumerate(document["edges"]):
+        _check_edge(index, edge)
+
+    return document
+
+
+def _json_kind(value):
+    """What a client called this, in their words rather than Python's.
+
+    A caller who sent a JSON array is not helped by being told about `list`,
+    and the type name of an internal object would be ours to know.
+    """
+    if value is None:
+        return "null"
+    return {bool: "a boolean", int: "a number", float: "a number",
+            str: "a string", list: "an array", dict: "an object"}.get(
+                type(value), "not usable here")
+
+
+def _check_node(index, node):
+    where = f"node at index {index}"
+    if not isinstance(node, dict):
+        raise HTTPException(status_code=400,
+                            detail=f"{where} must be an object, not "
+                                   f"{_json_kind(node)}")
+    for key in ("id", "type"):
+        if key not in node:
+            raise HTTPException(status_code=400,
+                                detail=f"{where} has no {key!r}")
+        if not isinstance(node[key], str):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{where} has a {key!r} that is "
+                       f"{_json_kind(node[key])}, and it must be a string")
+
+    # Only a tool node is read further: an input or output node carries no repo
+    # and never reaches fetch_tool.
+    if node["type"] != "workflowNode":
+        return
+
+    named = f"node {node['id']!r}"
+    data = node.get("data")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400,
+                            detail=f"{named} has no 'data' object")
+    repo = data.get("repo")
+    if not isinstance(repo, str) or not repo:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{named} needs a 'data.repo' naming the tool bundle to "
+                   f"pull; this is {_json_kind(repo)}")
+    params = data.get("paramValues", {})
+    if not isinstance(params, dict):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{named} has a 'data.paramValues' that is "
+                   f"{_json_kind(params)}, and it must be an object")
+    for name, param in params.items():
+        if not isinstance(param, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{named} parameter {name!r} must be an object with "
+                       f"'enabled' and 'value'; this is {_json_kind(param)}")
+        if param.get("enabled") is True and "value" not in param:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{named} parameter {name!r} is enabled and has no "
+                       f"'value'")
+
+
+def _check_edge(index, edge):
+    where = f"edge at index {index}"
+    if not isinstance(edge, dict):
+        raise HTTPException(status_code=400,
+                            detail=f"{where} must be an object, not "
+                                   f"{_json_kind(edge)}")
+    for key in ("source", "target"):
+        if key not in edge:
+            raise HTTPException(status_code=400,
+                                detail=f"{where} has no {key!r}")
+        if not isinstance(edge[key], str):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{where} has a {key!r} that is "
+                       f"{_json_kind(edge[key])}, and it must be a node id")
 
 
 def parse_biochef_workflow(biochef_workflow):
