@@ -242,6 +242,17 @@ between an open endpoint and a closed one. Selecting `bearer` without a token
 stops the service from starting rather than letting it run with a token nobody
 has to guess.
 
+**The audit trail records a caller only when the provider says its return names
+one.** Every provider has to declare that, and one that does not stops the
+service from starting — alongside the empty token and the unknown provider
+name. There is deliberately no default: `bearer` returns a marker every holder
+of the secret presents, and writing that into the trail's `caller` field would
+read as a name to whoever opens the log years later; but a provider added later
+that *does* carry identity and merely forgot to declare would have its callers
+silently dropped instead, which is the worse of the two and the one nothing
+would notice. So "we do not know who" stays a recorded fact about the
+deployment rather than a gap in the log.
+
 `BIOCHEF_DATA_SOURCES` decides where a run's inputs may come from. It defaults
 to `upload` alone — bytes pushed in the request, which is what the editor does.
 Adding `localpath` lets a workflow name a file already on the agent's host, which
