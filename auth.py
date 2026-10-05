@@ -146,6 +146,23 @@ class PassportAuth(AuthProvider):
 
     name = "passport"
 
+    identifies = True
+    """authenticate() returns a name, so the audit trail records it.
+
+    The one provider so far for which this is True. `none` returns nothing and
+    `bearer` returns a marker every holder of the secret presents, so recording
+    either as a `caller` would put something that reads like a name into a log
+    opened years later by someone who was not here. A passport's subject is a
+    name, and qualified by its issuer below so two brokers' identical subjects
+    do not merge into one caller -- which is exactly the thing that must survive
+    the last step and reach the trail.
+
+    Declared, not inherited: the base leaves this unanswered and a provider that
+    does not say refuses to start (#19). Before that check existed the default
+    was False, and this provider would have had its identities silently dropped
+    with every test here still passing.
+    """
+
     def __init__(self, issuer=None, audience=None, jwks_url=None,
                  visa_issuers=None, required_visa=None, required_value=None,
                  keyset_factory=None, userinfo_fetch=None, userinfo_url=None):

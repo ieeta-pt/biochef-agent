@@ -383,6 +383,42 @@ def test_the_provider_names_the_caller_with_the_issuer(broker, controller):
     )
 
 
+def test_the_provider_declares_that_it_names_a_caller(broker, controller):
+    """The declaration and the return value have to agree.
+
+    The audit trail records `caller` only when the provider says what
+    authenticate() returns is a name (#19), and a provider that does not say
+    refuses to start. Asserting the attribute alone would be a tautology, so
+    this checks the pairing: it says True, and what it returns really is a name
+    rather than a marker every caller shares.
+
+    If authenticate() were ever changed to return something shared -- a
+    constant, or the token -- this fails, because the declaration would then be
+    a claim the provider no longer supports.
+
+    Only this provider is checked here. The sweep over every registered
+    provider lives with the attribute itself (#19), and once both land it
+    covers `passport` too, because it parametrises over PROVIDERS.
+    """
+    assert auth.PassportAuth.identifies is True
+
+    provider = _provider(broker, controller)
+    first = provider.authenticate(
+        _Request(f"Bearer {broker.sign(passport_claims())}"))
+    second = provider.authenticate(
+        _Request(f"Bearer {broker.sign(passport_claims(sub='user-2'))}"))
+
+    assert first != second, (
+        "two different callers got the same value, so it is a marker and not a "
+        "name -- and `identifies = True` would put it in the trail as one"
+    )
+    assert first.endswith("#user-1") and second.endswith("#user-2")
+    assert first.startswith(BROKER) and second.startswith(BROKER), (
+        "the issuer travels with the subject, which is what stops two brokers' "
+        "identical subjects merging"
+    )
+
+
 def test_the_provider_refuses_without_credentials(broker, controller):
     with pytest.raises(auth.Unauthenticated):
         _provider(broker, controller).authenticate(_Request())

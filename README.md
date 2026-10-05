@@ -151,6 +151,11 @@ names the caller `<issuer>#<subject>` — with the issuer, because two brokers c
 each have a subject `12345` and recording only the second half would merge two
 people into one caller.
 
+It is the first provider that genuinely names anyone, so it is the first to
+declare that what it returns is a name and not a marker every caller shares.
+That declaration is what puts the caller in the audit trail; `none` and `bearer`
+decline it, and a provider that says nothing at all refuses to start.
+
 **The visas do not come from the access token.** The GA4GH AAI profile is
 explicit that "access tokens MUST NOT contain GA4GH Claims directly": the token
 is the credential this service presents to the broker's UserInfo endpoint to
