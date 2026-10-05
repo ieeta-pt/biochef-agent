@@ -46,6 +46,7 @@ if "oras" not in sys.modules:
 
 import pytest
 
+import auth
 import main
 
 
@@ -256,3 +257,101 @@ def test_authentication_wraps_the_body_limit_not_the_other_way_round():
     assert names.index("AuthenticationMiddleware") < names.index("BodySizeLimitMiddleware"), (
         f"middleware order is {names}; authentication must be outermost"
     )
+
+
+# ---------------------------------------------------------------------------
+# every provider has to say whether it knows who is calling (#19)
+
+
+def test_the_base_class_leaves_it_undeclared_rather_than_defaulting():
+    """A default is the bug this replaced.
+
+    The audit trail records `caller` only when the provider says its return
+    names one. With False as the inherited default, a provider written later
+    that forgot to declare would silently have its identities dropped -- and
+    nothing in that provider's own tests would change, because what
+    authenticate() returns is unaffected. PassportAuth returns issuer#subject
+    specifically so two brokers' identical subjects do not merge into one
+    caller, and inheriting False would discard that at the last step.
+    """
+    assert auth.AuthProvider.identifies is None
+
+
+def test_an_undeclared_provider_stops_the_process():
+    """Alongside the empty token and the unknown name: a deployment that cannot
+    say whether it knows who is calling should not be the one writing the
+    trail."""
+    class Forgetful(auth.AuthProvider):
+        name = "forgetful"
+
+        def authenticate(self, request):
+            return "someone@example.org"
+
+    monkey = auth.PROVIDERS.copy()
+    auth.PROVIDERS["forgetful"] = Forgetful
+    try:
+        with pytest.raises(ValueError, match="does not declare"):
+            auth.get_auth("forgetful")
+    finally:
+        auth.PROVIDERS.clear()
+        auth.PROVIDERS.update(monkey)
+
+
+def test_the_middleware_refuses_one_handed_to_it_directly():
+    """The backstop. get_auth covers what BIOCHEF_AUTH resolved to, but a
+    provider can be wired straight into the middleware -- which is how every
+    test does it, and how an embedding would."""
+    class Forgetful(auth.AuthProvider):
+        name = "forgetful"
+
+        def authenticate(self, request):
+            return "someone@example.org"
+
+    async def app(scope, receive, send):
+        pass
+
+    with pytest.raises(ValueError, match="does not declare"):
+        auth.AuthenticationMiddleware(app, provider=Forgetful())
+
+
+def test_the_refusal_says_what_to_set_and_why():
+    """Whoever hits this is adding a provider and needs to act, not guess."""
+    class Forgetful(auth.AuthProvider):
+        name = "forgetful"
+
+        def authenticate(self, request):
+            return "x"
+
+    with pytest.raises(ValueError) as refusal:
+        auth.check_declares_identity(Forgetful())
+
+    message = str(refusal.value)
+    assert "Forgetful" in message
+    assert "identifies" in message
+    assert "True" in message and "False" in message
+    assert "audit trail" in message
+
+
+@pytest.mark.parametrize("name", sorted(auth.PROVIDERS))
+def test_every_registered_provider_declares(name):
+    """So the startup check is a backstop and not the only thing standing
+    between a new provider and a trail missing its callers."""
+    declared = auth.PROVIDERS[name].identifies
+    assert declared is True or declared is False, (
+        f"the {name!r} provider does not declare whether its return names a "
+        f"caller, so it would refuse to start"
+    )
+
+
+def test_a_truthy_value_that_is_not_a_bool_does_not_count():
+    """`identifies = "yes"` reads as declared and is not. The check asks for a
+    bool so a half-answer fails at startup rather than being treated as True."""
+    class Sloppy(auth.AuthProvider):
+        name = "sloppy"
+        identifies = "yes"
+
+        def authenticate(self, request):
+            return "x"
+
+    with pytest.raises(ValueError, match="does not declare"):
+        auth.check_declares_identity(Sloppy())
