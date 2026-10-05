@@ -16,13 +16,16 @@ import base64
 
 from workspace import UnsafeName, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
-from runs import (IllegalTransition, RunState, RunStore, TERMINAL,
-                  UnknownRun)
+from runs import (IllegalTransition, RunCapacityError, RunState, RunStore,
+                  TERMINAL, UnknownRun)
 from datasource import DataSourceError, get_sources
 from retention import Retained
-from steplogs import Progress, failing_steps
+from steplogs import (Progress, clamp, failing_steps, make_step_log_names,
+                      read_node_logs)
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
+from evidence_verification import EvidenceVerificationError
 from runner import SubprocessRunner, get_runner
+from signing import SignatureError
 
 app = FastAPI()
 
@@ -76,6 +79,21 @@ async def tool_integrity(request, exc):
     )
 
 
+@app.exception_handler(SignatureError)
+@app.exception_handler(EvidenceVerificationError)
+async def artifact_verification(request, exc):
+    """Refuse an artifact that does not satisfy the local execution policy."""
+    return JSONResponse(
+        status_code=403,
+        content={
+            "detail": {
+                "error": "artifact_verification",
+                "message": str(exc),
+            }
+        },
+    )
+
+
 RUN_ROOT = os.getenv("BIOCHEF_RUN_ROOT") or None
 RUN_TIMEOUT_S = int(os.getenv("BIOCHEF_RUN_TIMEOUT", "900"))
 KEEP_WORKSPACE = os.getenv("BIOCHEF_KEEP_WORKSPACE", "false").lower() == "true"
@@ -107,8 +125,8 @@ class BiochefWorkflow(BaseModel):
 
 
 def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
-                on_finish=None, on_logs=None, on_progress=None,
-                on_outputs=None, retain=None):
+                on_finish=None, on_logs=None, cancel_requested=None,
+                on_progress=None, on_outputs=None, retain=None):
     """One run, start to finish, given its inputs already resolved.
 
     Split out of the handler so the synchronous endpoint and the asynchronous one
@@ -193,7 +211,10 @@ def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
         # directive, for the provider that runs each step in one. Asking the
         # runner keeps the emitter from having to know how the workflow will be
         # executed.
-        snakemake = RUNNER.snakefile_preamble() + convert_to_snakemake(workflow)
+        step_logs = (make_step_log_names(len(workflow.nodes))
+                     if on_logs is not None else None)
+        snakemake = RUNNER.snakefile_preamble() + convert_to_snakemake(
+            workflow, step_logs=step_logs)
         # Same mapping as the upload loop. An upload named "Snakefile" -- or,
         # on a case-insensitive filesystem, "SNAKEFILE" -- occupies this slot
         # first, and O_EXCL then refuses the generated write. That is the right
@@ -207,29 +228,33 @@ def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
                 detail="an upload occupies a name this run needs: 'Snakefile'",
             )
 
+        if cancel_requested is not None and cancel_requested():
+            return None
+
         report(RunState.RUNNING)
 
         # Built here because this is where the workflow's nodes are known, and
         # fed from the reader threads as snakemake announces each job. Every
         # node starts PENDING, which is what snakemake implies by saying nothing
         # about a job until it starts it.
-        progress = Progress([node.id for node in workflow.nodes], rule_name_for)
+        tracker = Progress([node.id for node in workflow.nodes], rule_name_for)
         if on_progress is not None:
-            on_progress(progress.snapshot())
+            on_progress(tracker.snapshot())
 
         def observe(stream, line):
-            if progress.observe(line) and on_progress is not None:
-                on_progress(progress.snapshot())
+            if stream == "stderr" and tracker.observe(line) and on_progress is not None:
+                on_progress(tracker.snapshot())
 
         code, out, err = run_snakemake(ws, on_start=on_start,
                                        on_finish=on_finish,
-                                       on_line=observe if on_progress else None)
+                                       on_line=observe if on_progress is not None else None)
 
-        # Recorded before the failure path raises, because a failed run is
-        # exactly the one whose output someone needs. Reporting it only on
-        # success, or only as a 2000-character tail, was the whole of #6.
+        # Preserve logs even when the runner exits nonzero, before reporting
+        # the execution failure.
         if on_logs is not None:
-            on_logs(out, err, [node.id for node in workflow.nodes])
+            node_ids = [node.id for node in workflow.nodes]
+            on_logs(code, out, err, node_ids,
+                    read_node_logs(ws, node_ids, step_logs))
 
         if code != 0:
             raise HTTPException(
@@ -278,8 +303,19 @@ def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
         # everything somewhere on completion, is the same bytes moved twice for
         # no gain. Retention is bounded by time and by count; when it declines,
         # or is switched off, the workspace goes now as it always did.
+        #
+        # The two keeping branches differ, and the difference is not tidiable.
+        # KEEP_WORKSPACE leaves the files for an operator to look at and nothing
+        # will read them through this object again, so the descriptor is
+        # released. A RETAINED workspace is still live: retention holds this
+        # object, and the streaming endpoint reads outputs through its
+        # descriptor rather than by path -- which is what keeps a replaced
+        # symlink from redirecting the read (#41). Closing it leaves the files
+        # on disk and the reader unable to open them; the branch's own tests
+        # fail with "output 'out' of 'tool-1' is not there" when it is closed
+        # here, which is how this comment came to exist.
         if KEEP_WORKSPACE:
-            pass
+            ws.close()
         elif retain is not None and retain(ws):
             pass
         else:
@@ -291,20 +327,21 @@ async def convert(
     biochef_workflow: str = Form(...),
     files: List[UploadFile] = File(...)
 ):
-    """Unchanged: the whole run happens inside this request.
+    """The editor's synchronous contract, sharing the execution limit.
 
     Kept as it was because it is the contract the editor speaks today. /runs is
     the same work without the wait.
     """
-    # The spooled file itself, not its contents. Starlette has already written
-    # anything over a megabyte to disk; reading it back with await f.read()
-    # would undo that and put the whole input in memory.
-    inputs = [("spooled", f.filename, f.file) for f in files]
-    return await run_in_threadpool(perform_run, biochef_workflow, inputs)
+    async with _slots():
+        # The spooled file itself, not its contents. Starlette has already
+        # written anything over a megabyte to disk; reading it back with
+        # await f.read() would undo that and put the whole input in memory.
+        inputs = [("spooled", f.filename, f.file) for f in files]
+        return await run_in_threadpool(perform_run, biochef_workflow, inputs)
 
 
 MAX_CONCURRENT_RUNS = int(os.getenv("BIOCHEF_MAX_CONCURRENT_RUNS", "4"))
-"""How many runs may execute at once.
+"""How many /runs and /convert workflows may execute at once.
 
 Without a bound, a burst of submissions became a burst of snakemake processes:
 anyio's default thread limiter is 40, so forty tools could be running at once on
@@ -314,6 +351,8 @@ Accepting work is cheap; doing it is not, and the two need separating.
 Runs beyond the limit wait in QUEUED, which is what that state is for -- WES
 means "accepted, not yet started" by it, and a client polling sees exactly that.
 """
+if MAX_CONCURRENT_RUNS < 1:
+    raise ValueError("BIOCHEF_MAX_CONCURRENT_RUNS must be positive")
 
 _slots_by_loop = weakref.WeakKeyDictionary()
 
@@ -384,7 +423,12 @@ async def _execute(run_id: str, biochef_workflow: str, inputs):
         _advance(run_id, state)
 
     def started(pgid):
-        RUNS.attach(run_id, pgid)
+        if RUNS.attach(run_id, pgid):
+            # Cancellation may have arrived while the runner was starting.
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     def finished():
         RUNS.detach(run_id)
@@ -402,11 +446,14 @@ async def _execute(run_id: str, biochef_workflow: str, inputs):
     def retain(ws):
         return RETAINED.keep(run_id, ws)
 
-    def logs(stdout, stderr, node_ids):
+    def logs(exit_code, stdout, stderr, node_ids, node_logs):
         # Attributed here, where the emitter is already imported, so the run
         # store does not have to reach for it.
-        steps = failing_steps(stderr, node_ids, rule_name_for)
-        RUNS.record_logs(run_id, stdout, stderr, steps)
+        # A successful tool can print a Snakemake-looking error heading. Only
+        # parse a failed workflow, and only from the retained stderr tail.
+        steps = (failing_steps(clamp(stderr), node_ids, rule_name_for)
+                 if exit_code != 0 else {})
+        RUNS.record_logs(run_id, stdout, stderr, steps, node_logs)
 
     try:
         # Waits here while the service is busy, and the run stays QUEUED until a
@@ -420,7 +467,9 @@ async def _execute(run_id: str, biochef_workflow: str, inputs):
                 return
             results = await run_in_threadpool(
                 perform_run, biochef_workflow, inputs, progress, started,
-                finished, logs, step_progress, outputs, retain)
+                finished, logs,
+                cancel_requested=lambda: _was_cancelled(run_id),
+                on_progress=step_progress, on_outputs=outputs, retain=retain)
     except HTTPException as refusal:
         if _was_cancelled(run_id):
             _advance(run_id, RunState.CANCELED)
@@ -457,17 +506,26 @@ def _was_cancelled(run_id) -> bool:
 def _advance(run_id, state, **detail):
     """Record a transition, tolerating one that is no longer legal.
 
-    A run may have reached a terminal state already -- cancelled, once #7
-    exists -- and the worker will not know. Refusing loudly inside a background
-    task would only raise into nowhere.
+    A cancellation can arrive after the worker checks the state but before it
+    records a terminal result. In that case the worker must settle CANCELING,
+    not leave it there forever.
     """
     try:
         RUNS.advance(run_id, state, **detail)
-    except (IllegalTransition, UnknownRun):
+    except IllegalTransition:
+        if state in (RunState.COMPLETE, RunState.EXECUTOR_ERROR,
+                     RunState.SYSTEM_ERROR) and _was_cancelled(run_id):
+            try:
+                RUNS.advance(run_id, RunState.CANCELED)
+            except (IllegalTransition, UnknownRun):
+                pass
+    except UnknownRun:
         pass
 
 
-@app.post("/runs", status_code=202)
+@app.post("/runs", status_code=202, responses={
+    503: {"description": "Agent capacity reached; retry later"},
+})
 async def submit_run(
     biochef_workflow: str = Form(...),
     files: List[UploadFile] = File(...)
@@ -479,25 +537,51 @@ async def submit_run(
     difference between this and /convert, and the reason it cannot simply call
     the same handler in the background.
     """
-    # Read to disk here rather than kept as the request's own spooled file. The
-    # request is over long before the work starts, and starlette closes what it
-    # spooled when it ends -- so the asynchronous path has to take ownership of
-    # the bytes while it still can, without holding them in memory.
-    inputs = []
-    for f in files:
-        spooled = tempfile.NamedTemporaryFile(delete=False)
-        try:
-            while True:
-                chunk = await f.read(1024 * 1024)
-                if not chunk:
-                    break
-                spooled.write(chunk)
-        finally:
-            spooled.close()
-        inputs.append(("handedover", f.filename, spooled.name))
+    # Admission first, and the upload read only after it. Master added this
+    # refusal so a submission the agent is about to turn away is never read, and
+    # a test pins it -- spooling first would write every byte of it to disk.
+    try:
+        run = RUNS.create()
+    except RunCapacityError:
+        raise HTTPException(
+            status_code=503, detail="agent run capacity reached; retry later",
+            headers={"Retry-After": "1"},
+        ) from None
 
-    run = RUNS.create()
-    task = asyncio.create_task(_execute(run.run_id, biochef_workflow, inputs))
+    inputs = []
+    try:
+        # Read to disk here rather than kept as the request's own spooled file.
+        # The request is over long before the work starts, and starlette closes
+        # what it spooled when it ends -- so the asynchronous path has to take
+        # ownership of the bytes while it still can, without holding them in
+        # memory.
+        for f in files:
+            spooled = tempfile.NamedTemporaryFile(delete=False)
+            # Recorded before it is written, not after: a failure part way
+            # through the copy would otherwise leave a file nothing knows the
+            # name of, and the cleanup below could not reach it.
+            inputs.append(("handedover", f.filename, spooled.name))
+            try:
+                while True:
+                    chunk = await f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    spooled.write(chunk)
+            finally:
+                spooled.close()
+        task = asyncio.create_task(_execute(run.run_id, biochef_workflow, inputs))
+    except BaseException:
+        # The handedover source deletes each file once the workspace has it, on
+        # every path -- but nothing has reached it yet, so these are ours. A
+        # refused submission would otherwise leave one temporary file per input
+        # behind, on a service built for large ones.
+        for _, _, path in inputs:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        RUNS.discard(run.run_id)
+        raise
     # Held until it finishes, then dropped. See _running above: without this the
     # task can be collected mid-run and the run never reaches a terminal state.
     _running.add(task)
@@ -528,14 +612,12 @@ async def cancel_run(run_id: str):
     Two shapes of run, and they differ. One waiting for a slot has executed
     nothing, so cancelling it is a matter of state: it settles CANCELED when its
     turn comes and it declines to start. One that is running has a process
-    group, and that group is ended -- the tool and everything it spawned,
-    exactly as the timeout does it, because a tool that spawns children and
-    survives its parent is the reason group-killing is there at all.
+    group, and that group is ended -- the tool and children that remain in the
+    group, exactly as the timeout does it.
 
-    The reply is CANCELING rather than CANCELED, and that is not evasion: the
-    kill has been issued, but the run is not over until the worker has finished
-    tidying up and said so. Reporting CANCELED here would be claiming something
-    that has not happened yet.
+    The reply is normally CANCELING while the worker tidies up. It may already
+    be CANCELED if the worker finishes before the response; CANCELED is only
+    recorded after cleanup.
     """
     try:
         run = RUNS.get(run_id)
@@ -575,18 +657,20 @@ async def cancel_run(run_id: str):
 
 @app.get("/runs/{run_id}/logs")
 async def get_run_logs(run_id: str):
-    """What the run printed, and which step snakemake blamed.
+    """Run-level output and separately captured output from each executed node.
 
-    Two halves, and the response says which is which rather than blurring them.
-    `steps` names the nodes that FAILED, because snakemake states that outright.
-    A step that succeeded is not separated out: its output is in `stdout` along
-    with everything else's, and nothing marks where one rule's writing ends.
-    Splitting that needs a log: directive per rule, which is the emitter's
-    business.
+    `stdout` and `stderr` are Snakemake's run-wide streams. `node_logs` has
+    stdout and stderr from separate files for each rule that started, including
+    a failing tool's actual stderr. Stdout already directed into a declared
+    scientific output remains in that output and is not copied into a log.
+    `failed_steps` is a diagnostic index of Snakemake-style error headings in the
+    run-wide stderr; tools can imitate those headings, so it is not proof of
+    failure or a substitute for `node_logs`.
 
-    Available while a run is still going, not only at the end -- there is no
-    reason to make someone wait for a fifteen-minute run to finish before seeing
-    what it has said so far.
+    Logs are recorded after the workflow process exits, before output collection
+    and the run's terminal state. They are not available during execution.
+    Each stream's retained per-node tails share BIOCHEF_MAX_LOG_BYTES across
+    nodes; log files on disk can grow until the run ends.
     """
     try:
         run = RUNS.get(run_id)

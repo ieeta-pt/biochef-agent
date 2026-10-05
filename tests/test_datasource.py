@@ -188,6 +188,26 @@ def test_localpath_refuses_to_exist_without_a_root():
         LocalPathSource(root="")
 
 
+@pytest.mark.parametrize("kind", ["missing", "file"])
+def test_localpath_requires_a_directory_root(tmp_path, kind):
+    root = tmp_path / "data"
+    if kind == "file":
+        root.write_bytes(b"not a directory")
+    with pytest.raises(ValueError, match="BIOCHEF_LOCAL_ROOT.*directory"):
+        LocalPathSource(root=str(root))
+
+
+def test_localpath_refuses_a_nul_in_the_source_path(tmp_path):
+    ws = make_workspace(str(tmp_path / "runs"))
+    try:
+        with pytest.raises(DataSourceError, match="NUL"):
+            LocalPathSource(root=str(tmp_path)).fetch(
+                ws, "input-1-out", "reads\x00.fastq")
+        assert not Path(ws.path, "input-1-out").exists()
+    finally:
+        ws.cleanup()
+
+
 def test_localpath_copies_a_file_from_inside_its_root(tmp_path):
     root = tmp_path / "data"
     root.mkdir()
