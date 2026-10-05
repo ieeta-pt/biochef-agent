@@ -186,6 +186,25 @@ class RunStore:
         with self._lock:
             del self._runs[run_id]
 
+    def state_counts(self) -> dict:
+        """How many retained runs sit in each state.
+
+        Walked from the store rather than kept as a running tally. A tally
+        drifts the first time an eviction or a refused transition is not
+        accounted for, and a count that is quietly wrong is worse than one that
+        costs a walk of at most MAX_RUNS entries -- a hub routes work on this.
+
+        Under the lock, because requests arrive while this walk is happening:
+        an admission inserts and may evict, which changes the dict's size
+        mid-iteration and is a RuntimeError in whichever thread is unlucky,
+        while a worker advancing a run changes the state being read.
+        """
+        counts = {}
+        with self._lock:
+            for run in self._runs.values():
+                counts[run.state.value] = counts.get(run.state.value, 0) + 1
+        return counts
+
     def all(self):
         """Every run still held, newest first.
 
@@ -196,18 +215,6 @@ class RunStore:
         """
         with self._lock:
             return list(reversed(self._runs.values()))
-
-    def state_counts(self):
-        """How many runs are in each state, for WES's system_state_counts.
-
-        Counted from the live store rather than kept as a running tally: a tally
-        drifts the first time an eviction or a failed transition is not
-        accounted for, and a wrong count is harder to notice than a slow one.
-        """
-        counts = {}
-        for run in self.all():
-            counts[run.state.value] = counts.get(run.state.value, 0) + 1
-        return counts
 
     def get(self, run_id: str) -> Run:
         with self._lock:
