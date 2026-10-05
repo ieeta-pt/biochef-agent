@@ -45,6 +45,48 @@
         "title": "Body_submit_run_runs_post",
         "type": "object"
       },
+      "Body_wes_run_workflow_ga4gh_wes_v1_runs_post": {
+        "properties": {
+          "tags": {
+            "default": "{}",
+            "title": "Tags",
+            "type": "string"
+          },
+          "workflow_attachment": {
+            "default": [],
+            "items": {
+              "contentMediaType": "application/octet-stream",
+              "type": "string"
+            },
+            "title": "Workflow Attachment",
+            "type": "array"
+          },
+          "workflow_params": {
+            "default": "{}",
+            "title": "Workflow Params",
+            "type": "string"
+          },
+          "workflow_type": {
+            "title": "Workflow Type",
+            "type": "string"
+          },
+          "workflow_type_version": {
+            "default": "",
+            "title": "Workflow Type Version",
+            "type": "string"
+          },
+          "workflow_url": {
+            "title": "Workflow Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workflow_type",
+          "workflow_url"
+        ],
+        "title": "Body_wes_run_workflow_ga4gh_wes_v1_runs_post",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -141,6 +183,217 @@
           }
         },
         "summary": "Convert"
+      }
+    },
+    "/ga4gh/wes/v1/runs": {
+      "get": {
+        "description": "Every run still held.\n\npage_size and page_token are accepted and ignored, which service-info says\nunder not_implemented. Refusing them would fail conformant clients that send\na page size by default; pretending to honour them would silently return a\ndifferent set than was asked for.",
+        "operationId": "wes_list_runs_ga4gh_wes_v1_runs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "title": "Page Size",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_token",
+            "required": false,
+            "schema": {
+              "title": "Page Token",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Wes List Runs"
+      },
+      "post": {
+        "description": "WES's submission, mapped onto the same machinery as POST /runs.\n\nAnswers 200 with a run_id, which is what WES specifies -- the bespoke\nendpoint answers 202, and the difference is the specification's rather than\na disagreement about what happened.",
+        "operationId": "wes_run_workflow_ga4gh_wes_v1_runs_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_wes_run_workflow_ga4gh_wes_v1_runs_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Wes Run Workflow"
+      }
+    },
+    "/ga4gh/wes/v1/runs/{run_id}": {
+      "get": {
+        "operationId": "wes_run_log_ga4gh_wes_v1_runs__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Wes Run Log"
+      }
+    },
+    "/ga4gh/wes/v1/runs/{run_id}/cancel": {
+      "post": {
+        "description": "The same cancellation the bespoke endpoint performs, called rather than\nrepeated: two implementations of stopping a process group would be two\nthings to keep correct, and the second is the one that gets forgotten.",
+        "operationId": "wes_cancel_run_ga4gh_wes_v1_runs__run_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Wes Cancel Run"
+      }
+    },
+    "/ga4gh/wes/v1/runs/{run_id}/status": {
+      "get": {
+        "operationId": "wes_run_status_ga4gh_wes_v1_runs__run_id__status_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Wes Run Status"
+      }
+    },
+    "/ga4gh/wes/v1/service-info": {
+      "get": {
+        "description": "What this server is, and what it will refuse.",
+        "operationId": "wes_service_info_ga4gh_wes_v1_service_info_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Wes Service Info"
       }
     },
     "/runs": {
