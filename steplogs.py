@@ -1,40 +1,35 @@
-"""What a run printed, and which step printed it (#6).
+"""Run-level diagnostics and separate rule output (#6).
 
-Snakemake writes one combined stream for the whole workflow, not one per rule.
-So "per step" has two honest halves here, and it is worth being clear which is
-which:
+For asynchronous runs the emitter directs each rule's diagnostic stdout and
+stderr to separate files. Snakemake's own messages remain in the run-level
+stream. Its error headings are diagnostic hints, not step-output boundaries:
 
-  attributed   a step that FAILED. Snakemake says so, in as many words --
-               "Error in rule <name>:" followed by the block describing it --
-               and the emitter derives every rule name from the node id. That
-               mapping is exact and is what makes the answer to "which step
-               broke" a fact rather than a guess.
+  attributed   on a failed workflow, stderr blocks headed "Error in rule
+               <name>:" are mapped to node ids using the emitter's rule names.
+               This is diagnostic text, not verified step identity; use the
+               separate per-rule files for the output a rule printed.
 
-  not split    a step that succeeded. Its output is in the run's stdout along
-               with everything else's, and nothing in snakemake's output marks
-               where one rule's writing ends and the next begins. Separating
-               that needs a `log:` directive per rule, which is the emitter's
-               business and a different piece of work.
-
-Reporting the first and being plain about the second is more useful than
-inventing a split by guessing at boundaries, which would be wrong exactly when
-two steps fail and someone needs to know which said what.
+The per-rule files are the source of `node_logs`. Scientific stdout already
+redirected into a declared output file stays in that output, not in a log.
 """
 
 import os
 import re
 import threading
 import time
+import uuid
 from collections import deque
 
 MAX_LOG_BYTES = int(os.getenv("BIOCHEF_MAX_LOG_BYTES", str(1024 * 1024)))
-"""How much of a run's output is kept.
+"""How much output is retained after a run.
 
-A tool that prints steadily can produce more than anyone wants held in memory,
-and runs are held in memory. The TAIL is kept rather than the head: an error and
-the traceback around it arrive at the end, and a truncated beginning costs
-progress chatter.
+The TAIL is kept rather than the head: an error and the traceback around it
+often arrive at the end. This does not bound the runner's peak capture or the
+size of temporary per-rule log files while tools are still running.
 """
+
+if MAX_LOG_BYTES < 1:
+    raise ValueError("BIOCHEF_MAX_LOG_BYTES must be positive")
 
 _ERROR_IN_RULE = re.compile(r"^Error in rule ([A-Za-z_][A-Za-z0-9_]*):", re.M)
 
@@ -46,22 +41,70 @@ def clamp(text, limit=None):
     no explanation reads like a tool that produced nonsense.
     """
     limit = MAX_LOG_BYTES if limit is None else limit
+    if limit < 1:
+        raise ValueError("log limit must be positive")
     if text is None:
         return ""
-    if len(text) <= limit:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
         return text
-    marker = f"[... {len(text) - limit} earlier bytes dropped ...]\n"
-    return marker + text[-limit:]
+    # A byte boundary can land inside a UTF-8 character. Drop that partial
+    # character and count its bytes among those omitted.
+    tail = encoded[-limit:].decode("utf-8", errors="ignore")
+    dropped = len(encoded) - len(tail.encode("utf-8"))
+    return f"[... {dropped} earlier bytes dropped ...]\n" + tail
+
+
+def make_step_log_names(count):
+    """Use opaque, plain workspace names for one stdout/stderr pair per rule."""
+    prefix = f"bclog-{uuid.uuid4().hex}"
+    return [(f"{prefix}-{index}.stdout", f"{prefix}-{index}.stderr")
+            for index in range(count)]
+
+
+def _read_log_tail(ws, name, limit):
+    try:
+        with ws.open_read(name, regular_only=True) as log:
+            log.seek(0, os.SEEK_END)
+            size = log.tell()
+            log.seek(max(0, size - limit))
+            raw = log.read(limit)
+    except FileNotFoundError:
+        return None
+
+    text = raw.decode("utf-8", errors="ignore")
+    omitted = size - len(text.encode("utf-8"))
+    if omitted:
+        return f"[... {omitted} bytes omitted ...]\n" + text
+    return text
+
+
+def read_node_logs(ws, node_ids, step_logs):
+    """Read per-rule files through the workspace, within one run-wide budget."""
+    if len(node_ids) != len(step_logs):
+        raise ValueError("one pair of log names is required for each node")
+    if not node_ids:
+        return {}
+    per_stream_limit = MAX_LOG_BYTES // len(node_ids)
+    result = {}
+    for node_id, (stdout_name, stderr_name) in zip(node_ids, step_logs):
+        stdout = _read_log_tail(ws, stdout_name, per_stream_limit)
+        stderr = _read_log_tail(ws, stderr_name, per_stream_limit)
+        if stdout is not None or stderr is not None:
+            result[node_id] = {"stdout": stdout or "", "stderr": stderr or ""}
+    return result
 
 
 def failing_steps(stderr, node_ids, rule_name_for):
-    """Which nodes snakemake blamed, and what it said about each.
+    """Which node names appear in Snakemake-style stderr blocks.
 
     `rule_name_for` is passed in rather than imported so this module does not
     depend on the emitter; the caller supplies the one transform that exists.
 
-    A rule name that maps to more than one node is reported against all of them
-    with a note. Two node ids can collide -- "a.b" and "a-b" both become "a_b" --
+    A tool can forge such a block, so these are diagnostic hints rather than
+    proof of a failed node. A rule name that maps to more than one node is
+    reported against all of them with a note. Two node ids can collide --
+    "a.b" and "a-b" both become "a_b" --
     and quietly picking one would put a failure against a step that did not have
     it.
     """
@@ -86,10 +129,11 @@ def failing_steps(stderr, node_ids, rule_name_for):
             # snakemake generated. Not a node, so not attributable.
             continue
         ambiguous = len(owners) > 1
+        block = "\n\n".join(texts)
         for node_id in owners:
             attributed[node_id] = {
                 "rule": rule,
-                "stderr": "\n\n".join(texts),
+                "stderr": block,
             }
             if ambiguous:
                 attributed[node_id]["ambiguous"] = sorted(owners)

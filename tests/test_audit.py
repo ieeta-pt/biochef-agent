@@ -38,10 +38,12 @@ if "oras" not in sys.modules:
 
 
 import pytest
+from fastapi import FastAPI
 
 import audit
 import runs
 from runs import RunStore, RunState
+from test_async_runs import WORKFLOW
 
 
 def test_no_path_means_no_trail(monkeypatch):
@@ -228,3 +230,158 @@ def test_there_is_no_endpoint_serving_the_trail():
     assert "audit" not in main.lower().split("def ")[0] or True
     for route in ("/audit", "/auditlog", "/audit-log"):
         assert route not in main, f"{route} exposes the audit trail over the API"
+
+
+# ---------------------------------------------------------------------------
+# from the route, not from a store built by hand
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_async_runs import service   # noqa: E402
+
+
+def test_a_run_submitted_over_http_records_who_asked(tmp_path, monkeypatch,
+                                                     service):
+    """The wiring, which nothing above exercises.
+
+    Every test here builds a RunStore and passes caller and authenticated_by
+    itself, so submit_run could stop reading them from the request and all
+    fourteen would still pass -- the trail would simply say None for every run
+    the service actually executed, which is the one failure an audit trail
+    cannot have.
+
+    Found while merging live-logs up into this branch: that merge rewrites the
+    submission, which is where the two values are read.
+    """
+    import auth
+    import main
+
+    from fastapi.testclient import TestClient
+
+    trail = tmp_path / "audit.jsonl"
+    monkeypatch.setenv(audit.ENV_PATH, str(trail))
+    monkeypatch.setattr(main, "AUTH", auth.BearerAuth("a-shared-secret"))
+    monkeypatch.setattr(main, "RUNS", RunStore())
+
+    app = FastAPI()
+    for route in main.app.routes:
+        if str(getattr(route, "path", "")).startswith("/runs"):
+            app.router.routes.append(route)
+    app.add_middleware(auth.AuthenticationMiddleware, provider=main.AUTH)
+
+    with TestClient(app) as client:
+        accepted = client.post(
+            "/runs",
+            data={"biochef_workflow": WORKFLOW},
+            files=[("files", ("input-1-out", b"in",
+                              "application/octet-stream"))],
+            headers={"Authorization": "Bearer a-shared-secret"},
+        )
+        assert accepted.status_code == 202, accepted.text
+        run_id = accepted.json()["run_id"]
+
+        # Polled with the header, not through the shared _poll helper: this app
+        # has authentication in front of it and that helper does not
+        # authenticate, so it read a 401 body and failed on a missing key
+        # rather than on anything this test is about.
+        import time
+        for _ in range(400):
+            state = client.get(
+                f"/runs/{run_id}",
+                headers={"Authorization": "Bearer a-shared-secret"},
+            ).json()["state"]
+            if state in {s.value for s in runs.TERMINAL}:
+                break
+            time.sleep(0.02)
+
+    events = [json.loads(line) for line in trail.read_text().splitlines()]
+    mine = [e for e in events if e.get("run_id") == run_id]
+    assert mine, "the run this test submitted left no trail at all"
+    assert all(e["authenticated_by"] == "bearer" for e in mine), (
+        f"the trail does not say which provider authorised it: {mine[0]}"
+    )
+    assert all(e["caller"] is None for e in mine), (
+        "a shared secret is not an identity, and recording one would be a claim "
+        "the deployment cannot support"
+    )
+
+
+def test_a_marker_that_is_not_an_identity_never_reaches_the_trail():
+    """The defect this guards against, at the seam rather than over HTTP.
+
+    BearerAuth.authenticate returns "bearer-token" -- #63's tested contract for
+    authenticated-without-identity -- and the audit wiring used to assign that
+    straight into `caller`. A string that reads like a name in the caller field
+    of an append-only trail is the one thing audit.py promises it is not: "for
+    the bearer provider, nothing at all".
+
+    Checked by driving the middleware, so it covers the translation and not just
+    the provider's return.
+    """
+    import asyncio
+
+    import auth
+
+    assert auth.BearerAuth.identifies is False
+    assert auth.NoAuth.identifies is False
+
+    captured = {}
+
+    async def app(scope, receive, send):
+        captured.update(scope.get("state") or {})
+
+    middleware = auth.AuthenticationMiddleware(
+        app, provider=auth.BearerAuth("a-shared-secret"))
+    scope = {"type": "http", "method": "GET", "path": "/runs/x",
+             "headers": [(b"authorization", b"Bearer a-shared-secret")]}
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        pass
+
+    asyncio.run(middleware(scope, receive, send))
+
+    assert captured["authenticated_by"] == "bearer"
+    assert captured["caller"] is None, (
+        f"the trail would record caller={captured['caller']!r}, which reads "
+        f"like a name for a shared secret every holder presents"
+    )
+
+
+def test_a_provider_that_does_identify_is_recorded(monkeypatch):
+    """The other half, so the fix is not just "always None".
+
+    A provider that genuinely carries identity sets identifies = True and its
+    value reaches the trail unchanged -- which is what F3 needs, and what makes
+    this a translation rather than a suppression.
+    """
+    import asyncio
+
+    import auth
+
+    class Identifying(auth.AuthProvider):
+        name = "passport-ish"
+        identifies = True
+
+        def authenticate(self, request):
+            return "researcher@example.org"
+
+    captured = {}
+
+    async def app(scope, receive, send):
+        captured.update(scope.get("state") or {})
+
+    middleware = auth.AuthenticationMiddleware(app, provider=Identifying())
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        pass
+
+    asyncio.run(middleware({"type": "http", "method": "GET", "path": "/x",
+                            "headers": []}, receive, send))
+
+    assert captured["caller"] == "researcher@example.org"
+    assert captured["authenticated_by"] == "passport-ish"

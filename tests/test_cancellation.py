@@ -245,6 +245,41 @@ def test_a_running_run_is_cancelled_and_its_processes_end(service, monkeypatch):
         pytest.fail("the child outlived the cancellation")
 
 
+def test_cancel_route_stops_the_real_subprocess_runner(service, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    class SlowRunner(runner_module.Runner):
+        def command(self, ws):
+            return ["sleep", "30"]
+
+    monkeypatch.setattr(main, "RUNNER", SlowRunner())
+
+    with TestClient(main.app) as client:
+        run_id = _submit(client).json()["run_id"]
+        pgid = None
+        settled = False
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                pgid = service.get(run_id).pgid
+                if pgid is not None:
+                    break
+                time.sleep(0.01)
+            assert pgid is not None, "the real runner never started"
+
+            response = client.post(f"/runs/{run_id}/cancel")
+            assert response.status_code == 200, response.text
+            settled = _wait_for(service, run_id, {RunState.CANCELED}) is RunState.CANCELED
+            assert settled
+            assert service.get(run_id).pgid is None
+        finally:
+            if pgid is not None and not settled:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
 def test_a_run_that_finishes_after_being_cancelled_still_reports_CANCELED(
         service, monkeypatch):
     """The kill can lose the race, and the answer is still CANCELED.
@@ -287,6 +322,105 @@ def test_a_run_that_finishes_after_being_cancelled_still_reports_CANCELED(
 
     assert state is RunState.CANCELED, body
     assert "outputs" not in body, "a cancelled run handed back its outputs"
+
+
+def test_cancel_during_initialization_stops_a_process_started_later(
+        service, monkeypatch):
+    """A cancellation before on_start must still reach the process group."""
+    import threading
+    from fastapi.testclient import TestClient
+
+    ready = threading.Event()
+    release = threading.Event()
+    killed = []
+    monkeypatch.setattr(main.os, "killpg",
+                        lambda pgid, sig: killed.append((pgid, sig)))
+
+    def starts_late(ws, timeout_s=None, on_start=None, on_finish=None, **kwargs):
+        ready.set()
+        assert release.wait(5)
+        on_start(12345)
+        on_finish()
+        return 0, "", ""
+
+    monkeypatch.setattr(main, "run_snakemake", starts_late)
+
+    with TestClient(main.app) as client:
+        run_id = _submit(client).json()["run_id"]
+        assert ready.wait(5), "the run never reached its start boundary"
+        assert client.post(f"/runs/{run_id}/cancel").status_code == 200
+        release.set()
+        assert _wait_for(service, run_id, {RunState.CANCELED}) is RunState.CANCELED
+
+    assert killed == [(12345, signal.SIGKILL)]
+
+
+def test_cancel_during_tool_setup_does_not_launch_the_runner(
+        service, monkeypatch):
+    """A run canceled while preparing tools should never start execution."""
+    import threading
+    from fastapi.testclient import TestClient
+
+    original = main.materialise_tools
+    preparing = threading.Event()
+    release = threading.Event()
+    launched = []
+
+    def prepare_then_wait(*args, **kwargs):
+        original(*args, **kwargs)
+        preparing.set()
+        assert release.wait(5)
+
+    def run_anyway(*args, **kwargs):
+        launched.append(True)
+        return 0, "", ""
+
+    monkeypatch.setattr(main, "materialise_tools", prepare_then_wait)
+    monkeypatch.setattr(main, "run_snakemake", run_anyway)
+
+    with TestClient(main.app) as client:
+        run_id = _submit(client).json()["run_id"]
+        assert preparing.wait(5), "the run never began preparing tools"
+        assert client.post(f"/runs/{run_id}/cancel").status_code == 200
+        release.set()
+        assert _wait_for(service, run_id, {RunState.CANCELED}) is RunState.CANCELED
+
+    assert not launched
+
+
+def test_cancel_between_finish_check_and_state_update_settles_canceled(
+        service, monkeypatch):
+    """A finish/cancel race must not leave a run in CANCELING forever."""
+    import asyncio
+    import threading
+    from fastapi.testclient import TestClient
+
+    finishing = threading.Event()
+    release = threading.Event()
+    original_advance = service.advance
+
+    def hold_completion(run_id, state, **detail):
+        if state is RunState.COMPLETE:
+            finishing.set()
+            assert release.wait(5)
+        return original_advance(run_id, state, **detail)
+
+    def succeeds(ws, timeout_s=None, **kwargs):
+        with open(os.path.join(ws.path, "tool-1-out"), "wb") as output:
+            output.write(b"x")
+        return 0, "", ""
+
+    monkeypatch.setattr(service, "advance", hold_completion)
+    monkeypatch.setattr(main, "run_snakemake", succeeds)
+
+    with TestClient(main.app) as client:
+        run_id = _submit(client).json()["run_id"]
+        assert finishing.wait(5), "the worker never reached completion"
+        try:
+            assert asyncio.run(main.cancel_run(run_id))["state"] == "CANCELING"
+        finally:
+            release.set()
+        assert _wait_for(service, run_id, {RunState.CANCELED}, seconds=2) is RunState.CANCELED
 
 
 # --------------------------------------------------------------------------
@@ -354,6 +488,21 @@ def test_cancelling_an_unknown_run_is_404(service):
 
     with TestClient(main.app) as client:
         assert client.post("/runs/nope/cancel").status_code == 404
+
+
+def test_bearer_auth_applies_to_cancellation(service):
+    from auth import AuthenticationMiddleware, BearerAuth
+    from fastapi.testclient import TestClient
+
+    guarded = AuthenticationMiddleware(main.app, provider=BearerAuth(token="test-secret"))
+    with TestClient(guarded) as client:
+        assert client.post("/runs/nope/cancel").status_code == 401
+        assert client.post(
+            "/runs/nope/cancel", headers={"Authorization": "Bearer wrong"}
+        ).status_code == 401
+        assert client.post(
+            "/runs/nope/cancel", headers={"Authorization": "Bearer test-secret"}
+        ).status_code == 404
 
 
 def test_cancel_aims_at_nothing_once_the_child_has_been_reaped(service, monkeypatch):
