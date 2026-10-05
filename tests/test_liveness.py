@@ -263,9 +263,32 @@ def test_a_version_of_nothing_but_whitespace_is_not_a_version():
 
 
 def test_datasets_are_null_rather_than_an_empty_list(client):
-    """Which datasets a site holds comes from the DataSource interface, which is
-    not in this tree. [] would read as "this site holds none"."""
+    """Null because nothing here can enumerate holdings, not because the
+    interface is missing.
+
+    The DataSource interface arrived in #69 while this branch was open, so the
+    earlier reason -- that it was not in the tree -- stopped being true. It is
+    still null: an upload source has nothing until a caller sends it, and a
+    localpath source has a root directory rather than a catalogue. [] would
+    read as "this site holds none", which is a different claim.
+    """
     assert client.get("/capacity", headers=authorised()).json()["datasets"] is None
+
+
+def test_the_providers_in_this_tree_genuinely_cannot_enumerate(client):
+    """So the reason above is checked rather than asserted in prose.
+
+    If a provider ever gains a way to list what it holds, this fails and
+    `datasets` should start carrying it.
+    """
+    import datasource
+
+    for name, provider in datasource.PROVIDERS.items():
+        for listing in ("list", "catalogue", "catalog", "enumerate", "holdings"):
+            assert not hasattr(provider, listing), (
+                f"the {name} provider can {listing}(), so /capacity could "
+                f"report datasets and should stop saying null"
+            )
 
 
 # --- the counting behind it -------------------------------------------------
