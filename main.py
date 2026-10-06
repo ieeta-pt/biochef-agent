@@ -494,6 +494,21 @@ async def _execute(run_id: str, biochef_workflow: str, inputs):
             _advance(run_id, RunState.CANCELED)
             return
         _advance(run_id, RunState.COMPLETE, outputs=results)
+    finally:
+        # Release canceled files after the worker has recorded its diagnostics.
+        try:
+            if RUNS.get(run_id).state is RunState.CANCELED:
+                RETAINED.release(run_id)
+        except UnknownRun:
+            pass
+
+        # Clean staging files even when source fetching never started.
+        for source, _, path in inputs:
+            if source == "handedover":
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
 
 def _was_cancelled(run_id) -> bool:
@@ -683,7 +698,9 @@ async def get_run_logs(run_id: str):
     return run.logs_as_dict()
 
 
-@app.get("/runs/{run_id}/outputs/{node_id}/{handle}")
+@app.get("/runs/{run_id}/outputs/{node_id}/{handle}", responses={
+    409: {"description": "Outputs are available only after the run completes"},
+})
 async def stream_output(run_id: str, node_id: str, handle: str):
     """One output, streamed, without base64 and without holding it in memory.
 
@@ -707,6 +724,17 @@ async def stream_output(run_id: str, node_id: str, handle: str):
                    f"enough ago to have been forgotten",
         )
 
+    if run.state is not RunState.COMPLETE:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "outputs_not_available",
+                "run_id": run_id,
+                "state": run.state.value,
+                "message": "outputs are available only after a run completes",
+            },
+        )
+
     filename = (run.output_files.get(node_id) or {}).get(handle)
     if filename is None:
         raise HTTPException(
@@ -715,8 +743,15 @@ async def stream_output(run_id: str, node_id: str, handle: str):
                    f"{node_id!r}",
         )
 
-    ws = RETAINED.workspace(run_id)
-    if ws is None:
+    try:
+        handle_in = RETAINED.open_read(run_id, filename)
+    except (FileNotFoundError, UnsafeName) as failure:
+        raise HTTPException(
+            status_code=404,
+            detail=f"output {handle!r} of {node_id!r} is not there: {failure}",
+        )
+
+    if handle_in is None:
         raise HTTPException(
             status_code=410,
             detail={
@@ -726,14 +761,6 @@ async def stream_output(run_id: str, node_id: str, handle: str):
                            "kept for BIOCHEF_KEEP_OUTPUTS seconds and for the "
                            "most recent BIOCHEF_MAX_RETAINED_RUNS runs.",
             },
-        )
-
-    try:
-        handle_in = ws.open_read(filename)
-    except (FileNotFoundError, UnsafeName) as failure:
-        raise HTTPException(
-            status_code=404,
-            detail=f"output {handle!r} of {node_id!r} is not there: {failure}",
         )
 
     def chunks():
