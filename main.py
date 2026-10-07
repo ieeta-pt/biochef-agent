@@ -24,6 +24,8 @@ from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
 from evidence_verification import EvidenceVerificationError
 from runner import SubprocessRunner, get_runner
 from signing import SignatureError
+from starlette.middleware.cors import CORSMiddleware
+from cors import get_cors_origins, middleware_options
 
 app = FastAPI()
 
@@ -51,6 +53,17 @@ for bearer without a token, fails to start rather than accepting work.
 # before any of the body is accepted. An anonymous caller should not be able to
 # make this service buffer half a gigabyte before being told no (#10).
 app.add_middleware(AuthenticationMiddleware, provider=AUTH)
+
+CORS_ORIGINS = get_cors_origins()
+"""Browser origins allowed to call this service; empty means no CORS headers."""
+
+# Added after authentication, so it is the OUTERMOST layer. A browser's
+# preflight carries no Authorization header, so beneath authentication it would
+# be refused with 401 and the real request never sent. Outermost, it answers the
+# preflight itself, and it also adds its headers to a 401 the layer below writes
+# -- otherwise the page could not even read why it was refused.
+if CORS_ORIGINS:
+    app.add_middleware(CORSMiddleware, **middleware_options(CORS_ORIGINS))
 
 
 @app.exception_handler(UnsafeName)

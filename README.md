@@ -171,6 +171,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_MAX_CONCURRENT_RUNS` | `4` | execution slots shared by `/runs` and `/convert`; admitted `/runs` jobs wait in `QUEUED` |
 | `BIOCHEF_AUTH` | `none` | who may call it: `none` or `bearer` |
 | `BIOCHEF_AUTH_TOKEN` | | the shared token, required when `BIOCHEF_AUTH=bearer` |
+| `BIOCHEF_CORS_ORIGINS` | *(unset)* | browser origins allowed to call the agent, comma separated; unset sends no CORS headers |
 | `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess` or `apptainer` |
 | `BIOCHEF_CONTAINER_IMAGE` | `docker://debian:stable-slim` | image each step runs in, under the `apptainer` runner |
 | `BIOCHEF_APPTAINER_CACHE` | `apptainer-cache` | where pulled container images are kept between runs |
@@ -188,6 +189,16 @@ not identity -- every holder is the same caller -- but it is the difference
 between an open endpoint and a closed one. Selecting `bearer` without a token
 stops the service from starting rather than letting it run with a token nobody
 has to guess.
+
+`BIOCHEF_CORS_ORIGINS` lets a page on another origin — the editor — read the
+agent's responses. It is unset by default, which sends no CORS headers. Name
+each origin exactly as a browser sends it, `scheme://host[:port]` with no path
+or trailing slash; `*` and anything else that is not an origin stop the service
+from starting. Without it, a browser calling `/convert` still sends the request
+and the agent still runs the workflow — only the response is withheld from the
+page. CORS is not access control: a request from an unlisted origin is still
+served, the browser only hides the reply. Who may run anything is decided by
+`BIOCHEF_AUTH`.
 
 `BIOCHEF_DATA_SOURCES` decides where a run's inputs may come from. It defaults
 to `upload` alone — bytes pushed in the request, which is what the editor does.
