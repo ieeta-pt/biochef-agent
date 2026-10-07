@@ -561,6 +561,33 @@ def _check_edge(index, edge):
                        f"{_json_kind(edge[key])}, and it must be a node id")
 
 
+def _declared(declarations, name, node_id, repo, kind):
+    """One declaration by name, or a 400 saying what the tool does declare.
+
+    These three lookups were bare `next(...)` calls with no default, so a
+    workflow naming a handle or a parameter the tool does not have raised
+    StopIteration from the middle of a run: 500 on /convert, and SYSTEM_ERROR
+    with "coroutine raised StopIteration" on /runs. The same class of mistake
+    read_workflow_document exists to catch, in the one place it cannot reach --
+    the shape check runs before the bundle is pulled, so it cannot know which
+    names a tool declares.
+
+    The refusal lists them, because the caller needs to know what to use
+    instead and the tool's own declared interface is not ours to withhold --
+    the editor already has the bundle.
+    """
+    for declaration in declarations or []:
+        if declaration.get("name") == name:
+            return declaration
+    available = sorted(
+        d.get("name") for d in (declarations or []) if d.get("name"))
+    raise HTTPException(
+        status_code=400,
+        detail=f"node {node_id!r} names the {kind} {name!r}, which {repo!r} "
+               f"does not declare; it has {available}",
+    )
+
+
 def parse_biochef_workflow(biochef_workflow):
     node_list, edge_list = biochef_workflow["nodes"], biochef_workflow["edges"]
     new_workflow: Workflow = Workflow()
@@ -570,7 +597,8 @@ def parse_biochef_workflow(biochef_workflow):
         if node_type != "workflowNode":
             continue
 
-        tool_info = fetch_tool(node_id, node["data"]["repo"])
+        repo = node["data"]["repo"]
+        tool_info = fetch_tool(node_id, repo)
 
         new_node: Node = Node(id=node_id, bin=tool_info["bin"])
 
@@ -593,19 +621,21 @@ def parse_biochef_workflow(biochef_workflow):
 
             is_input_connection = node_id == target
             if is_input_connection:
-                input_info = next(
-                    i for i in tool_info["io"]["inputs"] if i["name"] == target_handle)
+                input_info = _declared(
+                    tool_info["io"]["inputs"], target_handle,
+                    node_id, repo, "input")
                 new_node.inputs[_name] = build_io(input_info)
             else:
-                output_info = next(
-                    i for i in tool_info["io"]["outputs"] if i["name"] == source_handle)
+                output_info = _declared(
+                    tool_info["io"]["outputs"], source_handle,
+                    node_id, repo, "output")
                 new_node.outputs[_name] = build_io(output_info)
 
         for param_key, param in node["data"]["paramValues"].items():
             if param.get("enabled") != True:
                 continue
-            param_info = next(
-                p for p in tool_info["parameters"] if p["name"] == param_key)
+            param_info = _declared(
+                tool_info["parameters"], param_key, node_id, repo, "parameter")
 
             new_param: Param = Param(
                 param_key, param["value"], param_info.get("flag")

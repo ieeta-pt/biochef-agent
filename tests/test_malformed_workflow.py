@@ -215,3 +215,110 @@ def test_the_shape_check_runs_before_a_workspace_is_made():
         "the document is parsed after the workspace is created, so a malformed "
         "submission makes a directory first"
     )
+
+
+# ---------------------------------------------------------------------------
+# naming something the tool does not declare
+#
+# read_workflow_document cannot catch these: it runs before the bundle is
+# pulled, so it does not know which handles or parameters a tool has. They
+# were three bare next(...) calls with no default, which raised StopIteration
+# from the middle of a run -- 500 on /convert, and SYSTEM_ERROR carrying
+# "coroutine raised StopIteration" on /runs. The same mistake this file is
+# about, in the one place its own check cannot reach.
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_async_runs import WORKFLOW, service   # noqa: E402
+
+
+def _naming(**change):
+    document = json.loads(WORKFLOW)
+    if "parameter" in change:
+        for node in document["nodes"]:
+            if node["id"] == "tool-1":
+                node["data"]["paramValues"] = {
+                    change["parameter"]: {"enabled": True, "value": "x"}}
+    if "target_handle" in change:
+        document["edges"][0]["targetHandle"] = change["target_handle"]
+    if "source_handle" in change:
+        document["edges"][1]["sourceHandle"] = change["source_handle"]
+    return json.dumps(document)
+
+
+@pytest.mark.parametrize("label, document, named", [
+    ("a parameter the tool does not declare",
+     _naming(parameter="not-a-real-flag"), "not-a-real-flag"),
+    ("an input handle the tool does not have",
+     _naming(target_handle="no-such-input"), "no-such-input"),
+    ("an output handle the tool does not have",
+     _naming(source_handle="no-such-output"), "no-such-output"),
+])
+def test_naming_what_the_tool_lacks_is_refused(service, label, document, named):
+    from fastapi.testclient import TestClient
+
+    with TestClient(main.app, raise_server_exceptions=False) as client:
+        response = client.post("/convert",
+                               data={"biochef_workflow": document},
+                               files=UPLOAD)
+
+    assert response.status_code == 400, f"{label}: {response.status_code}"
+    detail = response.json()["detail"]
+    assert named in detail, detail
+    assert "does not declare" in detail
+
+
+@pytest.mark.parametrize("label, document", [
+    ("parameter", _naming(parameter="not-a-real-flag")),
+    ("input handle", _naming(target_handle="no-such-input")),
+    ("output handle", _naming(source_handle="no-such-output")),
+])
+def test_the_refusal_says_what_the_tool_does_declare(service, label, document):
+    """So a caller can correct it rather than guess.
+
+    The tool's declared interface is not ours to withhold -- the editor
+    already holds the bundle it came from.
+    """
+    from fastapi.testclient import TestClient
+
+    with TestClient(main.app, raise_server_exceptions=False) as client:
+        detail = client.post("/convert", data={"biochef_workflow": document},
+                             files=UPLOAD).json()["detail"]
+
+    assert "it has [" in detail, detail
+    for leak in ("StopIteration", "Traceback", "coroutine"):
+        assert leak not in detail
+
+
+def test_runs_calls_these_the_submissions_fault_too(service):
+    """EXECUTOR_ERROR, not SYSTEM_ERROR carrying our own exception's text."""
+    import time
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(main.app) as client:
+        submitted = client.post(
+            "/runs",
+            data={"biochef_workflow": _naming(parameter="not-a-real-flag")},
+            files=UPLOAD)
+        assert submitted.status_code == 202
+        run_id = submitted.json()["run_id"]
+        for _ in range(500):
+            body = client.get(f"/runs/{run_id}").json()
+            if body["state"] in {state.value for state in TERMINAL}:
+                break
+            time.sleep(0.02)
+
+    assert body["state"] == "EXECUTOR_ERROR", body["state"]
+    assert "StopIteration" not in str(body.get("error"))
+
+
+def test_a_valid_workflow_is_unaffected(service):
+    """The lookup refuses what is absent and must not refuse what is there."""
+    from fastapi.testclient import TestClient
+
+    with TestClient(main.app, raise_server_exceptions=False) as client:
+        response = client.post("/convert", data={"biochef_workflow": WORKFLOW},
+                               files=UPLOAD)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["tool-1"]["out"]

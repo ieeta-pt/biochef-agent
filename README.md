@@ -123,7 +123,10 @@ malformed documents through both routes and asserts none of them reaches a
 `500`, and another asserts that an internal fault still does.
 
 Whether a repo exists, whether a tool has the operation named, whether an
-edge's handles match — those need the registry and are still answered later.
+edge's handles match — those need the registry, so they are answered once the
+bundle has been pulled. They are refusals too: naming an input handle, an
+output handle or a parameter the tool does not declare is a `400` listing what
+it does declare, rather than the `500` it used to be.
 
 Both take the same fields:
 
