@@ -58,6 +58,9 @@ import hashlib
 import io
 import json
 import os
+import tempfile
+import threading
+import time
 
 import pytest
 
@@ -309,6 +312,203 @@ def test_an_expired_run_says_so_rather_than_404(tmp_path, monkeypatch):
     finally:
         convert.tools.clear()
         main.RETAINED.release_all()
+
+
+def test_malformed_async_submission_removes_owned_spool_file(
+        tmp_path, monkeypatch):
+    """A workflow rejected before input fetch still owns its request spool."""
+    from fastapi.testclient import TestClient
+
+    real_named_temporary_file = tempfile.NamedTemporaryFile
+    handed_over = []
+
+    def named_temporary_file(*args, **kwargs):
+        kwargs["dir"] = tmp_path
+        handle = real_named_temporary_file(*args, **kwargs)
+        handed_over.append(handle.name)
+        return handle
+
+    monkeypatch.setattr(main, "RUNS", RunStore())
+    monkeypatch.setattr(main, "RUN_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setattr(main, "RETAINED", Retained())
+    try:
+        with TestClient(main.app) as client:
+            monkeypatch.setattr(main.tempfile, "NamedTemporaryFile",
+                                named_temporary_file)
+            response = client.post(
+                "/runs", data={"biochef_workflow": "{"},
+                files=[("files", ("input-1-out", b"payload", "text/plain"))],
+            )
+            assert response.status_code == 202, response.text
+            run_id = response.json()["run_id"]
+
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                status = main.RUNS.get(run_id).state.value
+                if main.RUNS.get(run_id).state in main.TERMINAL:
+                    break
+                time.sleep(0.01)
+
+        assert status == "SYSTEM_ERROR"
+        assert handed_over and all(not os.path.exists(path) for path in handed_over)
+    finally:
+        main.RETAINED.release_all()
+
+
+def test_queued_cancel_skips_input_fetch_and_cleans_only_owned_file(
+        tmp_path, monkeypatch):
+    """Cancel while waiting for a worker slot; localpath inputs remain caller-owned."""
+    monkeypatch.setattr(main, "RUNS", RunStore())
+    run = main.RUNS.create()
+    handed = tmp_path / "handed-over"
+    handed.write_bytes(b"temporary")
+    original = tmp_path / "original-input"
+    original.write_bytes(b"keep")
+    entered = asyncio.Event()
+    release_slot = asyncio.Event()
+
+    class _HeldSlot:
+        async def __aenter__(self):
+            entered.set()
+            await release_slot.wait()
+
+        async def __aexit__(self, *args):
+            return False
+
+    monkeypatch.setattr(main, "_slots", lambda: _HeldSlot())
+
+    async def exercise():
+        task = asyncio.create_task(main._execute(
+            run.run_id, "not parsed while queued", [
+                ("handedover", "input-1-out", str(handed)),
+                ("localpath", "input-1-out", str(original)),
+            ]))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            main.RUNS.advance(run.run_id, RunState.CANCELING)
+        finally:
+            release_slot.set()
+        await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(exercise())
+
+    assert main.RUNS.get(run.run_id).state is RunState.CANCELED
+    assert not handed.exists(), "queued cancellation leaked its owned spool file"
+    assert original.read_bytes() == b"keep", "cleanup deleted a caller-owned input"
+
+
+def test_cancel_during_output_finalization_denies_output_and_releases_workspace(
+        tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    workflow = _service(tmp_path, monkeypatch, output=b"must not be released")
+    original_record_outputs = main.RUNS.record_outputs
+
+    def finish_with_diagnostics(ws, **kwargs):
+        with open(os.path.join(ws.path, "tool-1-out"), "wb") as output:
+            output.write(b"must not be released")
+        return 0, "diagnostic stdout", "diagnostic stderr"
+
+    monkeypatch.setattr(main, "run_snakemake", finish_with_diagnostics)
+
+    def record_then_cancel(run_id, catalogue):
+        original_record_outputs(run_id, catalogue)
+        main.RUNS.advance(run_id, RunState.CANCELING)
+
+    monkeypatch.setattr(main.RUNS, "record_outputs", record_then_cancel)
+    try:
+        with TestClient(main.app) as client:
+            response = client.post(
+                "/runs", data={"biochef_workflow": workflow},
+                files=[("files", ("input-1-out", b"in",
+                                  "application/octet-stream"))],
+            )
+            run_id = response.json()["run_id"]
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                run = main.RUNS.get(run_id)
+                if run.state is RunState.CANCELED:
+                    break
+                time.sleep(0.01)
+            response = client.get(f"/runs/{run_id}/outputs/tool-1/out")
+            logs = client.get(f"/runs/{run_id}/logs").json()
+
+        assert run.state is RunState.CANCELED
+        assert response.status_code == 409
+        assert response.json()["detail"]["state"] == "CANCELED"
+        assert main.RETAINED.workspace(run_id) is None
+        assert logs["run_id"] == run_id
+        assert logs["stdout"] == "diagnostic stdout"
+        assert logs["stderr"] == "diagnostic stderr"
+    finally:
+        convert.tools.clear()
+        main.RETAINED.release_all()
+
+
+def test_retained_file_open_finishes_before_eviction_closes_workspace(
+        tmp_path):
+    """Acquiring a descriptor under retention's lock survives subsequent eviction."""
+    retained = Retained(keep_seconds=3600, max_retained=1)
+    ws = make_workspace(str(tmp_path))
+    ws.write_bytes("out", b"readable after eviction")
+    retained.keep("first", ws, now=1000)
+
+    entered_open = threading.Event()
+    permit_open = threading.Event()
+    eviction_started = threading.Event()
+    eviction_done = threading.Event()
+    real_open_read = ws.open_read
+
+    def paused_open_read(name, **kwargs):
+        entered_open.set()
+        assert permit_open.wait(5), "test did not release output acquisition"
+        return real_open_read(name, **kwargs)
+
+    ws.open_read = paused_open_read
+    acquired = {}
+
+    def open_output():
+        try:
+            acquired["file"] = retained.open_read("first", "out", now=1001)
+        except BaseException as failure:
+            acquired["error"] = failure
+
+    def evict_output():
+        eviction_started.set()
+        other = _FakeWorkspace(tmp_path / "second")
+        try:
+            retained.keep("second", other, now=1002)
+        except BaseException as failure:
+            acquired["eviction_error"] = failure
+        finally:
+            eviction_done.set()
+
+    opener = threading.Thread(target=open_output)
+    evictor = threading.Thread(target=evict_output)
+    opener.start()
+    try:
+        assert entered_open.wait(5)
+        evictor.start()
+        assert eviction_started.wait(5)
+        assert not eviction_done.wait(0.05), "eviction closed workspace during open"
+    finally:
+        permit_open.set()
+        opener.join(5)
+        if evictor.ident is not None:
+            evictor.join(5)
+
+    try:
+        assert not opener.is_alive() and not evictor.is_alive()
+        assert eviction_done.is_set()
+        assert "error" not in acquired, repr(acquired.get("error"))
+        assert "eviction_error" not in acquired, repr(acquired.get("eviction_error"))
+        assert acquired["file"] is not None
+        assert acquired["file"].read() == b"readable after eviction"
+        assert retained.workspace("first", now=1003) is None
+    finally:
+        if "file" in acquired and acquired["file"] is not None:
+            acquired["file"].close()
+        retained.release_all()
 
 
 # --------------------------------------------------------------------------
