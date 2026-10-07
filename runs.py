@@ -97,6 +97,8 @@ class Run:
         self.stdout = ""
         self.stderr = ""
         self.failed_steps = {}
+        self.manifest = None
+        """How this run was produced (#18), once it has finished."""
         self.output_files = {}
         """Which file in the workspace holds each output, once a run has made
         them. What the streaming endpoint serves, so that a client never names a
@@ -219,6 +221,12 @@ class RunStore:
                 run.pgid = pgid
                 return run.state is RunState.CANCELING
             return False
+
+    def record_manifest(self, run_id: str, document) -> None:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is not None:
+                run.manifest = document
 
     def record_outputs(self, run_id: str, catalogue) -> None:
         """What each output handle is called inside the workspace."""
