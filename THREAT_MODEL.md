@@ -118,9 +118,16 @@ These are gaps or limits of assurance, not excluded threats. A protected TRE dep
 - **A malicious but correctly signed tool.** Digest and signature checks can
   bind the bytes to an identity and policy; they cannot establish benign
   behavior or rule out a compromised publisher.
-- **Resource exhaustion.** Request-body middleware now enforces a configurable
-  upload-byte limit (**#11**). That does not supply a concurrency cap, disk
-  quota, or complete runtime and output limits.
+- **Resource exhaustion.** Request-body middleware enforces a configurable
+  upload-byte limit (**#11**), and `BIOCHEF_MAX_CONCURRENT_RUNS` caps how many
+  runs execute at once. Nothing bounds bytes a run writes to disk, the size of
+  a workflow, retained output size, or the tool cache (**#91**). A concurrency
+  slot counts runs, not what one run consumes.
+- **No authorization between callers.** Authentication names a caller; nothing
+  then decides what that caller may read. Any authenticated caller can read any
+  run's outputs, logs and manifest by run id (**#90**). Under a shared bearer
+  token that is unavoidable; once callers are distinguishable (#79) it is access
+  across projects on a shared Agent.
 
 ## Trusted assumptions and exclusions
 
@@ -129,6 +136,12 @@ These are gaps or limits of assurance, not excluded threats. A protected TRE dep
   that is out of scope.
 
   Oversight of administrators belongs to the TRE; audit records protected from alteration by those administrators can support accountability. This exclusion does not cover malicious researchers or tools, including attempts to gain administrative access.
+
+- **Browser-side verification in the editor.** The editor checks the signed
+  catalogue with a public key shipped in its own JavaScript bundle, so its root
+  of trust is the frontend deploy pipeline. That is the editor's threat model,
+  not this one: the Agent does not rely on anything the browser verified, and
+  checks each bundle itself against its own configured policy.
 
 ## Applying it
 
