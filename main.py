@@ -145,9 +145,19 @@ def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
             progress(state)
 
     report(RunState.INITIALIZING)
+
+    # Parsed and shape-checked in one place, and before anything is created, so
+    # a malformed document is a 400 from here rather than a KeyError further in
+    # -- which /convert answered as 500 and /runs recorded as SYSTEM_ERROR,
+    # taking the blame for what the caller sent (#86).
+    #
+    # Ahead of make_workspace so a refused submission leaves nothing behind: it
+    # was briefly below, and every malformed document made a run directory and
+    # then removed it, for a run that never was.
+    workflow_dict = read_workflow_document(biochef_workflow)
+
     ws = make_workspace(RUN_ROOT)
     try:
-        workflow_dict = json.loads(biochef_workflow)
         workflow = parse_biochef_workflow(workflow_dict)
 
         # The tools go in first, so that an upload named after a binary is
