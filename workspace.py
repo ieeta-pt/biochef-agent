@@ -93,6 +93,8 @@ class Workspace:
 
     def _open(self, name: str, flags: int, mode: int = 0o600) -> int:
         check_name(name)
+        if self._fd is None:
+            raise OSError(errno.EBADF, "workspace is closed")
         try:
             fd = os.open(name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, mode,
                          dir_fd=self._fd)

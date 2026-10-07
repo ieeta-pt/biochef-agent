@@ -29,6 +29,7 @@ version of that which fits inside one HTTP request.
 """
 
 import inspect
+import tempfile
 import sys
 import types
 from pathlib import Path
@@ -351,21 +352,39 @@ def test_concurrent_admission_cannot_exceed_one_slot():
     assert store.get(admitted[0]).state is RunState.QUEUED
 
 
-def test_upload_read_failure_releases_reserved_capacity(service, monkeypatch):
+def test_upload_read_failure_releases_reserved_capacity(service, monkeypatch,
+                                                        tmp_path):
+    """And leaves no half-written spool behind.
+
+    read() takes a size now, because the submission copies the upload to disk a
+    megabyte at a time rather than calling read() for the whole of it -- which
+    is what starlette's own UploadFile.read(size=-1) has always accepted. The
+    stub followed the code.
+
+    The second assertion is new with that change: the copy creates a temporary
+    file of our own, and the handedover source only deletes it once a workspace
+    has taken it. A submission that fails here never reaches the source, so the
+    file is the handler's to remove, and a service built for large inputs cannot
+    leak one per failed input.
+    """
     import asyncio
 
     class BrokenUpload:
         filename = "input-1-out"
         size = 1
 
-        async def read(self):
+        async def read(self, size=-1):
             raise OSError("input stream failed")
 
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     store = RunStore(max_runs=1)
     monkeypatch.setattr(main, "RUNS", store)
     with pytest.raises(OSError, match="input stream failed"):
         asyncio.run(main.submit_run(WORKFLOW, [BrokenUpload()]))
     assert store.create().state is RunState.QUEUED
+    assert list(tmp_path.iterdir()) == [], (
+        f"a failed submission left {[p.name for p in tmp_path.iterdir()]} behind"
+    )
 
 
 def test_full_store_refuses_before_upload_is_read(service, monkeypatch):

@@ -53,6 +53,18 @@ what snakemake implies by saying nothing about a job until it starts it.
 These are the last states announced by the engine. Cancellation can leave a
 step marked `RUNNING`; the run's terminal state takes precedence in the UI.
 
+`GET /runs/{run_id}/outputs/{node}/{handle}` streams one output as raw bytes —
+no base64, and never assembled in memory. This is how a file larger than memory
+comes back: the encoded response above costs a second copy plus a third again
+for the encoding, so a 4 GiB output would need roughly 14.7 GiB resident. A
+client names a node and a handle, never a path.
+
+Outputs stay fetchable for `BIOCHEF_KEEP_OUTPUTS` seconds and for the most
+recent `BIOCHEF_MAX_RETAINED_RUNS` runs, whichever runs out first; after that the
+endpoint answers `410 Gone` rather than pretending the run never existed.
+Retention is bounded in both directions because "stop deleting" is how a service
+fills a disk.
+
 `GET /runs/{run_id}/logs` returns Snakemake's run-wide `stdout` and `stderr`,
 plus `node_logs`: separate stdout and stderr captured for each rule that ran.
 A failing tool's own stderr is in its node's entry. Stdout that a recipe directs
@@ -103,11 +115,11 @@ Both take the same fields:
 | `biochef_workflow` | the editor's workflow JSON, as a string: `{"nodes": [...], "edges": [...]}` |
 | `files` | the input files, one part each |
 
-Inputs go through a `DataSource`. `upload` is the default and the only one
-enabled out of the box, so the request above is unchanged. `localpath` lets a
-workflow name a file already on the agent's host — see `BIOCHEF_DATA_SOURCES`
-below — and a provider writes into the run's workspace rather than returning
-bytes, so a large input is streamed rather than held whole.
+Inputs go through a `DataSource`. Request uploads use `spooled` for `/convert`
+and `handedover` for `/runs`; `upload` remains available for inputs already held
+as bytes. `localpath` lets a workflow name a file already on the agent's host —
+see `BIOCHEF_DATA_SOURCES` below — and a provider writes into the run's workspace
+rather than returning bytes, so a large input is streamed rather than held whole.
 
 **Uploaded files must be named for the edge that carries them.** The converter
 names every intermediate file `{source_node_id}-{source_handle}`, so a file
@@ -160,7 +172,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `REGISTRY_INSECURE` | `false` | allow a plain-HTTP registry |
 | `ORAS_AUTH_BACKEND` | `token` | ORAS authentication backend |
 | `BIOCHEF_TOOL_CACHE` | `tool-cache` | where pulled tool bundles are kept between runs |
-| `BIOCHEF_DATA_SOURCES` | `upload` | where inputs may come from: `upload`, `localpath` |
+| `BIOCHEF_DATA_SOURCES` | `upload,spooled,handedover` | permitted input providers; add `localpath` to allow reads under `BIOCHEF_LOCAL_ROOT` |
 | `BIOCHEF_LOCAL_ROOT` | | the only directory `localpath` may read from |
 | `BIOCHEF_RUN_ROOT` | the system temp directory | where a run's private directory is created |
 | `BIOCHEF_RUN_TIMEOUT` | `900` | seconds before a run's whole process group is killed |
@@ -168,6 +180,8 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_MAX_UPLOAD_BYTES` | `536870912` | largest request body accepted, in bytes |
 | `BIOCHEF_MAX_RUNS` | `256` | maximum run records retained for polling |
 | `BIOCHEF_MAX_LOG_BYTES` | `1048576` | retained bytes per run-wide stream and shared budget per node-log stream, tail first |
+| `BIOCHEF_KEEP_OUTPUTS` | `3600` | seconds a finished run's outputs stay fetchable; `0` deletes them at once |
+| `BIOCHEF_MAX_RETAINED_RUNS` | `32` | how many finished runs may keep outputs on disk |
 | `BIOCHEF_MAX_CONCURRENT_RUNS` | `4` | execution slots shared by `/runs` and `/convert`; admitted `/runs` jobs wait in `QUEUED` |
 | `BIOCHEF_AUTH` | `none` | who may call it: `none` or `bearer` |
 | `BIOCHEF_AUTH_TOKEN` | | the shared token, required when `BIOCHEF_AUTH=bearer` |
@@ -189,10 +203,18 @@ between an open endpoint and a closed one. Selecting `bearer` without a token
 stops the service from starting rather than letting it run with a token nobody
 has to guess.
 
-`BIOCHEF_DATA_SOURCES` decides where a run's inputs may come from. It defaults
-to `upload` alone — bytes pushed in the request, which is what the editor does.
-Adding `localpath` lets a workflow name a file already on the agent's host, which
-is the ordinary case inside a TRE where the data is already on the machine.
+`BIOCHEF_DATA_SOURCES` decides which input providers are enabled. It defaults to
+`upload,spooled,handedover`: direct bytes, the synchronous route's request spool,
+and the asynchronous route's Agent-owned temporary copy. Adding `localpath` lets
+a workflow name a file already on the agent's host, which is the ordinary case
+inside a TRE where the data is already on the machine.
+Existing `upload`-only configurations need `spooled` and `handedover` to use
+these HTTP routes.
+With an `upload`-only configuration, a submitted `/runs` workflow reaches `EXECUTOR_ERROR` because `handedover` is disabled, and an output download returns HTTP 409. Check `GET /runs/{run_id}` for the underlying error.
+
+Raw output downloads from `/runs/{run_id}/outputs/{node_id}/{handle}` are
+available only after the run reaches `COMPLETE`; other states return HTTP 409.
+Status responses still include base64 outputs.
 
 **`localpath` requires `BIOCHEF_LOCAL_ROOT` to be an existing directory,** and
 refuses to start without it.
