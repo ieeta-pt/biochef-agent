@@ -29,15 +29,26 @@ already done so at least once: several findings were dismissed on the grounds
 that they required "code already running on the host", which describes the
 ordinary case here rather than an escalation.
 
+## Deployment responsibilities
+
+The required protections also form a security contract between the Agent and the site. Data owners and the site's governance process decide permitted use and release and the Agent applies those rules, supported by site-managed controls.
+
+The TRE defines which tools may run and who may access each dataset. For each job, the Agent checks the researcher's identity and data access, and whether the selected tool is approved. It runs the job only if local rules permit it, and checks permission to release results to the intended recipient.
+
+The TRE must provide trusted policy and configuration, approved data-access permissions, and an execution environment that isolates jobs and enforces CPU, memory, disk and process limits. It also defines retention rules, protects audit records and provides the local output-release procedure. Execution limits must hold at the host, storage or scheduler, not only in the workflow description.
+
+The Agent must use those controls when admitting and running a job. A workflow or coordinator cannot override local rules. If required permission, artifact verification or execution protections cannot be established, the Agent must refuse the affected execution or release.
+
 ## Actors
 
+**The researcher** is the named person who approves a job. The Agent must check their identity and local permission to use the requested data and tools. It is important to consider that an authenticated researcher can still submit a hostile job.
+
 **The caller or coordinator** supplies a workflow and its inputs. Untrusted as a
-source of tasks even after its identity is established. The current prototype
-has no caller authentication (**#10**), Passport-based identity (**#22**), or
-local authorization for what a caller may run or read. In the target deployment,
-the Agent must authenticate the coordinator and authorize each task against
-local data and execution policy; the coordinator must also authenticate the
-Agent.
+source of tasks even after its identity is established. The coordinator may relay only jobs the researcher explicitly approved while  the Agent must verify that approval rather than accept the coordinator's word. Approval for one job does not permit additional or changed jobs.
+
+In the target deployment, the Agent must authenticate the coordinator and authorize each task against local data and execution policy; the coordinator must also authenticate the Agent. Authenticating the coordinator does not establish the researcher's identity or permissions. Audit records must identify the researcher who approved each job.
+
+**The identity provider** performs login and issues evidence the Agent checks for a trusted issuer, the intended recipient and validity. LS-AAI/OIDC is the intended goal and institutional providers are possible additional deployment profiles. The site decides which providers and claims it trusts. Identity checks do not by themselves prove job approval or data access.
 
 **The workflow description** is task-supplied data. Its node ids, parameter
 values, and edge handles may reach a generated Snakefile or a filename, so they
@@ -51,6 +62,8 @@ deployment must enable it with an appropriate local policy. Verification does
 not prove that a correctly signed tool is safe. Bundle-supplied strings remain
 untrusted input (**#42**).
 
+The TRE decides which tools may run under its local policy. Before execution, the Agent must check that policy permits the selected tool artifact for the job.
+
 **The tool binary, once running, is untrusted.** This is the one most easily got
 wrong. It is arbitrary compiled code, fetched from a registry. With the default
 subprocess runner it executes with the Agent's privileges against whatever the
@@ -59,18 +72,24 @@ not itself establish complete confinement. A tool can read, write, and spawn
 processes wherever its runtime permits. "The attacker is already executing
 code on the host" is not a precondition to be argued away here; it is Tuesday.
 
+Tools must receive only the data and resources approved for their run. They must not inherit the Agent's credentials or access its configuration and policy.
+
 **The data** is the asset. In the deployments this is written for it is the
 reason the environment exists, and the reason it may not leave.
+Results, intermediate files and logs can also be sensitive and must remain inside the TRE until local policy approves release and Agent audit records must not contain raw research data, access tokens or secrets.
 
 **The operator** — whoever deploys and configures the agent — is trusted. So is
 the machine it runs on and the environment variables it is given.
+
+In a TRE, only its administrators may configure the Agent and its policy. The Agent trusts this administrator-controlled policy; a researcher, workflow or coordinator cannot replace it with rules supplied in a job.
 
 ## Boundaries
 
 | boundary | what crosses it | what has to hold |
 |---|---|---|
-| caller/coordinator → agent | workflow JSON, uploaded files or data references | authenticate and authorize the source and task; validate names, inputs and shell-bound values |
-| registry → agent | bundle metadata, tool binaries | verify immutable artifact identity and required evidence before execution; still treat content as untrusted |
+| caller/coordinator → agent | workflow JSON, uploaded files or data references, researcher identity and job approval | authenticate the source; verify researcher identity and approval, then authorize the task locally; validate names, inputs and shell-bound values |
+| identity-provider evidence → agent | researcher identity and authorization claims | check the site-accepted issuer, intended recipient and validity; apply local access rules |
+| registry → agent | bundle metadata, tool binaries | verify immutable artifact identity and required evidence, and check local tool approval before execution; still treat content as untrusted |
 | agent → tool | a working directory, argv, local data access | confine filesystem, process privileges, and network access to the approved run |
 | tool → agent | files in that directory | read as data, never followed out of the run |
 | agent → caller/coordinator | response body or outbound result transmission | apply local output policy before any data leaves; authorize the destination and record the transfer |
@@ -83,10 +102,12 @@ output slot pre-filled by an upload — can turn an authorized result channel in
 exfiltration. Findings of that shape are not "the caller deceiving itself";
 they are the thing the environment exists to prevent.
 
-## Not defended against
+## Current limitations
 
 Stated plainly, because a threat model that implies more coverage than it has is
 worse than none.
+
+These are gaps or limits of assurance, not excluded threats. A protected TRE deployment must supply the required isolation and resource controls.
 
 - **A malicious tool escaping its working directory.** Snakemake's `--directory`
   sets an origin, not a jail: a rule whose output is `../escaped` can write
@@ -100,9 +121,14 @@ worse than none.
 - **Resource exhaustion.** Request-body middleware now enforces a configurable
   upload-byte limit (**#11**). That does not supply a concurrency cap, disk
   quota, or complete runtime and output limits.
+
+## Trusted assumptions and exclusions
+
 - **Anything requiring the operator to be hostile.** Someone who can set the
   environment or write to the tool cache has already won, and defending against
   that is out of scope.
+
+  Oversight of administrators belongs to the TRE; audit records protected from alteration by those administrators can support accountability. This exclusion does not cover malicious researchers or tools, including attempts to gain administrative access.
 
 ## Applying it
 
