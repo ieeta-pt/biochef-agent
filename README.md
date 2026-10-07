@@ -210,6 +210,7 @@ a workflow name a file already on the agent's host, which is the ordinary case
 inside a TRE where the data is already on the machine.
 Existing `upload`-only configurations need `spooled` and `handedover` to use
 these HTTP routes.
+With an `upload`-only configuration, a submitted `/runs` workflow reaches `EXECUTOR_ERROR` because `handedover` is disabled, and an output download returns HTTP 409. Check `GET /runs/{run_id}` for the underlying error.
 
 Raw output downloads from `/runs/{run_id}/outputs/{node_id}/{handle}` are
 available only after the run reaches `COMPLETE`; other states return HTTP 409.
