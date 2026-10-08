@@ -328,7 +328,7 @@ def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
             # its way out would otherwise leave one behind for every attempt.
             live.close()
 
-        # The authoritative record, from the runner's own complete capture, and
+        # The authoritative record, from the runner's own retained tails, and
         # recorded before the failure path raises -- a failed run is exactly the
         # one whose output someone needs. It replaces whatever the live flushes
         # left, so a batch still in the buffer when the process exited costs
@@ -781,8 +781,9 @@ async def get_run_logs(run_id: str):
     run-wide stderr; tools can imitate those headings, so it is not proof of
     failure or a substitute for `node_logs`.
 
-    Logs are recorded after the workflow process exits, before output collection
-    and the run's terminal state. They are not available during execution.
+    Run-wide stdout and stderr are updated during execution. Per-node logs are
+    recorded after the workflow process exits, before output collection and the
+    run's terminal state.
     Each stream's retained per-node tails share BIOCHEF_MAX_LOG_BYTES across
     nodes; log files on disk can grow until the run ends.
     """

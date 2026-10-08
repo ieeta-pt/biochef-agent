@@ -546,6 +546,44 @@ def test_log_limit_must_be_positive():
         clamp("text", limit=0)
 
 
+@pytest.mark.parametrize("text, limit, expected", [
+    ("é" * 100 + "\n", 32,
+     "[... 170 earlier bytes dropped ...]\n" + "é" * 15 + "\n"),
+    ("😀x", 2, "[... 4 earlier bytes dropped ...]\nx"),
+])
+def test_tail_buffer_counts_bytes_and_discards_partial_utf8(text, limit, expected):
+    from steplogs import TailBuffer
+
+    tail = TailBuffer(max_bytes=limit)
+    tail.append(text)
+    assert tail.text() == expected
+    assert tail.text() == expected
+
+
+def test_recording_a_tail_preserves_its_original_dropped_count(monkeypatch):
+    import steplogs
+
+    monkeypatch.setattr(steplogs, "MAX_LOG_BYTES", 32)
+    tail = steplogs.TailBuffer()
+    tail.append("x" * 64 + "\n")
+    store = RunStore()
+    run = store.create()
+    store.record_logs(run.run_id, "", tail.text(), {})
+    expected = "[... 33 earlier bytes dropped ...]\n" + "x" * 31 + "\n"
+
+    assert store.get(run.run_id).stderr == expected
+    assert json.loads(json.dumps(store.get(run.run_id).logs_as_dict()))["stderr"] == expected
+    assert clamp(store.get(run.run_id).stderr, limit=16) == (
+        "[... 49 earlier bytes dropped ...]\n" + "x" * 15 + "\n")
+
+
+def test_log_content_that_looks_like_a_marker_is_still_clamped():
+    text = "[... 999 earlier bytes dropped ...]\n" + "x" * 64
+    expected_dropped = len(text.encode()) - 32
+    assert clamp(text, limit=32) == (
+        f"[... {expected_dropped} earlier bytes dropped ...]\n" + "x" * 32)
+
+
 def test_node_log_tails_share_a_bounded_budget(tmp_path, monkeypatch):
     from workspace import make_workspace
     import steplogs
@@ -987,6 +1025,45 @@ def test_logs_are_readable_while_the_tools_are_still_running(service,
 
     # The authoritative record replaces the partial one.
     assert final["stderr"] == "everything is fine\n", final["stderr"]
+
+
+def test_live_and_final_api_logs_keep_byte_limits_and_original_counts(
+        service, monkeypatch):
+    from fastapi.testclient import TestClient
+    from runner import Runner
+    import steplogs
+
+    monkeypatch.setattr(steplogs, "MAX_LOG_BYTES", 32)
+
+    class DiagnosticRunner(Runner):
+        def command(self, ws):
+            return [sys.executable, "-c",
+                    "import sys,time; "
+                    "open('tn93.distance-1-out','wb').write(b'done'); "
+                    "sys.stdout.write('x'*64+'\\n'); sys.stdout.flush(); "
+                    "sys.stderr.write('é'*100+'\\n'); sys.stderr.flush(); "
+                    "time.sleep(1.5)"]
+
+    monkeypatch.setattr(main, "RUNNER", DiagnosticRunner())
+    expected_out = "[... 33 earlier bytes dropped ...]\n" + "x" * 31 + "\n"
+    expected_err = "[... 170 earlier bytes dropped ...]\n" + "é" * 15 + "\n"
+
+    with TestClient(main.app) as client:
+        run_id = _submit(client).json()["run_id"]
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            live = client.get(f"/runs/{run_id}/logs").json()
+            if live["stderr"]:
+                break
+            time.sleep(0.02)
+        assert live["state"] == "RUNNING", live
+        assert live["stdout"] == expected_out
+        assert live["stderr"] == expected_err
+        assert _wait(service, run_id, TERMINAL_STATES) is RunState.COMPLETE
+        final = client.get(f"/runs/{run_id}/logs").json()
+
+    assert final["stdout"] == expected_out
+    assert final["stderr"] == expected_err
 
 
 def test_a_caller_wanting_logs_but_not_progress_still_gets_them():
