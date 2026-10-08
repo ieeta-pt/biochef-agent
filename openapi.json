@@ -377,6 +377,9 @@
             },
             "description": "Successful Response"
           },
+          "409": {
+            "description": "Outputs are available only after the run completes"
+          },
           "422": {
             "content": {
               "application/json": {

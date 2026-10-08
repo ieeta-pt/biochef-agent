@@ -144,9 +144,10 @@ class _Registry:
 
 
 def _run(tmp_path, monkeypatch, *, with_evidence=True, exit_code=0,
-         output=b"the output", expect_failure=False):
+         output=b"the output", expect_failure=False, runner_action=None,
+         registry=None, cancel_requested=None):
     monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
-    monkeypatch.setattr(convert, "client", _Registry(with_evidence))
+    monkeypatch.setattr(convert, "client", registry or _Registry(with_evidence))
     monkeypatch.setattr(main, "RUN_ROOT", str(tmp_path / "runs"))
     convert.tools.clear()
     convert.provenance.clear()
@@ -154,6 +155,8 @@ def _run(tmp_path, monkeypatch, *, with_evidence=True, exit_code=0,
     def produce(ws, timeout_s=None, on_start=None, on_finish=None, on_line=None):
         with open(os.path.join(ws.path, "tool-1-out"), "wb") as handle:
             handle.write(output)
+        if runner_action is not None:
+            runner_action(ws)
         return exit_code, "", ""
 
     monkeypatch.setattr(main, "run_snakemake", produce)
@@ -171,7 +174,8 @@ def _run(tmp_path, monkeypatch, *, with_evidence=True, exit_code=0,
         main.perform_run(json.dumps(WORKFLOW),
                          [("upload", "input-1-out", b"the input")],
                          on_manifest=lambda doc: captured.setdefault("m", doc),
-                         retain=keep, run_id="run-under-test")
+                         retain=keep, run_id="run-under-test",
+                         cancel_requested=cancel_requested)
     except HTTPException:
         if not expect_failure:
             raise
@@ -237,8 +241,60 @@ def test_inputs_and_outputs_are_recorded_by_content(tmp_path, monkeypatch):
         convert.tools.clear()
 
     assert manifest["inputs"]["input-1-out"] == _digest(b"the input")
+    assert "inputs_after" not in manifest
     assert manifest["outputs"]["tool-1"]["tool-1-out"] == _digest(b"produced")
     ws.cleanup()
+
+
+def test_manifest_records_a_changed_input_identity(tmp_path, monkeypatch):
+    replacement = b"modified by the workflow"
+
+    def modify_input(ws):
+        with open(os.path.join(ws.path, "input-1-out"), "wb") as handle:
+            handle.write(replacement)
+
+    try:
+        manifest, ws = _run(tmp_path, monkeypatch, runner_action=modify_input)
+    finally:
+        convert.tools.clear()
+
+    assert manifest["inputs"]["input-1-out"] == _digest(b"the input")
+    assert manifest["inputs_after"] == {"input-1-out": _digest(replacement)}
+    ws.cleanup()
+
+
+def test_manifest_records_a_deleted_input_as_changed_to_null(tmp_path, monkeypatch):
+    def delete_input(ws):
+        os.unlink(os.path.join(ws.path, "input-1-out"))
+
+    try:
+        manifest, ws = _run(tmp_path, monkeypatch, runner_action=delete_input)
+    finally:
+        convert.tools.clear()
+
+    assert manifest["inputs"]["input-1-out"] == _digest(b"the input")
+    assert manifest["inputs_after"] == {"input-1-out": None}
+    ws.cleanup()
+
+
+def test_inputs_after_contains_only_the_input_that_changed(tmp_path):
+    ws = make_workspace(str(tmp_path / "runs"))
+    ws.write_bytes("changed", b"after")
+    ws.write_bytes("unchanged", b"same")
+    inputs = {"changed": _digest(b"before"),
+              "unchanged": _digest(b"same")}
+    try:
+        manifest = build(
+            run_id="run", workflow_document={},
+            workflow=types.SimpleNamespace(nodes=[]), ws=ws,
+            inputs=inputs, outputs={}, bundles={}, exit_code=0,
+            started_at="start", finished_at="finish", runner="subprocess",
+        )
+    finally:
+        ws.cleanup()
+
+    assert manifest["inputs"] == inputs
+    assert manifest["inputs_after"] == {"changed": _digest(b"after")}
 
 
 def test_the_exit_code_is_recorded_on_a_run_that_succeeded(tmp_path, monkeypatch):
@@ -440,17 +496,31 @@ def test_a_failed_runs_outputs_are_recorded_as_absent(tmp_path, monkeypatch):
     """Not omitted, and not invented.
 
     A tool that exited non-zero may have produced nothing, or something partial.
-    Recording the handles as absent says which outputs were expected and did not
-    arrive; leaving them out would say nothing at all.
+    Recording expected handles with their observed identity distinguishes those
+    cases; leaving them out would say nothing at all.
     """
+    def remove_output(ws):
+        os.unlink(os.path.join(ws.path, "tool-1-out"))
+
     try:
         manifest, ws = _run(tmp_path, monkeypatch, exit_code=1,
-                            expect_failure=True)
+                            expect_failure=True, runner_action=remove_output)
     finally:
         convert.tools.clear()
 
-    assert "tool-1" in manifest["outputs"], (
-        "the failing node was left out of the manifest entirely"
+    assert manifest["outputs"]["tool-1"]["tool-1-out"] is None
+    ws.cleanup()
+
+
+def test_a_failed_run_records_partial_output_identity(tmp_path, monkeypatch):
+    try:
+        manifest, ws = _run(tmp_path, monkeypatch, exit_code=1,
+                            expect_failure=True, output=b"partial output")
+    finally:
+        convert.tools.clear()
+
+    assert manifest["outputs"]["tool-1"]["tool-1-out"] == _digest(
+        b"partial output"
     )
     ws.cleanup()
 
@@ -466,6 +536,103 @@ def test_the_inputs_are_still_recorded_when_the_run_fails(tmp_path, monkeypatch)
     assert manifest["inputs"]["input-1-out"] == _digest(b"the input")
     assert manifest["tools"]["tool-1"]["artifacts"]["bundle.json"]
     ws.cleanup()
+
+
+def test_failed_run_records_input_mutation_too(tmp_path, monkeypatch):
+    replacement = b"modified before failure"
+
+    def modify_input(ws):
+        with open(os.path.join(ws.path, "input-1-out"), "wb") as handle:
+            handle.write(replacement)
+
+    try:
+        manifest, ws = _run(tmp_path, monkeypatch, exit_code=2,
+                            expect_failure=True, runner_action=modify_input)
+    finally:
+        convert.tools.clear()
+
+    assert manifest["inputs"]["input-1-out"] == _digest(b"the input")
+    assert manifest["inputs_after"] == {"input-1-out": _digest(replacement)}
+    ws.cleanup()
+
+
+def test_cancellation_after_input_hashing_does_not_start_the_run(
+        tmp_path, monkeypatch):
+    original_identities = main.provenance._identities
+    hashed = []
+    started = []
+
+    def track_identities(ws, names):
+        result = original_identities(ws, names)
+        hashed.append(result)
+        return result
+
+    def should_cancel():
+        return bool(hashed)
+
+    monkeypatch.setattr(main.provenance, "_identities", track_identities)
+    try:
+        manifest, ws = _run(tmp_path, monkeypatch,
+                            cancel_requested=should_cancel,
+                            runner_action=lambda ws: started.append(True))
+    finally:
+        convert.tools.clear()
+
+    assert manifest is None
+    assert not started
+    ws.cleanup()
+
+
+def test_manifest_keeps_fetch_time_evidence_when_cache_is_updated_during_run(
+        tmp_path, monkeypatch):
+    registry = _Registry()
+    first_binary = registry.binary_bytes
+    replacement = b"#!/bin/sh\necho replacement\n"
+
+    def update_cache_during_run(ws):
+        registry.binary_bytes = replacement
+        convert.fetch_tool("tool-1", "r")
+
+    try:
+        manifest, ws = _run(
+            tmp_path, monkeypatch, registry=registry,
+            runner_action=update_cache_during_run,
+        )
+    finally:
+        convert.tools.clear()
+        convert.provenance.clear()
+
+    assert manifest["tools"]["tool-1"]["artifacts"]["tool"] == _digest(
+        first_binary
+    )
+    with ws.open_read("tool") as handle:
+        assert handle.read() == first_binary
+    ws.cleanup()
+
+
+def test_cache_update_before_staging_rejects_a_mismatched_tool(
+        tmp_path, monkeypatch):
+    registry = _Registry()
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(convert, "client", registry)
+    convert.tools.clear()
+    convert.provenance.clear()
+
+    workflow = convert.parse_biochef_workflow(WORKFLOW)
+    registry.binary_bytes = b"#!/bin/sh\necho replacement\n"
+    convert.fetch_tool("tool-1", "r")
+
+    from workspace import make_workspace
+    from convert import ToolIntegrityError
+
+    ws = make_workspace(str(tmp_path / "runs"))
+    try:
+        with pytest.raises(ToolIntegrityError, match="expected sha256:"):
+            convert.materialise_tools(workflow, ws)
+    finally:
+        ws.cleanup()
+        convert.tools.clear()
+        convert.provenance.clear()
 
 
 # --------------------------------------------------------------------------

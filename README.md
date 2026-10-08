@@ -66,9 +66,12 @@ Retention is bounded in both directions because "stop deleting" is how a service
 fills a disk.
 
 `GET /runs/{run_id}/manifest` returns how the run was produced: the workflow by
-digest, each tool by the digests the registry stated for it, every input and
-output by content, the runner and image, and the exit code. It is also written
-into the run's own directory as `run.json`, beside the outputs it describes.
+digest, each tool by the digests the registry stated for it, each input as
+received, outputs by content, the runner and image, and the exit code. If a run
+changes an input, `inputs_after` records that input's final digest (or `null` if
+it was removed or could not be read); the field is omitted when inputs are
+unchanged. It is also written into the run's own directory as `run.json`, beside
+the outputs it describes.
 
 The vocabulary is the hub's. It publishes `biochef.build-evidence.v1` alongside
 each bundle and signs artifacts as in-toto statements, so a run manifest carries
@@ -76,8 +79,9 @@ that evidence forward by reference rather than restating the same facts in
 different words. A bundle built before that work still produces a manifest —
 provenance should not be a reason not to run something.
 
-A run that **failed** gets one too, with its real exit code and its outputs
-recorded as absent — that is the run whose exit code matters most. A run that has
+A run that **failed** gets one too, with its real exit code and every declared
+output recorded by its final identity, including `null` for outputs that are
+missing — that is the run whose exit code matters most. A run that has
 nowhere to put a manifest gets none: `/convert` deletes its workspace on the way
 out and has no run id to attach one to, and building it costs a second full read
 of every input and output.
@@ -153,11 +157,11 @@ Both take the same fields:
 | `biochef_workflow` | the editor's workflow JSON, as a string: `{"nodes": [...], "edges": [...]}` |
 | `files` | the input files, one part each |
 
-Inputs go through a `DataSource`. `upload` is the default and the only one
-enabled out of the box, so the request above is unchanged. `localpath` lets a
-workflow name a file already on the agent's host — see `BIOCHEF_DATA_SOURCES`
-below — and a provider writes into the run's workspace rather than returning
-bytes, so a large input is streamed rather than held whole.
+Inputs go through a `DataSource`. Request uploads use `spooled` for `/convert`
+and `handedover` for `/runs`; `upload` remains available for inputs already held
+as bytes. `localpath` lets a workflow name a file already on the agent's host —
+see `BIOCHEF_DATA_SOURCES` below — and a provider writes into the run's workspace
+rather than returning bytes, so a large input is streamed rather than held whole.
 
 **Uploaded files must be named for the edge that carries them.** The converter
 names every intermediate file `{source_node_id}-{source_handle}`, so a file
@@ -210,7 +214,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `REGISTRY_INSECURE` | `false` | allow a plain-HTTP registry |
 | `ORAS_AUTH_BACKEND` | `token` | ORAS authentication backend |
 | `BIOCHEF_TOOL_CACHE` | `tool-cache` | where pulled tool bundles are kept between runs |
-| `BIOCHEF_DATA_SOURCES` | `upload` | where inputs may come from: `upload`, `localpath` |
+| `BIOCHEF_DATA_SOURCES` | `upload,spooled,handedover` | permitted input providers; add `localpath` to allow reads under `BIOCHEF_LOCAL_ROOT` |
 | `BIOCHEF_LOCAL_ROOT` | | the only directory `localpath` may read from |
 | `BIOCHEF_RUN_ROOT` | the system temp directory | where a run's private directory is created |
 | `BIOCHEF_RUN_TIMEOUT` | `900` | seconds before a run's whole process group is killed |
@@ -241,10 +245,18 @@ between an open endpoint and a closed one. Selecting `bearer` without a token
 stops the service from starting rather than letting it run with a token nobody
 has to guess.
 
-`BIOCHEF_DATA_SOURCES` decides where a run's inputs may come from. It defaults
-to `upload` alone — bytes pushed in the request, which is what the editor does.
-Adding `localpath` lets a workflow name a file already on the agent's host, which
-is the ordinary case inside a TRE where the data is already on the machine.
+`BIOCHEF_DATA_SOURCES` decides which input providers are enabled. It defaults to
+`upload,spooled,handedover`: direct bytes, the synchronous route's request spool,
+and the asynchronous route's Agent-owned temporary copy. Adding `localpath` lets
+a workflow name a file already on the agent's host, which is the ordinary case
+inside a TRE where the data is already on the machine.
+Existing `upload`-only configurations need `spooled` and `handedover` to use
+these HTTP routes.
+With an `upload`-only configuration, a submitted `/runs` workflow reaches `EXECUTOR_ERROR` because `handedover` is disabled, and an output download returns HTTP 409. Check `GET /runs/{run_id}` for the underlying error.
+
+Raw output downloads from `/runs/{run_id}/outputs/{node_id}/{handle}` are
+available only after the run reaches `COMPLETE`; other states return HTTP 409.
+Status responses still include base64 outputs.
 
 **`localpath` requires `BIOCHEF_LOCAL_ROOT` to be an existing directory,** and
 refuses to start without it.
