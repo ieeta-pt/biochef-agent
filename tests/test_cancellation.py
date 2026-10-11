@@ -57,6 +57,7 @@ import time
 
 import pytest
 
+import audit
 import convert
 from runs import ALLOWED, RunState, RunStore
 
@@ -278,6 +279,53 @@ def test_cancel_route_stops_the_real_subprocess_runner(service, monkeypatch):
                     os.killpg(pgid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+
+
+def test_cancellation_audit_failure_still_kills_the_owned_process_group(
+        service, monkeypatch):
+    """A failed cancellation record remains visible but cannot block SIGKILL."""
+    from fastapi.testclient import TestClient
+
+    class SlowRunner(runner_module.Runner):
+        def command(self, ws):
+            return ["sleep", "30"]
+
+    def fail_cancellation(event, **fields):
+        if fields.get("state") in {RunState.CANCELING.value, RunState.CANCELED.value}:
+            raise audit.AuditError("cancellation event was not recorded")
+
+    monkeypatch.setattr(main, "RUNNER", SlowRunner())
+    monkeypatch.setattr(audit, "record", fail_cancellation)
+
+    pgid = None
+    group_gone = False
+    try:
+        with TestClient(main.app) as client:
+            run_id = _submit(client).json()["run_id"]
+            deadline = time.time() + 5
+            while time.time() < deadline and service.get(run_id).pgid is None:
+                time.sleep(0.01)
+            pgid = service.get(run_id).pgid
+            assert pgid is not None, "the real runner never started"
+
+            response = client.post(f"/runs/{run_id}/cancel")
+            assert response.status_code == 500, response.text
+            assert response.json()["detail"]["error"] == "audit_error"
+            assert _wait_for(service, run_id, {RunState.CANCELED}) is RunState.CANCELED
+            body = client.get(f"/runs/{run_id}").json()
+
+        assert body["error"]["error"] == "audit_error", body
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            group_gone = True
+        assert group_gone, "the canceled process group is still alive"
+    finally:
+        if pgid is not None and not group_gone:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def test_a_run_that_finishes_after_being_cancelled_still_reports_CANCELED(

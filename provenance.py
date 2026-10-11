@@ -57,14 +57,11 @@ def build(*, run_id, workflow_document, workflow, ws, inputs, outputs,
           bundles, exit_code, started_at, finished_at, runner, image=None):
     """The manifest for one finished run.
 
-    Every digest is computed from what is on disk at the moment this is called,
-    which is after the run and before the workspace is released -- so an input a
-    tool overwrote is recorded as what the tool left, not as what arrived. That
-    is the honest reading: re-execution needs the bytes the tools actually saw,
-    and if a tool rewrote its own input then the manifest cannot pretend
-    otherwise.
+    ``inputs`` contains identities frozen before execution. Compare those with
+    the workspace after execution and record only inputs whose final identity
+    changed, including ``None`` when a changed input was removed or unreadable.
     """
-    return {
+    document = {
         "schema": SCHEMA,
         "run_id": run_id,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -82,7 +79,7 @@ def build(*, run_id, workflow_document, workflow, ws, inputs, outputs,
             ],
         },
         "tools": bundles,
-        "inputs": _identities(ws, sorted(inputs)),
+        "inputs": dict(inputs),
         "outputs": {
             node_id: _identities(ws, sorted(handles.values()))
             for node_id, handles in outputs.items()
@@ -93,6 +90,14 @@ def build(*, run_id, workflow_document, workflow, ws, inputs, outputs,
             "exit_code": exit_code,
         },
     }
+    inputs_after = _identities(ws, sorted(inputs))
+    changed_inputs = {
+        name: digest for name, digest in inputs_after.items()
+        if digest != inputs[name]
+    }
+    if changed_inputs:
+        document["inputs_after"] = changed_inputs
+    return document
 
 
 def _identities(ws, names):

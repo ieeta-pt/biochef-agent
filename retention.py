@@ -85,6 +85,16 @@ class Retained:
             entry = self._entries.get(run_id)
             return entry[0] if entry else None
 
+    def open_read(self, run_id, filename, now=None):
+        """Open under the retention lock and stream from the handle after unlocking."""
+        now = time.time() if now is None else now
+        with self._lock:
+            self._evict(now)
+            entry = self._entries.get(run_id)
+            if entry is None:
+                return None
+            return entry[0].open_read(filename, regular_only=True)
+
     def release(self, run_id):
         """Remove a run's workspace now, if it is being kept."""
         with self._lock:

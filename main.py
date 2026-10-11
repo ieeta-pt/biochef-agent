@@ -16,7 +16,9 @@ import os
 import signal
 import subprocess
 import base64
+import logging
 
+import audit
 from workspace import UnsafeName, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
 from runs import (IllegalTransition, RunCapacityError, RunState, RunStore,
@@ -31,6 +33,7 @@ from runner import SubprocessRunner, get_runner
 from signing import SignatureError
 
 app = FastAPI()
+logger = logging.getLogger(__name__)
 
 # Before anything reads the body. starlette spools the whole multipart payload
 # before the handler is entered, so a limit enforced in /convert would be
@@ -62,6 +65,15 @@ app.add_middleware(AuthenticationMiddleware, provider=AUTH)
 async def unusable_name(request, exc):
     """A bad name is the client's mistake, so say so rather than returning 500."""
     return JSONResponse(status_code=400, content={"detail": f"unusable file name: {exc}"})
+
+
+@app.exception_handler(audit.AuditError)
+async def audit_failure(request, exc):
+    """Report that the requested state change could not be audited."""
+    return JSONResponse(
+        status_code=500,
+        content={"detail": {"error": "audit_error", "message": str(exc)}},
+    )
 
 
 @app.exception_handler(ToolIntegrityError)
@@ -232,10 +244,16 @@ def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
                 detail="an upload occupies a name this run needs: 'Snakefile'",
             )
 
-        # The cancellation check first, and the manifest's clock after it. This
-        # is the last point at which a run can be abandoned without having
-        # declared itself RUNNING, so there is no reason to start timing -- or
-        # to build the closure below -- for work that is about to be dropped.
+        if cancel_requested is not None and cancel_requested():
+            return None
+
+        # Input deliveries are recorded in the manifest, so that a run can be reproduced
+        manifest_will_be_kept = on_manifest is not None or KEEP_WORKSPACE
+        input_identities = (
+            provenance._identities(ws, sorted(expected))
+            if manifest_will_be_kept else {}
+        )
+
         if cancel_requested is not None and cancel_requested():
             return None
 
@@ -250,21 +268,16 @@ def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
             run to attach a manifest to, so a manifest written there could
             never be read.
             """
-            if on_manifest is None and not KEEP_WORKSPACE:
+            if not manifest_will_be_kept:
                 return
             document = provenance.build(
                 run_id=run_id,
                 workflow_document=workflow_dict,
                 workflow=workflow,
                 ws=ws,
-                inputs=expected,
+                inputs=input_identities,
                 outputs=catalogue,
-                # bundle_provenance, not convert.provenance: `from convert
-                # import *` is followed by `async def convert`, so the module
-                # name is bound to the handler in here.
-                bundles={node.id: bundle_provenance.get(
-                             check_name(node.id.split("-")[0]), {})
-                         for node in workflow.nodes},
+                bundles={node.id: node.provenance for node in workflow.nodes},
                 exit_code=code,
                 started_at=started_at,
                 finished_at=datetime.now(timezone.utc).isoformat(),
@@ -327,7 +340,7 @@ def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
             # its way out would otherwise leave one behind for every attempt.
             live.close()
 
-        # The authoritative record, from the runner's own complete capture, and
+        # The authoritative record, from the runner's own retained tails, and
         # recorded before the failure path raises -- a failed run is exactly the
         # one whose output someone needs. It replaces whatever the live flushes
         # left, so a batch still in the buffer when the process exited costs
@@ -341,7 +354,14 @@ def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
             # the run whose exit code matters most is the one that failed --
             # which was the only kind that did not get one. Outputs that were
             # never produced are recorded as absent rather than omitted.
-            record_manifest(code, {node.id: {} for node in workflow.nodes})
+            expected_outputs = {
+                node.id: {
+                    output_name.split("-")[-1]: output.file
+                    for output_name, output in node.outputs.items()
+                }
+                for node in workflow.nodes
+            }
+            record_manifest(code, expected_outputs)
             raise HTTPException(
                 status_code=500,
                 detail={"error": "execution_failed", "exit_code": code,
@@ -585,6 +605,21 @@ async def _execute(run_id: str, biochef_workflow: str, inputs):
             _advance(run_id, RunState.CANCELED)
             return
         _advance(run_id, RunState.COMPLETE, outputs=results)
+    finally:
+        # Release canceled files after the worker has recorded its diagnostics.
+        try:
+            if RUNS.get(run_id).state is RunState.CANCELED:
+                RETAINED.release(run_id)
+        except UnknownRun:
+            pass
+
+        # Clean staging files even when source fetching never started.
+        for source, _, path in inputs:
+            if source == "handedover":
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
 
 def _was_cancelled(run_id) -> bool:
@@ -603,13 +638,15 @@ def _advance(run_id, state, **detail):
     """
     try:
         RUNS.advance(run_id, state, **detail)
+    except audit.AuditError:
+        logger.exception("could not audit transition for run %s", run_id)
+        if state not in (RunState.COMPLETE, RunState.EXECUTOR_ERROR,
+                         RunState.SYSTEM_ERROR, RunState.CANCELED):
+            raise
     except IllegalTransition:
         if state in (RunState.COMPLETE, RunState.EXECUTOR_ERROR,
                      RunState.SYSTEM_ERROR) and _was_cancelled(run_id):
-            try:
-                RUNS.advance(run_id, RunState.CANCELED)
-            except (IllegalTransition, UnknownRun):
-                pass
+            _advance(run_id, RunState.CANCELED)
     except UnknownRun:
         pass
 
@@ -737,19 +774,21 @@ async def cancel_run(run_id: str):
         )
 
     try:
-        RUNS.advance(run_id, RunState.CANCELING)
-    except IllegalTransition:
-        # Someone else asked first, or it ended between the check and here.
-        return RUNS.get(run_id).as_dict()
-
-    pgid = run.pgid
-    if pgid is not None:
         try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            # Already gone -- it finished on its own in the meantime. The
-            # worker will settle the state.
-            pass
+            RUNS.advance(run_id, RunState.CANCELING)
+        except IllegalTransition:
+            # Someone else asked first, or it ended between the check and here.
+            return RUNS.get(run_id).as_dict()
+    finally:
+        # Kill after an audit failure, but not after the run already finished.
+        pgid = run.pgid
+        if run.state is RunState.CANCELING and pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                # Already gone -- it finished on its own in the meantime. The
+                # worker will settle the state.
+                pass
 
     return RUNS.get(run_id).as_dict()
 
@@ -766,8 +805,9 @@ async def get_run_logs(run_id: str):
     run-wide stderr; tools can imitate those headings, so it is not proof of
     failure or a substitute for `node_logs`.
 
-    Logs are recorded after the workflow process exits, before output collection
-    and the run's terminal state. They are not available during execution.
+    Run-wide stdout and stderr are updated during execution. Per-node logs are
+    recorded after the workflow process exits, before output collection and the
+    run's terminal state.
     Each stream's retained per-node tails share BIOCHEF_MAX_LOG_BYTES across
     nodes; log files on disk can grow until the run ends.
     """
@@ -782,7 +822,9 @@ async def get_run_logs(run_id: str):
     return run.logs_as_dict()
 
 
-@app.get("/runs/{run_id}/outputs/{node_id}/{handle}")
+@app.get("/runs/{run_id}/outputs/{node_id}/{handle}", responses={
+    409: {"description": "Outputs are available only after the run completes"},
+})
 async def stream_output(run_id: str, node_id: str, handle: str):
     """One output, streamed, without base64 and without holding it in memory.
 
@@ -806,6 +848,17 @@ async def stream_output(run_id: str, node_id: str, handle: str):
                    f"enough ago to have been forgotten",
         )
 
+    if run.state is not RunState.COMPLETE:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "outputs_not_available",
+                "run_id": run_id,
+                "state": run.state.value,
+                "message": "outputs are available only after a run completes",
+            },
+        )
+
     filename = (run.output_files.get(node_id) or {}).get(handle)
     if filename is None:
         raise HTTPException(
@@ -814,8 +867,15 @@ async def stream_output(run_id: str, node_id: str, handle: str):
                    f"{node_id!r}",
         )
 
-    ws = RETAINED.workspace(run_id)
-    if ws is None:
+    try:
+        handle_in = RETAINED.open_read(run_id, filename)
+    except (FileNotFoundError, UnsafeName) as failure:
+        raise HTTPException(
+            status_code=404,
+            detail=f"output {handle!r} of {node_id!r} is not there: {failure}",
+        )
+
+    if handle_in is None:
         raise HTTPException(
             status_code=410,
             detail={
@@ -825,14 +885,6 @@ async def stream_output(run_id: str, node_id: str, handle: str):
                            "kept for BIOCHEF_KEEP_OUTPUTS seconds and for the "
                            "most recent BIOCHEF_MAX_RETAINED_RUNS runs.",
             },
-        )
-
-    try:
-        handle_in = ws.open_read(filename)
-    except (FileNotFoundError, UnsafeName) as failure:
-        raise HTTPException(
-            status_code=404,
-            detail=f"output {handle!r} of {node_id!r} is not there: {failure}",
         )
 
     def chunks():

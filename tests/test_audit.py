@@ -102,6 +102,15 @@ def test_a_write_failure_is_raised_and_not_swallowed(tmp_path, monkeypatch):
         audit.record("run.state", run_id="x")
 
 
+def test_a_short_write_is_reported_as_a_failed_event(tmp_path, monkeypatch):
+    trail = tmp_path / "audit.jsonl"
+    monkeypatch.setenv(audit.ENV_PATH, str(trail))
+    monkeypatch.setattr(audit.os, "write", lambda fd, payload: len(payload) - 1)
+
+    with pytest.raises(audit.AuditError, match="partially written"):
+        audit.record("run.state", run_id="x")
+
+
 def test_an_unreadable_line_does_not_hide_the_rest(tmp_path, monkeypatch):
     """One corrupt line must not make the trail unreadable, and must not vanish
     from it either."""
@@ -179,6 +188,30 @@ def test_the_error_that_ended_a_run_is_in_the_trail(tmp_path, monkeypatch):
     registry.advance(run.run_id, RunState.SYSTEM_ERROR, error="the disk went away")
     last = json.loads(trail.read_text().splitlines()[-1])
     assert last["error"] == "the disk went away"
+
+
+def test_a_recovered_cancellation_record_carries_the_prior_audit_error(monkeypatch):
+    registry = RunStore()
+    run = registry.create()
+    registry.advance(run.run_id, RunState.INITIALIZING)
+    registry.advance(run.run_id, RunState.RUNNING)
+
+    def fail_cancel(event, **fields):
+        raise audit.AuditError("CANCELING event was not recorded")
+
+    monkeypatch.setattr(audit, "record", fail_cancel)
+    with pytest.raises(audit.AuditError):
+        registry.advance(run.run_id, RunState.CANCELING)
+
+    prior_error = run.error
+    recorded = []
+    monkeypatch.setattr(audit, "record",
+                        lambda event, **fields: recorded.append(fields))
+    registry.advance(run.run_id, RunState.CANCELED)
+
+    assert run.error == prior_error
+    assert run.state is RunState.CANCELED
+    assert recorded[-1]["error"] == prior_error
 
 
 # --- honesty about identity --------------------------------------------------

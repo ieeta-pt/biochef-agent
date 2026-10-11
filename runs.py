@@ -214,24 +214,40 @@ class RunStore:
                     f"transition this run may make"
                 )
 
-            run.state = state
             # Here rather than at each call site, because this is the only place
             # a state changes. A hook at the call sites is one a new transition
             # forgets to add, and the gap in an audit trail is invisible from
-            # inside the thing that should have written it.
-            audit.record(
-                "run.state",
-                run_id=run_id,
-                # .value, not str(): this is a str-Enum, and str() gives
-                # "RunState.RUNNING" rather than the WES term "RUNNING". #64
-                # adopted that vocabulary precisely so the states would be
-                # legible to something that is not this service, and an
-                # exported trail is exactly that reader.
-                state=state.value,
-                caller=getattr(run, "caller", None),
-                authenticated_by=getattr(run, "authenticated_by", None),
-                error=error,
-            )
+            # inside the thing that should have written it. Keep the audit
+            # attempt and the state commit under this lock so a concurrent
+            # cancellation cannot slip between them.
+            try:
+                audit.record(
+                    "run.state",
+                    run_id=run_id,
+                    # .value, not str(): this is a str-Enum, and str() gives
+                    # "RunState.RUNNING" rather than the WES term "RUNNING". #64
+                    # adopted that vocabulary precisely so the states would be
+                    # legible to something that is not this service, and an
+                    # exported trail is exactly that reader.
+                    state=state.value,
+                    caller=getattr(run, "caller", None),
+                    authenticated_by=getattr(run, "authenticated_by", None),
+                    error=error if error is not None else run.error,
+                )
+            except audit.AuditError as exc:
+                # Keep cancellation possible through an audit outage, and expose
+                # that missing record in the run's pollable error.
+                cause = error if error is not None else run.error
+                failure = {"error": "audit_error", "message": str(exc)}
+                if cause is not None:
+                    failure["cause"] = cause
+                run.state = (state if state in (RunState.CANCELING, RunState.CANCELED)
+                             else RunState.SYSTEM_ERROR)
+                run.outputs = None
+                run.error = failure
+                raise
+
+            run.state = state
             if outputs is not None:
                 run.outputs = outputs
             if error is not None:

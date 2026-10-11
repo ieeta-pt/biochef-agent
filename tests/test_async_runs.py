@@ -64,6 +64,7 @@ import time
 
 import pytest
 
+import audit
 import convert
 from runs import (ALLOWED, TERMINAL, IllegalTransition, RunCapacityError,
                   RunState, RunStore, UnknownRun)
@@ -229,6 +230,51 @@ def test_a_defect_in_the_service_is_SYSTEM_ERROR_not_the_workflows_fault(service
         body = _poll(client, run_id)
 
     assert body["state"] == RunState.SYSTEM_ERROR.value, body
+
+
+@pytest.mark.parametrize("failed_state", [RunState.INITIALIZING, RunState.RUNNING])
+def test_an_initializing_or_running_audit_failure_stops_before_the_runner(
+        service, monkeypatch, failed_state):
+    from fastapi.testclient import TestClient
+
+    launched = []
+
+    def fail_transition(event, **fields):
+        if fields.get("state") == failed_state.value:
+            raise audit.AuditError("audit destination is unavailable")
+
+    monkeypatch.setattr(audit, "record", fail_transition)
+    monkeypatch.setattr(main, "run_snakemake",
+                        lambda *args, **kwargs: launched.append(True))
+
+    with TestClient(main.app) as client:
+        run_id = _submit(client).json()["run_id"]
+        body = _poll(client, run_id)
+
+    assert body["state"] == RunState.SYSTEM_ERROR.value, body
+    assert body["error"]["error"] == "audit_error"
+    assert not launched, "runner started after its INITIALIZING event failed"
+    assert "outputs" not in body
+
+
+def test_a_completion_audit_failure_is_pollable_and_has_no_outputs(
+        service, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    def fail_completion(event, **fields):
+        if fields.get("state") == RunState.COMPLETE.value:
+            raise audit.AuditError("completion event was not recorded")
+
+    monkeypatch.setattr(audit, "record", fail_completion)
+
+    with TestClient(main.app) as client:
+        run_id = _submit(client).json()["run_id"]
+        body = _poll(client, run_id)
+
+    assert body["state"] == RunState.SYSTEM_ERROR.value, body
+    assert body["error"]["error"] == "audit_error"
+    assert "completion event was not recorded" in body["error"]["message"]
+    assert "outputs" not in body
 
 
 def test_an_unknown_run_is_404_not_500(service):
