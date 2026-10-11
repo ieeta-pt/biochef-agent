@@ -99,11 +99,26 @@ to a scientific output file stays in that output and is not copied into logs.
 for what each rule printed. Rules share a workspace, so these files are
 diagnostic records rather than tamper-proof audit evidence.
 
-**The logs are not streamed, though progress is updated live.** The runner
-drains both pipes as output arrives, using the engine's stderr announcements
-for progress. Run-wide output is recorded and per-rule log files are read when
-the workflow process exits. Logs therefore appear before the run reaches a
-terminal state, but not while tools are running.
+**Run-wide output is live; per-rule logs are not.** `stdout` and `stderr` are
+read as they arrive and handed to the run twice a second, so a run that is still
+going can be read as it goes. A tool that prints once and then works silently is
+still visible: the flush is on a timer, because checking
+the clock only when a line arrives would show nothing for as long as the tool
+said nothing. The per-rule `node_logs` are different — they are read from each
+rule's own file when the workflow process exits, so a mid-run poll carries
+run-wide output and no node logs yet.
+
+What a poll returns mid-run is therefore a **partial** log. The runner, live
+buffer and run store each retain at most `BIOCHEF_MAX_LOG_BYTES` of text per
+stream, plus a truncation marker. Oldest output is dropped first. The final
+record is written when the process exits, from the runner's retained tails;
+output already discarded by the runner is not recovered.
+
+`failed_steps` is only derived once the run has an exit code, and only for a
+failed one: a successful tool can print something that looks like a
+snakemake error heading, so a live flush deliberately reports an exit code of
+zero and lets nothing be parsed out of a run still in progress.
+
 `/convert` keeps its existing shell command and failure response; per-rule
 capture applies to asynchronous `/runs` only.
 
@@ -127,8 +142,8 @@ inputs in memory; the request-size limit is not an aggregate memory limit.
 reach 512 MiB — `BIOCHEF_MAX_RUNS` × `BIOCHEF_MAX_LOG_BYTES` × two streams.
 The per-node stdout and stderr tails share another two-stream budget per run,
 adding up to another 512 MiB at the defaults. A run also holds diagnostic
-error blocks and base64-encoded outputs. The runner still buffers complete
-run-wide streams before truncation, and per-rule log files can grow on disk
+error blocks and base64-encoded outputs. The runner still reads a complete line
+before trimming its tail, and per-rule log files can grow on disk
 until the run ends. This setting is a retention bound, not a peak resource
 limit. Logs may contain sensitive tool output; this prototype has no local
 log-release policy for TRE use.
