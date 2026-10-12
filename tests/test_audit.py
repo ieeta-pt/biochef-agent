@@ -138,10 +138,84 @@ def test_every_state_a_run_reaches_is_recorded(tmp_path, monkeypatch):
     registry.advance(run.run_id, RunState.RUNNING)
     registry.advance(run.run_id, RunState.COMPLETE)
 
-    states = [json.loads(l)["state"] for l in trail.read_text().splitlines()]
-    assert states == ["INITIALIZING", "RUNNING", "COMPLETE"]
-    assert all(json.loads(l)["run_id"] == run.run_id
-               for l in trail.read_text().splitlines())
+    events = [json.loads(line) for line in trail.read_text().splitlines()]
+    assert [event["state"] for event in events] == [
+        "QUEUED", "INITIALIZING", "RUNNING", "COMPLETE"]
+    assert all(event["run_id"] == run.run_id for event in events)
+    assert events[0]["schema"] == audit.SCHEMA
+    assert events[0]["caller"] is None
+    assert events[0]["authenticated_by"] == "bearer"
+    assert events[0]["error"] is None
+    assert events[0]["at"].endswith("+00:00")
+
+
+def test_a_queued_run_cancel_is_recorded(tmp_path, monkeypatch):
+    trail = tmp_path / "audit.jsonl"
+    monkeypatch.setenv(audit.ENV_PATH, str(trail))
+
+    registry = RunStore()
+    run = registry.create(caller="researcher@example.org",
+                          authenticated_by="passport")
+    registry.advance(run.run_id, RunState.CANCELING)
+    registry.advance(run.run_id, RunState.CANCELED)
+
+    events = [json.loads(line) for line in trail.read_text().splitlines()]
+    assert [event["state"] for event in events] == [
+        "QUEUED", "CANCELING", "CANCELED"]
+    assert all(event["run_id"] == run.run_id for event in events)
+    assert all(event["caller"] == "researcher@example.org" for event in events)
+    assert all(event["authenticated_by"] == "passport" for event in events)
+
+
+def test_capacity_refusal_does_not_write_an_admission_event(tmp_path, monkeypatch):
+    trail = tmp_path / "audit.jsonl"
+    monkeypatch.setenv(audit.ENV_PATH, str(trail))
+    registry = RunStore(max_runs=1)
+    accepted = registry.create()
+    before = trail.read_text()
+
+    with pytest.raises(runs.RunCapacityError):
+        registry.create()
+
+    assert trail.read_text() == before
+    assert registry.get(accepted.run_id).state is RunState.QUEUED
+
+
+def test_admission_audit_failure_publishes_no_run_or_upload_copy(
+        service, monkeypatch, tmp_path):
+    import asyncio
+    import tempfile
+    import main
+    from test_async_runs import _bare_request
+
+    class UnreadUpload:
+        filename = "input-1-out"
+        was_read = False
+
+        async def read(self, size=-1):
+            self.was_read = True
+            return b"input"
+
+    upload = UnreadUpload()
+    registry = RunStore(max_runs=1)
+    monkeypatch.setattr(main, "RUNS", registry)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+    def fail_admission(event, **fields):
+        assert event == "run.state"
+        assert fields["state"] == "QUEUED"
+        raise audit.AuditError("admission event was not recorded")
+
+    monkeypatch.setattr(audit, "record", fail_admission)
+
+    with pytest.raises(audit.AuditError, match="admission event was not recorded"):
+        asyncio.run(main.submit_run(
+            _bare_request("researcher@example.org", "passport"),
+            WORKFLOW, [upload]))
+
+    assert not upload.was_read
+    assert not registry._runs
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_a_refused_transition_is_not_recorded_as_having_happened(tmp_path, monkeypatch):
@@ -163,20 +237,22 @@ def test_a_refused_transition_is_not_recorded_as_having_happened(tmp_path, monke
 
 
 def test_the_hook_is_where_transitions_happen_and_not_at_the_call_sites(tmp_path):
-    """A hook at each call site is one a new transition forgets.
+    """Admission and transitions share one audit hook.
 
     A gap in an audit trail is invisible from inside the thing that should have
-    written it, so the record has to sit at the single point every state change
-    passes through.
+    written it, so admission and each state change use the same event formatter.
     """
     source = (REPO_ROOT / "runs.py").read_text()
     code = "\n".join(line.split("#", 1)[0] for line in source.splitlines())
     assert code.count("audit.record(") == 1, (
-        "more than one place records a transition, which means there is a place "
-        "that can be forgotten"
+        "admission and transitions must share one place that writes state events"
     )
+    helper = code.split("def _record_state")[1].split("def discard")[0]
+    assert "audit.record(" in helper
+    create = code.split("def create")[1].split("def _record_state")[0]
+    assert "self._record_state(run, RunState.QUEUED)" in create
     advance = code.split("def advance")[1]
-    assert "audit.record(" in advance
+    assert "self._record_state(run, state, error)" in advance
 
 
 def test_the_error_that_ended_a_run_is_in_the_trail(tmp_path, monkeypatch):

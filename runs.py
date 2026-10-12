@@ -178,8 +178,26 @@ class RunStore:
             # one that is late.
             run.caller = caller
             run.authenticated_by = authenticated_by
+            self._record_state(run, RunState.QUEUED)
             self._runs[run.run_id] = run
         return run
+
+    @staticmethod
+    def _record_state(run: Run, state: RunState,
+                      error: Optional[str] = None) -> None:
+        audit.record(
+            "run.state",
+            run_id=run.run_id,
+            # .value, not str(): this is a str-Enum, and str() gives
+            # "RunState.RUNNING" rather than the WES term "RUNNING". #64
+            # adopted that vocabulary precisely so the states would be
+            # legible to something that is not this service, and an
+            # exported trail is exactly that reader.
+            state=state.value,
+            caller=getattr(run, "caller", None),
+            authenticated_by=getattr(run, "authenticated_by", None),
+            error=error if error is not None else run.error,
+        )
 
     def discard(self, run_id: str) -> None:
         """Undo admission when request upload fails before a run is launched."""
@@ -221,19 +239,7 @@ class RunStore:
             # attempt and the state commit under this lock so a concurrent
             # cancellation cannot slip between them.
             try:
-                audit.record(
-                    "run.state",
-                    run_id=run_id,
-                    # .value, not str(): this is a str-Enum, and str() gives
-                    # "RunState.RUNNING" rather than the WES term "RUNNING". #64
-                    # adopted that vocabulary precisely so the states would be
-                    # legible to something that is not this service, and an
-                    # exported trail is exactly that reader.
-                    state=state.value,
-                    caller=getattr(run, "caller", None),
-                    authenticated_by=getattr(run, "authenticated_by", None),
-                    error=error if error is not None else run.error,
-                )
+                self._record_state(run, state, error)
             except audit.AuditError as exc:
                 # Keep cancellation possible through an audit outage, and expose
                 # that missing record in the run's pollable error.
