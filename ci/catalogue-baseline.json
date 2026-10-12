@@ -128,7 +128,7 @@
     "jq.query": "sha256: ca8d47c4165a771f",
     "kalign.align": "error: TypeError: sequence item 22: expected str instance, int found",
     "ksw2.align": "error: TypeError: sequence item 4: expected str instance, int found",
-    "lastz.align": "sha256: 3e8f4a5f87583fdf",
+    "lastz.align": "sha256: e1191a9ae60eaa10",
     "minimap2.align": "error: TypeError: sequence item 120: expected str instance, int found",
     "minimap2.index": "error: TypeError: sequence item 20: expected str instance, int found",
     "modbam2bed.summarize": "error: TypeError: sequence item 26: expected str instance, int found",
