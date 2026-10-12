@@ -5,7 +5,7 @@ import asyncio
 import provenance
 import tempfile
 import weakref
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from datetime import datetime, timezone
@@ -16,7 +16,9 @@ import os
 import signal
 import subprocess
 import base64
+import logging
 
+import audit
 from workspace import UnsafeName, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
 from runs import (IllegalTransition, RunCapacityError, RunState, RunStore,
@@ -31,6 +33,7 @@ from runner import SubprocessRunner, get_runner
 from signing import SignatureError
 
 app = FastAPI()
+logger = logging.getLogger(__name__)
 
 # Before anything reads the body. starlette spools the whole multipart payload
 # before the handler is entered, so a limit enforced in /convert would be
@@ -62,6 +65,15 @@ app.add_middleware(AuthenticationMiddleware, provider=AUTH)
 async def unusable_name(request, exc):
     """A bad name is the client's mistake, so say so rather than returning 500."""
     return JSONResponse(status_code=400, content={"detail": f"unusable file name: {exc}"})
+
+
+@app.exception_handler(audit.AuditError)
+async def audit_failure(request, exc):
+    """Report that the requested state change could not be audited."""
+    return JSONResponse(
+        status_code=500,
+        content={"detail": {"error": "audit_error", "message": str(exc)}},
+    )
 
 
 @app.exception_handler(ToolIntegrityError)
@@ -626,13 +638,15 @@ def _advance(run_id, state, **detail):
     """
     try:
         RUNS.advance(run_id, state, **detail)
+    except audit.AuditError:
+        logger.exception("could not audit transition for run %s", run_id)
+        if state not in (RunState.COMPLETE, RunState.EXECUTOR_ERROR,
+                         RunState.SYSTEM_ERROR, RunState.CANCELED):
+            raise
     except IllegalTransition:
         if state in (RunState.COMPLETE, RunState.EXECUTOR_ERROR,
                      RunState.SYSTEM_ERROR) and _was_cancelled(run_id):
-            try:
-                RUNS.advance(run_id, RunState.CANCELED)
-            except (IllegalTransition, UnknownRun):
-                pass
+            _advance(run_id, RunState.CANCELED)
     except UnknownRun:
         pass
 
@@ -641,6 +655,7 @@ def _advance(run_id, state, **detail):
     503: {"description": "Agent capacity reached; retry later"},
 })
 async def submit_run(
+    request: Request,
     biochef_workflow: str = Form(...),
     files: List[UploadFile] = File(...)
 ):
@@ -651,11 +666,18 @@ async def submit_run(
     difference between this and /convert, and the reason it cannot simply call
     the same handler in the background.
     """
+    # Whatever the authentication provider knew about the caller, which for the
+    # bearer provider is nothing. Recorded as None rather than as a guess: the
+    # audit trail says which provider authorised the request, so "we do not know
+    # who" reads as a fact about the deployment and not as a hole in the log.
+    state = getattr(request, "scope", {}).get("state") or {}
+
     # Admission first, and the upload read only after it. Master added this
     # refusal so a submission the agent is about to turn away is never read, and
     # a test pins it -- spooling first would write every byte of it to disk.
     try:
-        run = RUNS.create()
+        run = RUNS.create(caller=state.get("caller"),
+                          authenticated_by=state.get("authenticated_by"))
     except RunCapacityError:
         raise HTTPException(
             status_code=503, detail="agent run capacity reached; retry later",
@@ -752,19 +774,21 @@ async def cancel_run(run_id: str):
         )
 
     try:
-        RUNS.advance(run_id, RunState.CANCELING)
-    except IllegalTransition:
-        # Someone else asked first, or it ended between the check and here.
-        return RUNS.get(run_id).as_dict()
-
-    pgid = run.pgid
-    if pgid is not None:
         try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            # Already gone -- it finished on its own in the meantime. The
-            # worker will settle the state.
-            pass
+            RUNS.advance(run_id, RunState.CANCELING)
+        except IllegalTransition:
+            # Someone else asked first, or it ended between the check and here.
+            return RUNS.get(run_id).as_dict()
+    finally:
+        # Kill after an audit failure, but not after the run already finished.
+        pgid = run.pgid
+        if run.state is RunState.CANCELING and pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                # Already gone -- it finished on its own in the meantime. The
+                # worker will settle the state.
+                pass
 
     return RUNS.get(run_id).as_dict()
 

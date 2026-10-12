@@ -13,6 +13,8 @@ persistent store is its own piece of work.
 import os
 import threading
 import uuid
+
+import audit
 from collections import OrderedDict
 from enum import Enum
 
@@ -166,12 +168,36 @@ class RunStore:
         if self._max < 1:
             raise ValueError("max_runs must be positive")
 
-    def create(self) -> Run:
+    def create(self, caller=None, authenticated_by=None) -> Run:
         with self._lock:
             self._evict_if_needed()
             run = Run(uuid.uuid4().hex)
+            # Set before the run is published into _runs, and inside the lock
+            # that publishes it, so no reader can ever see a run whose caller is
+            # not yet recorded -- an audit trail with a gap in it is worse than
+            # one that is late.
+            run.caller = caller
+            run.authenticated_by = authenticated_by
+            self._record_state(run, RunState.QUEUED)
             self._runs[run.run_id] = run
         return run
+
+    @staticmethod
+    def _record_state(run: Run, state: RunState,
+                      error: Optional[str] = None) -> None:
+        audit.record(
+            "run.state",
+            run_id=run.run_id,
+            # .value, not str(): this is a str-Enum, and str() gives
+            # "RunState.RUNNING" rather than the WES term "RUNNING". #64
+            # adopted that vocabulary precisely so the states would be
+            # legible to something that is not this service, and an
+            # exported trail is exactly that reader.
+            state=state.value,
+            caller=getattr(run, "caller", None),
+            authenticated_by=getattr(run, "authenticated_by", None),
+            error=error if error is not None else run.error,
+        )
 
     def discard(self, run_id: str) -> None:
         """Undo admission when request upload fails before a run is launched."""
@@ -205,6 +231,27 @@ class RunStore:
                     f"{run_id}: {run.state.value} -> {state.value} is not a "
                     f"transition this run may make"
                 )
+
+            # Here rather than at each call site, because this is the only place
+            # a state changes. A hook at the call sites is one a new transition
+            # forgets to add, and the gap in an audit trail is invisible from
+            # inside the thing that should have written it. Keep the audit
+            # attempt and the state commit under this lock so a concurrent
+            # cancellation cannot slip between them.
+            try:
+                self._record_state(run, state, error)
+            except audit.AuditError as exc:
+                # Keep cancellation possible through an audit outage, and expose
+                # that missing record in the run's pollable error.
+                cause = error if error is not None else run.error
+                failure = {"error": "audit_error", "message": str(exc)}
+                if cause is not None:
+                    failure["cause"] = cause
+                run.state = (state if state in (RunState.CANCELING, RunState.CANCELED)
+                             else RunState.SYSTEM_ERROR)
+                run.outputs = None
+                run.error = failure
+                raise
 
             run.state = state
             if outputs is not None:

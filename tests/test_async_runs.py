@@ -64,6 +64,7 @@ import time
 
 import pytest
 
+import audit
 import convert
 from runs import (ALLOWED, TERMINAL, IllegalTransition, RunCapacityError,
                   RunState, RunStore, UnknownRun)
@@ -137,6 +138,22 @@ def service(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "RUNS", RunStore())
     yield main.RUNS
     convert.tools.clear()
+
+
+def _bare_request(caller=None, authenticated_by=None):
+    """A real Request for the two tests that call submit_run directly.
+
+    The handler takes one because the audit trail records who asked (#19), and
+    these two bypass fastapi's dependency resolution -- so the request is theirs
+    to supply. A real Request rather than a stub, so they break if the way the
+    caller is read changes, which is the point of them.
+    """
+    from starlette.requests import Request
+
+    return Request({
+        "type": "http", "method": "POST", "path": "/runs", "headers": [],
+        "state": {"caller": caller, "authenticated_by": authenticated_by},
+    })
 
 
 def _submit(client):
@@ -213,6 +230,51 @@ def test_a_defect_in_the_service_is_SYSTEM_ERROR_not_the_workflows_fault(service
         body = _poll(client, run_id)
 
     assert body["state"] == RunState.SYSTEM_ERROR.value, body
+
+
+@pytest.mark.parametrize("failed_state", [RunState.INITIALIZING, RunState.RUNNING])
+def test_an_initializing_or_running_audit_failure_stops_before_the_runner(
+        service, monkeypatch, failed_state):
+    from fastapi.testclient import TestClient
+
+    launched = []
+
+    def fail_transition(event, **fields):
+        if fields.get("state") == failed_state.value:
+            raise audit.AuditError("audit destination is unavailable")
+
+    monkeypatch.setattr(audit, "record", fail_transition)
+    monkeypatch.setattr(main, "run_snakemake",
+                        lambda *args, **kwargs: launched.append(True))
+
+    with TestClient(main.app) as client:
+        run_id = _submit(client).json()["run_id"]
+        body = _poll(client, run_id)
+
+    assert body["state"] == RunState.SYSTEM_ERROR.value, body
+    assert body["error"]["error"] == "audit_error"
+    assert not launched, "runner started after its INITIALIZING event failed"
+    assert "outputs" not in body
+
+
+def test_a_completion_audit_failure_is_pollable_and_has_no_outputs(
+        service, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    def fail_completion(event, **fields):
+        if fields.get("state") == RunState.COMPLETE.value:
+            raise audit.AuditError("completion event was not recorded")
+
+    monkeypatch.setattr(audit, "record", fail_completion)
+
+    with TestClient(main.app) as client:
+        run_id = _submit(client).json()["run_id"]
+        body = _poll(client, run_id)
+
+    assert body["state"] == RunState.SYSTEM_ERROR.value, body
+    assert body["error"]["error"] == "audit_error"
+    assert "completion event was not recorded" in body["error"]["message"]
+    assert "outputs" not in body
 
 
 def test_an_unknown_run_is_404_not_500(service):
@@ -380,7 +442,8 @@ def test_upload_read_failure_releases_reserved_capacity(service, monkeypatch,
     store = RunStore(max_runs=1)
     monkeypatch.setattr(main, "RUNS", store)
     with pytest.raises(OSError, match="input stream failed"):
-        asyncio.run(main.submit_run(WORKFLOW, [BrokenUpload()]))
+        asyncio.run(main.submit_run(_bare_request(), WORKFLOW,
+                                    [BrokenUpload()]))
     assert store.create().state is RunState.QUEUED
     assert list(tmp_path.iterdir()) == [], (
         f"a failed submission left {[p.name for p in tmp_path.iterdir()]} behind"
@@ -402,7 +465,8 @@ def test_full_store_refuses_before_upload_is_read(service, monkeypatch):
     accepted = store.create()
     monkeypatch.setattr(main, "RUNS", store)
     with pytest.raises(HTTPException) as refused:
-        asyncio.run(main.submit_run(WORKFLOW, [UnreadUpload()]))
+        asyncio.run(main.submit_run(_bare_request("someone"), WORKFLOW,
+                                    [UnreadUpload()]))
     assert refused.value.status_code == 503
     assert store.get(accepted.run_id).state is RunState.QUEUED
 
