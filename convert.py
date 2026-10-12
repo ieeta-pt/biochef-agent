@@ -596,6 +596,11 @@ def convert_to_snakemake(workflow: Workflow, step_logs=None):
         extra_cms = []
 
         for param_name, param in node.parameters.items():
+            # A flag ending in "=" (lastz's --format=) takes its value in the
+            # same argument, as the browser runs it.
+            if param.flag and param.flag.endswith("="):
+                cmd.append(f"{param.flag}{param.value}")
+                continue
             if param.flag:
                 cmd.append(param.flag)
             cmd.append(param.value)
