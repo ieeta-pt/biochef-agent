@@ -177,6 +177,7 @@
     "seqtk.trimfq": "sha256: e5373eb5fa5c747a",
     "ssw.align": "error: TypeError: sequence item 2: expected str instance, int found",
     "tn93.distance": "error: TypeError: sequence item 2: expected str instance, float found",
-    "viralconsensus.consensus": "sha256: 476d7b7de8e578a6"
+    "viralconsensus.consensus": "sha256: 476d7b7de8e578a6",
+    "wgsim.simulate": "sha256: deee27f48d4aff50"
   }
 }
