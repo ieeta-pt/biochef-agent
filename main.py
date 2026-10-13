@@ -3,6 +3,7 @@ from convert import rule_name_for
 from convert import provenance as bundle_provenance
 import asyncio
 import provenance
+import wes
 import tempfile
 import weakref
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
@@ -651,6 +652,26 @@ def _advance(run_id, state, **detail):
         pass
 
 
+def _admit_run(request):
+    # Whatever the authentication provider knew about the caller, which for the
+    # bearer provider is nothing. Recorded as None rather than as a guess: the
+    # audit trail says which provider authorised the request, so "we do not know
+    # who" reads as a fact about the deployment and not as a hole in the log.
+    state = getattr(request, "scope", {}).get("state") or {}
+
+    # Admission first, and the upload read only after it. Master added this
+    # refusal so a submission the agent is about to turn away is never read, and
+    # a test pins it -- spooling first would write every byte of it to disk.
+    try:
+        return RUNS.create(caller=state.get("caller"),
+                           authenticated_by=state.get("authenticated_by"))
+    except RunCapacityError:
+        raise HTTPException(
+            status_code=503, detail="agent run capacity reached; retry later",
+            headers={"Retry-After": "1"},
+        ) from None
+
+
 @app.post("/runs", status_code=202, responses={
     503: {"description": "Agent capacity reached; retry later"},
 })
@@ -666,24 +687,7 @@ async def submit_run(
     difference between this and /convert, and the reason it cannot simply call
     the same handler in the background.
     """
-    # Whatever the authentication provider knew about the caller, which for the
-    # bearer provider is nothing. Recorded as None rather than as a guess: the
-    # audit trail says which provider authorised the request, so "we do not know
-    # who" reads as a fact about the deployment and not as a hole in the log.
-    state = getattr(request, "scope", {}).get("state") or {}
-
-    # Admission first, and the upload read only after it. Master added this
-    # refusal so a submission the agent is about to turn away is never read, and
-    # a test pins it -- spooling first would write every byte of it to disk.
-    try:
-        run = RUNS.create(caller=state.get("caller"),
-                          authenticated_by=state.get("authenticated_by"))
-    except RunCapacityError:
-        raise HTTPException(
-            status_code=503, detail="agent run capacity reached; retry later",
-            headers={"Retry-After": "1"},
-        ) from None
-
+    run = _admit_run(request)
     inputs = []
     try:
         # Read to disk here rather than kept as the request's own spooled file.
@@ -906,6 +910,136 @@ async def stream_output(run_id: str, node_id: str, handle: str):
         headers={"Content-Disposition":
                  f'attachment; filename="{node_id}-{handle}"'},
     )
+
+
+# --- the GA4GH WES surface (#24) --------------------------------------------
+#
+# A mapping, not a second implementation. Every endpoint below reads the same
+# RunStore the bespoke API reads, and a run submitted through either is the same
+# run -- which is why B1 took the WES RunState vocabulary and put cancel at
+# WES's path in the first place.
+
+
+@app.get(f"{wes.BASE}/service-info")
+async def wes_service_info():
+    """What this server is, and what it will refuse."""
+    return wes.service_info(
+        RUNS.state_counts(), auth_provider=AUTH.name, service_version=app.version,
+    )
+
+
+@app.get(f"{wes.BASE}/runs")
+async def wes_list_runs(page_size: int = None, page_token: str = None):
+    """Every run still held.
+
+    page_size and page_token are accepted and ignored, which service-info says
+    under not_implemented. Refusing them would fail conformant clients that send
+    a page size by default; pretending to honour them would silently return a
+    different set than was asked for.
+    """
+    return wes.run_list(RUNS.all())
+
+
+@app.post(f"{wes.BASE}/runs", status_code=200, responses={
+    503: {"description": "Agent capacity reached; retry later"},
+})
+async def wes_run_workflow(
+    request: Request,
+    workflow_type: str = Form(...),
+    workflow_url: str = Form(...),
+    workflow_params: str = Form("{}"),
+    workflow_type_version: str = Form(""),
+    workflow_attachment: List[UploadFile] = File(default=[]),
+    tags: str = Form("{}"),
+):
+    """WES's submission, mapped onto the same machinery as POST /runs.
+
+    Answers 200 with a run_id, which is what WES specifies -- the bespoke
+    endpoint answers 202, and the difference is the specification's rather than
+    a disagreement about what happened.
+    """
+    try:
+        wes.check_type(workflow_type, workflow_type_version)
+    except wes.UnsupportedWorkflow as refusal:
+        raise HTTPException(status_code=400, detail=str(refusal))
+
+    try:
+        params = json.loads(workflow_params)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="workflow_params must be a JSON object") from None
+    if not isinstance(params, dict):
+        raise HTTPException(status_code=400, detail="workflow_params must be a JSON object")
+    if params:
+        raise HTTPException(
+            status_code=400,
+            detail="Non-empty workflow_params are not supported; set tool parameters in the workflow JSON",
+        )
+
+    run = _admit_run(request)
+    attachments = []
+    try:
+        for f in workflow_attachment:
+            spooled = tempfile.NamedTemporaryFile(delete=False)
+            attachments.append((f.filename, spooled.name))
+            try:
+                while True:
+                    chunk = await f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    spooled.write(chunk)
+            finally:
+                spooled.close()
+
+        try:
+            workflow, inputs = wes.select_workflow(workflow_url, attachments)
+        except wes.MissingWorkflow as refusal:
+            raise HTTPException(status_code=400, detail=str(refusal))
+
+        with open(workflow[1], "r", encoding="utf-8") as handle:
+            document = handle.read()
+        os.unlink(workflow[1])
+        attachments.remove(workflow)
+        handed = [("handedover", name, path) for name, path in inputs]
+        task = asyncio.create_task(_execute(run.run_id, document, handed))
+        attachments.clear()  # Input ownership passes to the worker.
+    except BaseException:
+        RUNS.discard(run.run_id)
+        raise
+    finally:
+        for _, path in attachments:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    _running.add(task)
+    task.add_done_callback(_running.discard)
+    return {"run_id": run.run_id}
+
+
+@app.get(f"{wes.BASE}/runs/{{run_id}}/status")
+async def wes_run_status(run_id: str):
+    try:
+        return wes.run_status(RUNS.get(run_id))
+    except UnknownRun:
+        raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
+
+
+@app.get(f"{wes.BASE}/runs/{{run_id}}")
+async def wes_run_log(run_id: str):
+    try:
+        return wes.run_log(RUNS.get(run_id))
+    except UnknownRun:
+        raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
+
+
+@app.post(f"{wes.BASE}/runs/{{run_id}}/cancel")
+async def wes_cancel_run(run_id: str):
+    """The same cancellation the bespoke endpoint performs, called rather than
+    repeated: two implementations of stopping a process group would be two
+    things to keep correct, and the second is the one that gets forgotten."""
+    await cancel_run(run_id)
+    return {"run_id": run_id}
 
 
 @app.get("/runs/{run_id}/manifest")
