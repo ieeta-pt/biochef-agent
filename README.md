@@ -66,9 +66,12 @@ Retention is bounded in both directions because "stop deleting" is how a service
 fills a disk.
 
 `GET /runs/{run_id}/manifest` returns how the run was produced: the workflow by
-digest, each tool by the digests the registry stated for it, every input and
-output by content, the runner and image, and the exit code. It is also written
-into the run's own directory as `run.json`, beside the outputs it describes.
+digest, each tool by the digests the registry stated for it, each input as
+received, outputs by content, the runner and image, and the exit code. If a run
+changes an input, `inputs_after` records that input's final digest (or `null` if
+it was removed or could not be read); the field is omitted when inputs are
+unchanged. It is also written into the run's own directory as `run.json`, beside
+the outputs it describes.
 
 The vocabulary is the hub's. It publishes `biochef.build-evidence.v1` alongside
 each bundle and signs artifacts as in-toto statements, so a run manifest carries
@@ -76,8 +79,9 @@ that evidence forward by reference rather than restating the same facts in
 different words. A bundle built before that work still produces a manifest —
 provenance should not be a reason not to run something.
 
-A run that **failed** gets one too, with its real exit code and its outputs
-recorded as absent — that is the run whose exit code matters most. A run that has
+A run that **failed** gets one too, with its real exit code and every declared
+output recorded by its final identity, including `null` for outputs that are
+missing — that is the run whose exit code matters most. A run that has
 nowhere to put a manifest gets none: `/convert` deletes its workspace on the way
 out and has no run id to attach one to, and building it costs a second full read
 of every input and output.
@@ -98,19 +102,17 @@ diagnostic records rather than tamper-proof audit evidence.
 **Run-wide output is live; per-rule logs are not.** `stdout` and `stderr` are
 read as they arrive and handed to the run twice a second, so a run that is still
 going can be read as it goes. A tool that prints once and then works silently is
-still visible: the flush is on a timer as well as a line count, because checking
+still visible: the flush is on a timer, because checking
 the clock only when a line arrives would show nothing for as long as the tool
 said nothing. The per-rule `node_logs` are different — they are read from each
 rule's own file when the workflow process exits, so a mid-run poll carries
 run-wide output and no node logs yet.
 
-What a poll returns mid-run is therefore a **partial** log, and bounded: nothing
-holds more than `BIOCHEF_MAX_LOG_BYTES` of a stream, oldest dropped first, and a
-truncated log says so rather than beginning mid-sentence. That ceiling applies to
-the runner's own capture as well — a chatty tool used to decide how much memory
-the agent used. The authoritative record is written when the process exits, from
-the runner's own complete capture, so anything trimmed or still buffered costs
-nothing in the end.
+What a poll returns mid-run is therefore a **partial** log. The runner, live
+buffer and run store each retain at most `BIOCHEF_MAX_LOG_BYTES` of text per
+stream, plus a truncation marker. Oldest output is dropped first. The final
+record is written when the process exits, from the runner's retained tails;
+output already discarded by the runner is not recovered.
 
 `failed_steps` is only derived once the run has an exit code, and only for a
 failed one: a successful tool can print something that looks like a
@@ -140,8 +142,8 @@ inputs in memory; the request-size limit is not an aggregate memory limit.
 reach 512 MiB — `BIOCHEF_MAX_RUNS` × `BIOCHEF_MAX_LOG_BYTES` × two streams.
 The per-node stdout and stderr tails share another two-stream budget per run,
 adding up to another 512 MiB at the defaults. A run also holds diagnostic
-error blocks and base64-encoded outputs. The runner still buffers complete
-run-wide streams before truncation, and per-rule log files can grow on disk
+error blocks and base64-encoded outputs. The runner still reads a complete line
+before trimming its tail, and per-rule log files can grow on disk
 until the run ends. This setting is a retention bound, not a peak resource
 limit. Logs may contain sensitive tool output; this prototype has no local
 log-release policy for TRE use.
@@ -153,11 +155,11 @@ Both take the same fields:
 | `biochef_workflow` | the editor's workflow JSON, as a string: `{"nodes": [...], "edges": [...]}` |
 | `files` | the input files, one part each |
 
-Inputs go through a `DataSource`. `upload` is the default and the only one
-enabled out of the box, so the request above is unchanged. `localpath` lets a
-workflow name a file already on the agent's host — see `BIOCHEF_DATA_SOURCES`
-below — and a provider writes into the run's workspace rather than returning
-bytes, so a large input is streamed rather than held whole.
+Inputs go through a `DataSource`. Request uploads use `spooled` for `/convert`
+and `handedover` for `/runs`; `upload` remains available for inputs already held
+as bytes. `localpath` lets a workflow name a file already on the agent's host —
+see `BIOCHEF_DATA_SOURCES` below — and a provider writes into the run's workspace
+rather than returning bytes, so a large input is streamed rather than held whole.
 
 **Uploaded files must be named for the edge that carries them.** The converter
 names every intermediate file `{source_node_id}-{source_handle}`, so a file
@@ -210,7 +212,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `REGISTRY_INSECURE` | `false` | allow a plain-HTTP registry |
 | `ORAS_AUTH_BACKEND` | `token` | ORAS authentication backend |
 | `BIOCHEF_TOOL_CACHE` | `tool-cache` | where pulled tool bundles are kept between runs |
-| `BIOCHEF_DATA_SOURCES` | `upload` | where inputs may come from: `upload`, `localpath` |
+| `BIOCHEF_DATA_SOURCES` | `upload,spooled,handedover` | permitted input providers; add `localpath` to allow reads under `BIOCHEF_LOCAL_ROOT` |
 | `BIOCHEF_LOCAL_ROOT` | | the only directory `localpath` may read from |
 | `BIOCHEF_RUN_ROOT` | the system temp directory | where a run's private directory is created |
 | `BIOCHEF_RUN_TIMEOUT` | `900` | seconds before a run's whole process group is killed |
@@ -253,10 +255,18 @@ silently dropped instead, which is the worse of the two and the one nothing
 would notice. So "we do not know who" stays a recorded fact about the
 deployment rather than a gap in the log.
 
-`BIOCHEF_DATA_SOURCES` decides where a run's inputs may come from. It defaults
-to `upload` alone — bytes pushed in the request, which is what the editor does.
-Adding `localpath` lets a workflow name a file already on the agent's host, which
-is the ordinary case inside a TRE where the data is already on the machine.
+`BIOCHEF_DATA_SOURCES` decides which input providers are enabled. It defaults to
+`upload,spooled,handedover`: direct bytes, the synchronous route's request spool,
+and the asynchronous route's Agent-owned temporary copy. Adding `localpath` lets
+a workflow name a file already on the agent's host, which is the ordinary case
+inside a TRE where the data is already on the machine.
+Existing `upload`-only configurations need `spooled` and `handedover` to use
+these HTTP routes.
+With an `upload`-only configuration, a submitted `/runs` workflow reaches `EXECUTOR_ERROR` because `handedover` is disabled, and an output download returns HTTP 409. Check `GET /runs/{run_id}` for the underlying error.
+
+Raw output downloads from `/runs/{run_id}/outputs/{node_id}/{handle}` are
+available only after the run reaches `COMPLETE`; other states return HTTP 409.
+Status responses still include base64 outputs.
 
 **`localpath` requires `BIOCHEF_LOCAL_ROOT` to be an existing directory,** and
 refuses to start without it.
@@ -383,6 +393,11 @@ surface stops: `workflow_url` may only name an attachment (a remote URL is not
 fetched, which would mean executing a document from wherever a caller pointed
 this service), run listing is not paginated, and `task_logs` carries one entry
 per workflow step without per-task commands.
+
+Tool parameters stay in the frontend's workflow JSON. `workflow_params` accepts
+only an empty object (`{}`); malformed or non-empty values return HTTP 400.
+Submission tags are not retained. WES submissions use the same admission limit
+and HTTP 503 capacity refusal as `/runs`.
 
 ## How a request is served
 

@@ -34,6 +34,17 @@ if MAX_LOG_BYTES < 1:
 _ERROR_IN_RULE = re.compile(r"^Error in rule ([A-Za-z_][A-Za-z0-9_]*):", re.M)
 
 
+class _LogTail(str):
+    """A text tail carrying its omitted-byte count without parsing log content."""
+
+    def __new__(cls, body, dropped):
+        marker = f"[... {dropped} earlier bytes dropped ...]\n" if dropped else ""
+        value = super().__new__(cls, marker + body)
+        value._dropped = dropped
+        value._body_offset = len(marker)
+        return value
+
+
 def clamp(text, limit=None):
     """Keep the last `limit` bytes, and say so where it was cut.
 
@@ -45,14 +56,16 @@ def clamp(text, limit=None):
         raise ValueError("log limit must be positive")
     if text is None:
         return ""
-    encoded = text.encode("utf-8")
+    dropped = text._dropped if isinstance(text, _LogTail) else 0
+    body = text[text._body_offset:] if isinstance(text, _LogTail) else text
+    encoded = body.encode("utf-8")
     if len(encoded) <= limit:
         return text
     # A byte boundary can land inside a UTF-8 character. Drop that partial
     # character and count its bytes among those omitted.
     tail = encoded[-limit:].decode("utf-8", errors="ignore")
-    dropped = len(encoded) - len(tail.encode("utf-8"))
-    return f"[... {dropped} earlier bytes dropped ...]\n" + tail
+    dropped += len(encoded) - len(tail.encode("utf-8"))
+    return _LogTail(tail, dropped)
 
 
 def make_step_log_names(count):
@@ -208,10 +221,9 @@ class TailBuffer:
     it was truncated, because a log that starts mid-sentence with no explanation
     reads like a tool that produced nonsense.
 
-    One line longer than the whole budget is truncated to its own tail. That is
-    not a contrived case: a tool emitting no newline -- a progress bar redrawing
-    with \r, or binary on stdout -- arrives as a single line of whatever size,
-    and a trim that stopped at the last line left the bound meaningless.
+    One line longer than the whole budget is truncated to its own tail. A stream
+    with no newline can arrive as one large line; this bounds its retained tail,
+    not the temporary allocation needed to read that line.
 
     Not thread-safe on its own. Callers that share one hold their own lock.
     """
@@ -223,6 +235,7 @@ class TailBuffer:
         self._max = MAX_LOG_BYTES if max_bytes is None else max_bytes
 
     def append(self, line):
+        line = line.encode("utf-8")
         if len(line) > self._max:
             self._dropped += len(line) - self._max
             line = line[-self._max:]
@@ -234,10 +247,10 @@ class TailBuffer:
             self._dropped += len(oldest)
 
     def text(self):
-        body = "".join(self._lines)
-        if not self._dropped:
-            return body
-        return f"[... {self._dropped} earlier bytes dropped ...]\n" + body
+        raw = b"".join(self._lines)
+        body = raw.decode("utf-8", errors="ignore")
+        dropped = self._dropped + len(raw) - len(body.encode("utf-8"))
+        return _LogTail(body, dropped)
 
 
 class LiveLog:
@@ -260,8 +273,8 @@ class LiveLog:
     of joining too, which would otherwise grow with the log.
 
     What this produces is a PARTIAL log. The authoritative one is recorded when
-    the process exits, from the runner's complete capture, so anything trimmed
-    or still buffered here costs nothing in the end.
+    the process exits, from the runner's retained tails. It replaces any pending
+    live snapshot, but output already discarded by the runner stays discarded.
     """
 
     def __init__(self, on_flush=None, every_seconds=0.5, max_bytes=None):

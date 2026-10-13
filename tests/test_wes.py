@@ -11,10 +11,12 @@ is better than that, and service-info exists precisely so a client can find out
 before it commits.
 """
 
+import asyncio
 import json
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -42,6 +44,7 @@ from fastapi.testclient import TestClient
 import main
 import wes
 from runs import RunState, RunStore
+from test_async_runs import service, WORKFLOW, _bare_request, _poll
 
 
 @pytest.fixture
@@ -66,9 +69,12 @@ def test_service_info_carries_the_wes_version_and_shape(client):
     assert body["type"] == {"group": "org.ga4gh", "artifact": "wes",
                             "version": wes.WES_VERSION}
     assert wes.WES_VERSION in body["supported_wes_versions"]
-    for required in ("id", "name", "system_state_counts",
+    for required in ("id", "name", "version", "system_state_counts",
                      "supported_filesystem_protocols", "workflow_engine_versions"):
         assert required in body, f"service-info is missing {required}"
+    assert body["version"] == main.app.version
+    assert body["workflow_engine_versions"]["snakemake"] == \
+        {"workflow_engine_version": [wes.importlib.metadata.version("snakemake")]}
 
 
 def test_service_info_says_where_the_standard_surface_stops(client):
@@ -171,6 +177,15 @@ def test_run_log_does_not_invent_fields_it_does_not_know():
     assert body["outputs"] == {}
     assert body["task_logs"] == []
     assert "exit_code" not in body["run_log"]
+    assert "request" not in body
+
+
+def test_run_log_keeps_an_explicit_request():
+    store = RunStore()
+    run = store.create()
+    request = {"workflow_type": "BIOCHEF", "workflow_type_version": "1",
+               "workflow_url": "workflow.json"}
+    assert wes.run_log(store.get(run.run_id), request)["request"] == request
 
 
 def test_a_failure_reason_reaches_somewhere_a_client_looks():
@@ -180,7 +195,18 @@ def test_a_failure_reason_reaches_somewhere_a_client_looks():
     store.advance(run.run_id, RunState.SYSTEM_ERROR, error="the disk went away")
     body = wes.run_log(store.get(run.run_id))
     assert body["state"] == "SYSTEM_ERROR"
-    assert "the disk went away" in body["run_log"]["stderr"]
+    assert body["run_log"]["system_logs"] == ["the disk went away"]
+    assert "stderr" not in body["run_log"]
+
+
+def test_run_log_serializes_non_string_errors_as_text():
+    run = SimpleNamespace(
+        run_id="test-run", state=RunState.SYSTEM_ERROR, outputs=None,
+        step_status={}, error={"z": 1, "message": "disk unavailable"},
+    )
+    body = wes.run_log(run)
+    assert json.loads(body["run_log"]["system_logs"][0]) == run.error
+    assert "stderr" not in body["run_log"]
 
 
 def test_the_run_list_terminates_for_a_paging_client():
@@ -243,3 +269,107 @@ def test_the_bespoke_endpoints_are_still_there(client):
     assert "/runs" in paths
     assert "/runs/{run_id}" in paths
     assert "/convert" in paths
+
+
+@pytest.fixture
+def staging(tmp_path, monkeypatch):
+    directory = tmp_path / "uploads"
+    directory.mkdir()
+    monkeypatch.setattr(main.tempfile, "tempdir", str(directory))
+    return directory
+
+
+def _submit_wes(client, workflow_url="workflow.json", params="{}"):
+    return client.post(
+        f"{wes.BASE}/runs",
+        data={"workflow_type": "BIOCHEF", "workflow_url": workflow_url,
+              "workflow_params": params},
+        files=[("workflow_attachment", ("workflow.json", WORKFLOW)),
+               ("workflow_attachment", ("input-1-out", b"\x00\xffinput"))],
+    )
+
+
+@pytest.mark.parametrize("keep_workspace", [False, True])
+def test_wes_submission_cleans_staging_and_shares_outputs(
+    service, staging, monkeypatch, keep_workspace
+):
+    monkeypatch.setattr(main, "KEEP_WORKSPACE", keep_workspace)
+    runner = main.run_snakemake
+
+    def check_input(ws, **kwargs):
+        assert (Path(ws.path) / "input-1-out").read_bytes() == b"\x00\xffinput"
+        return runner(ws, **kwargs)
+
+    monkeypatch.setattr(main, "run_snakemake", check_input)
+    with TestClient(main.app) as client:
+        response = _submit_wes(client)
+        assert response.status_code == 200, response.text
+        run_id = response.json()["run_id"]
+        run = _poll(client, run_id)
+        assert run["state"] == "COMPLETE", run
+        assert client.get(f"{wes.BASE}/runs/{run_id}").json()["outputs"] == run["outputs"]
+    assert list(staging.iterdir()) == []
+
+
+def test_wes_missing_workflow_cleans_staging_and_releases_admission(service, staging):
+    with TestClient(main.app) as client:
+        assert _submit_wes(client, workflow_url="missing.json").status_code == 400
+    assert service.all() == []
+    assert list(staging.iterdir()) == []
+
+
+def test_wes_capacity_refusal_happens_before_staging(service, staging, monkeypatch):
+    store = RunStore(max_runs=1)
+    store.create()
+    monkeypatch.setattr(main, "RUNS", store)
+    with TestClient(main.app) as client:
+        response = _submit_wes(client)
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "1"
+    assert len(store.all()) == 1
+    assert list(staging.iterdir()) == []
+
+
+def test_wes_audit_refusal_happens_before_staging(service, staging, monkeypatch):
+    import audit
+
+    def unavailable(event):
+        raise audit.AuditError("audit unavailable")
+
+    monkeypatch.setattr(audit, "record", unavailable)
+    with TestClient(main.app, raise_server_exceptions=False) as client:
+        assert _submit_wes(client).status_code == 500
+    assert service.all() == []
+    assert list(staging.iterdir()) == []
+
+
+@pytest.mark.parametrize("params", ["not-json", "[]", "null", '{"init": 9}'])
+def test_wes_rejects_unsupported_params_before_admission(service, staging, params):
+    with TestClient(main.app) as client:
+        response = _submit_wes(client, params=params)
+    assert response.status_code == 400
+    assert "workflow_params" in response.json()["detail"]
+    assert service.all() == []
+    assert list(staging.iterdir()) == []
+
+
+@pytest.mark.parametrize("failure", [OSError("upload interrupted"),
+                                      asyncio.CancelledError()])
+def test_wes_interrupted_copy_cleans_partial_file(service, staging, failure):
+    class InterruptedUpload:
+        filename = "workflow.json"
+        calls = 0
+
+        async def read(self, size):
+            self.calls += 1
+            if self.calls == 1:
+                return b"partial upload"
+            raise failure
+
+    with pytest.raises(type(failure)):
+        asyncio.run(main.wes_run_workflow(
+            _bare_request(), "BIOCHEF", "workflow.json", "{}", "1",
+            [InterruptedUpload()], "{}",
+        ))
+    assert service.all() == []
+    assert list(staging.iterdir()) == []

@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+import copy
 import fcntl
 import hashlib
 import json
@@ -84,6 +85,15 @@ class Node:
     inputs: dict[str, IO] = field(default_factory=dict)
     outputs: dict[str, IO] = field(default_factory=dict)
     parameters: dict[str, Param] = field(default_factory=dict)
+    provenance: dict = field(default_factory=dict)
+
+
+class ToolBundle(dict):
+    """A bundle plus the evidence snapshot observed when it was fetched."""
+
+    def __init__(self, bundle, provenance):
+        super().__init__(bundle)
+        self.provenance = copy.deepcopy(provenance)
 
 
 @dataclass
@@ -371,7 +381,7 @@ def fetch_tool(tool_id, repo):
         # fetcher can read one without the other.
         tools[tool_id] = bundle
         provenance[tool_id] = evidence
-        return bundle
+        return ToolBundle(bundle, evidence)
 
 def _bundle_evidence(directory, manifest, target):
     """What this bundle is, in the terms the registry stated it.
@@ -447,14 +457,48 @@ def materialise_tools(workflow, ws):
     returned early and skipped the copy; splitting the cache out lost that and
     nothing replaced it.
     """
-    placed = set()
+    by_name = {}
     for node in workflow.nodes:
         name = check_name(node.bin)
-        if name in placed:
+        by_name.setdefault(name, []).append(node)
+
+    for name, nodes in by_name.items():
+        tool_id = check_name(nodes[0].id.split("-")[0])
+        source = os.path.join(TOOL_CACHE, tool_id, name)
+        with _fetch_lock(tool_id):
+            ws.place_executable(source, name)
+
+        evidenced_nodes = [node for node in nodes
+                           if getattr(node, "provenance", {})]
+        if not evidenced_nodes:
             continue
-        source = os.path.join(TOOL_CACHE, check_name(node.id.split("-")[0]), name)
-        ws.place_executable(source, name)
-        placed.add(name)
+
+        digest = hashlib.sha256()
+        try:
+            with ws.open_read(name, regular_only=True) as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        except (OSError, ValueError) as error:
+            raise ToolIntegrityError(
+                f"staged tool {name!r} could not be read as a regular file"
+            ) from error
+        actual = "sha256:" + digest.hexdigest()
+
+        for node in evidenced_nodes:
+            evidence = node.provenance
+            expected = (evidence.get("artifacts") or {}).get(name)
+            if not expected:
+                raise ToolIntegrityError(
+                    f"tool {node.id!r} has no registry digest for executable {name!r}"
+                )
+            if expected != actual:
+                raise ToolIntegrityError(
+                    f"tool {node.id!r} executable {name!r} has digest {actual}, "
+                    f"expected {expected}"
+                )
 
 
 def rule_name_for(node_id):
@@ -481,7 +525,11 @@ def parse_biochef_workflow(biochef_workflow):
 
         tool_info = fetch_tool(node_id, node["data"]["repo"])
 
-        new_node: Node = Node(id=node_id, bin=tool_info["bin"])
+        new_node: Node = Node(
+            id=node_id,
+            bin=tool_info["bin"],
+            provenance=copy.deepcopy(getattr(tool_info, "provenance", {})),
+        )
 
         connections = [e for e in edge_list if node_id in (e["target"], e["source"])]
         for connection in connections:

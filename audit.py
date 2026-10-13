@@ -85,7 +85,13 @@ def record(event, **fields):
         # another writer can interleave into.
         handle = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
-            os.write(handle, line.encode("utf-8"))
+            payload = line.encode("utf-8")
+            written = os.write(handle, payload)
+            if written != len(payload):
+                raise AuditError(
+                    f"the audit trail at {destination} was only partially written "
+                    f"({written} of {len(payload)} bytes)"
+                )
         finally:
             os.close(handle)
     except OSError as exc:

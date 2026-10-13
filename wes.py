@@ -24,6 +24,9 @@ message saying what IS accepted. A client that speaks WES can read
 whole purpose of `service-info`.
 """
 
+import importlib.metadata
+import json
+
 BASE = "/ga4gh/wes/v1"
 
 # The specification this maps onto. Not a claim of full conformance -- see
@@ -43,6 +46,9 @@ UNIMPLEMENTED = (
     "fetched",
     "run listing is not paginated and ignores page_size and page_token",
     "task_logs carries one entry per workflow step, without per-task commands",
+    "tool parameters must be in the workflow JSON; non-empty workflow_params "
+    "are refused",
+    "submission tags are not retained",
 )
 
 
@@ -112,7 +118,7 @@ def select_workflow(workflow_url, attachments):
     return workflow, inputs
 
 
-def service_info(state_counts, auth_provider=None):
+def service_info(state_counts, auth_provider=None, service_version="0.1.0"):
     """What this server is and is not.
 
     `system_state_counts` is taken from the live store rather than remembered,
@@ -127,6 +133,7 @@ def service_info(state_counts, auth_provider=None):
             "its own API."
         ),
         "type": {"group": "org.ga4gh", "artifact": "wes", "version": WES_VERSION},
+        "version": service_version,
         "workflow_type_versions": {
             WORKFLOW_TYPE: {"workflow_type_version": [WORKFLOW_TYPE_VERSION]}
         },
@@ -134,7 +141,11 @@ def service_info(state_counts, auth_provider=None):
         # Attachments only. The service does not fetch inputs from anywhere the
         # caller names; see select_workflow.
         "supported_filesystem_protocols": ["file"],
-        "workflow_engine_versions": {"snakemake": "9"},
+        "workflow_engine_versions": {
+            "snakemake": {
+                "workflow_engine_version": [importlib.metadata.version("snakemake")]
+            }
+        },
         "default_workflow_engine_parameters": [],
         "system_state_counts": dict(state_counts),
         "auth_instructions_url": "",
@@ -160,21 +171,23 @@ def run_log(run, request=None):
     """
     body = {
         "run_id": run.run_id,
-        "request": request if request is not None else {},
         "state": run.state.value,
         "run_log": {"name": run.run_id},
         "task_logs": [],
         "outputs": run.outputs if run.outputs is not None else {},
     }
+    if request is not None:
+        body["request"] = request
 
     step_status = getattr(run, "step_status", None) or {}
     for name in sorted(step_status):
         body["task_logs"].append({"name": name, "state": step_status[name]})
 
     if run.error is not None:
-        # WES has nowhere for a failure reason on the run itself, so it goes
-        # where a client will actually look for it.
-        body["run_log"]["stderr"] = run.error
+        error = run.error
+        if not isinstance(error, str):
+            error = json.dumps(error, sort_keys=True, separators=(",", ":"))
+        body["run_log"]["system_logs"] = [error]
     return body
 
 

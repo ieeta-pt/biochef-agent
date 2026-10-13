@@ -207,8 +207,8 @@ ENABLED = [
 ]
 """Which sources a deployment permits, most restrictive first in the docs.
 
-Defaults to `upload` alone, so nothing changes for an existing deployment and
-localpath is something an operator turns on knowingly.
+Defaults to `upload,spooled,handedover`: `upload` handles bytes directly as the current status expects, `spooled` supports `/convert` and `handedover` keeps uploaded files available for `/runs` after the request ends. localpath is something an operator
+turns on knowingly.
 """
 
 
