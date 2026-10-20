@@ -1,13 +1,23 @@
 from fastapi import FastAPI
+import copy
+import fcntl
+import hashlib
 import json
 import oras.client
 import os
 import shutil
 import stat
+import threading
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 
 from dotenv import load_dotenv
+
+import signing
+import evidence_verification
+from workspace import check_name
 
 load_dotenv()
 
@@ -75,6 +85,15 @@ class Node:
     inputs: dict[str, IO] = field(default_factory=dict)
     outputs: dict[str, IO] = field(default_factory=dict)
     parameters: dict[str, Param] = field(default_factory=dict)
+    provenance: dict = field(default_factory=dict)
+
+
+class ToolBundle(dict):
+    """A bundle plus the evidence snapshot observed when it was fetched."""
+
+    def __init__(self, bundle, provenance):
+        super().__init__(bundle)
+        self.provenance = copy.deepcopy(provenance)
 
 
 @dataclass
@@ -82,24 +101,413 @@ class Workflow:
     nodes: list[Node] = field(default_factory=list)
 
 
+TOOL_CACHE = os.path.realpath(os.getenv("BIOCHEF_TOOL_CACHE", "tool-cache"))
+"""Where pulled bundles live, shared by every run.
+
+Each run has its own workspace, while downloaded bundles can be reused. On
+every fetch, the cached files are checked against the registry manifest; a
+matching entry avoids another pull. materialise_tools copies the executable
+into whichever run workspace needs it.
+"""
+
 tools = {}
+
+provenance = {}
+"""What each pulled bundle was, kept for the run manifest (#18)."""
+
+_fetch_locks = {}
+_fetch_locks_guard = threading.Lock()
+
+
+@contextmanager
+def _fetch_lock(tool_id):
+    """Lock one local cache entry across cooperating threads and processes."""
+    with _fetch_locks_guard:
+        thread_lock = _fetch_locks.setdefault(tool_id, threading.Lock())
+
+    with thread_lock:
+        os.makedirs(TOOL_CACHE, exist_ok=True)
+        # Keep this file: recreating it could let processes lock different inodes.
+        lock_path = os.path.join(TOOL_CACHE, f".{tool_id}.lock")
+        lock_fd = os.open(
+            lock_path,
+            os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+
+class ToolIntegrityError(Exception):
+    """The bytes that arrived are not the bytes the registry vouched for."""
+
+
+# Spelled out rather than imported from oras.defaults, because every test module
+# here replaces the oras package with a stub so nothing reaches the registry, and
+# importing a submodule of that stub fails. These two values are part of the OCI
+# specification rather than of oras.
+_ANNOTATION_TITLE = "org.opencontainers.image.title"
+_DIR_MEDIA_TYPE = "application/vnd.oci.image.layer.v1.tar+gzip"
+
+
+def _contained_path(root, name, target):
+    """Where a manifest title lands, refusing anything that escapes `root`.
+
+    check_name is the wrong instrument here and was the first thing tried. It
+    admits one plain file name, so it refused "bin/tool" and "lib/libz.so.1" --
+    titles oras itself accepts and sanitises. A bundle laid out in
+    subdirectories would have been rejected as an integrity failure.
+
+    Containment is the property that actually matters: the manifest comes from
+    the registry, the client chooses the registry, and a title of
+    "../../etc/cron.d/x" must not decide which path gets hashed. Resolving and
+    checking the prefix allows nesting and still refuses escape.
+    """
+    resolved = os.path.realpath(os.path.join(root, name))
+    base = os.path.realpath(root)
+    if resolved != base and not resolved.startswith(base + os.sep):
+        raise ToolIntegrityError(
+            f"{target}: the manifest names {name!r}, which resolves outside the "
+            f"directory the pull was staged in"
+        )
+    return resolved
+
+
+def _sha256_of(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def cache_matches(directory, manifest, target):
+    """Whether what is on disk already is what the manifest describes.
+
+    Silent, unlike verify_against_manifest: a mismatch here is a reason to pull
+    again, not a reason to fail. The tag may simply have moved to a new version,
+    which is the ordinary case and not an incident.
+    """
+    if not os.path.exists(os.path.join(directory, "bundle.json")):
+        return False
+    try:
+        verify_against_manifest(target, directory, manifest=manifest)
+    except ToolIntegrityError:
+        return False
+    return True
+
+
+def verify_against_manifest(target, staging, manifest=None):
+    """Check every staged file against the digest the manifest claims for it.
+
+    oras never does this. It builds the blob URL from the digest and streams the
+    response to a file, so the digest names what was asked for and never what
+    arrived (#9). What arrives is then made executable and run.
+
+    A layer's on-disk file IS the blob for ordinary layers, so hashing the staged
+    file is the comparison the specification intends. A directory layer is
+    different: oras downloads it to a temporary archive and extracts it, so
+    nothing on disk is the blob and the digest cannot be checked after the fact.
+    That case is refused rather than skipped -- an unverifiable artifact must not
+    be quietly treated as a verified one, which is the failure this whole issue
+    is about.
+    """
+    if manifest is None:
+        manifest = client.get_manifest(client.get_container(target))
+    layers = manifest.get("layers") or []
+    if not layers:
+        raise ToolIntegrityError(
+            f"{target} has no layers in its manifest, so there is nothing to "
+            f"verify the pulled files against"
+        )
+
+    for layer in layers:
+        digest = layer.get("digest")
+        if not digest:
+            raise ToolIntegrityError(f"{target}: a layer declares no digest")
+
+        if layer.get("mediaType") == _DIR_MEDIA_TYPE:
+            raise ToolIntegrityError(
+                f"{target}: layer {digest} is a directory archive, which is "
+                f"extracted on the way in, so what lands on disk is not the "
+                f"blob and its digest cannot be checked. Refusing rather than "
+                f"treating it as verified."
+            )
+
+        name = (layer.get("annotations") or {}).get(_ANNOTATION_TITLE) or digest
+        path = _contained_path(staging, name, target)
+        if not os.path.exists(path):
+            raise ToolIntegrityError(
+                f"{target}: the manifest declares {name!r} but the pull did not "
+                f"produce it"
+            )
+
+        actual = _sha256_of(path)
+        if actual != digest:
+            raise ToolIntegrityError(
+                f"{target}: {name!r} does not match the manifest. "
+                f"expected {digest}, got {actual}. Either the bytes are not the "
+                f"ones the registry vouched for, or the tag moved between the "
+                f"pull and this check -- an ordinary push to the same tag looks "
+                f"identical from here."
+            )
+
+
+# Taken from oras rather than restated: a manifest media type oras would accept
+# must not be refused here just because this file has an older list.
+try:
+    import oras.defaults
+    _MANIFEST_TYPES = ", ".join(oras.defaults.default_manifest_accepted_media_types)
+except Exception:  # pragma: no cover - a stubbed oras in the test suite
+    _MANIFEST_TYPES = "application/vnd.oci.image.manifest.v1+json"
+
+
+def fetch_manifest(target):
+    """The manifest and the digest that names it, from a single fetch, along with the raw bytes.
+
+    oras parses the response and throws it away, so the manifest digest -- which
+    is defined as the hash of the exact bytes served, not of anything we could
+    re-serialise -- is not recoverable from what get_manifest returns. Signature
+    verification needs that digest, and needs it to name the same artifact the
+    blobs are pulled from, so the request happens here and both are kept.
+
+    The digest is computed from the bytes rather than taken from the registry's
+    Docker-Content-Digest header. The header is advisory and comes from the same
+    party as the manifest; if both are present and disagree, that is refused,
+    because a registry answering one thing and labelling it another is not a
+    situation to pick a winner in.
+
+    Falls back to oras's own accessor for any client that cannot do a raw
+    request, returning no digest -- which strict mode refuses, so the fallback
+    cannot quietly become a way to skip verification.
+    """
+    container = client.get_container(target)
+    if not (hasattr(client, "do_request") and hasattr(client, "prefix")):
+        return client.get_manifest(container), None, None
+
+    url = f"{client.prefix}://{container.manifest_url()}"
+    response = client.do_request(url, "GET", headers={"Accept": _MANIFEST_TYPES})
+    if response.status_code != 200:
+        raise ToolIntegrityError(
+            f"{target}: the registry answered {response.status_code} for its manifest"
+        )
+
+    body = response.content
+    digest = "sha256:" + hashlib.sha256(body).hexdigest()
+    advertised = response.headers.get("Docker-Content-Digest")
+    if advertised and advertised != digest:
+        raise ToolIntegrityError(
+            f"{target}: the registry served a manifest whose digest is {digest} "
+            f"but labelled it {advertised}"
+        )
+    requested = getattr(container, "digest", None)
+    if requested and requested != digest:
+        raise ToolIntegrityError(
+            f"{target}: the registry served manifest {digest}, but the requested "
+            f"immutable reference names {requested}"
+        )
+    return json.loads(body), digest, body
+
+
 def fetch_tool(tool_id, repo):
-    tool_id = tool_id.split("-")[0]
+    """Pull a bundle into the shared cache and return it.
 
-    if tool_id in tools:
-        return tools[tool_id]
+    The signature is unchanged on purpose: parse_biochef_workflow calls this,
+    and threading a workspace through would make the parse know about run
+    directories for no reason. It no longer copies or chmods anything -- placing
+    the binary is a separate pass that runs once the workspace exists.
+    """
+    tool_id = check_name(tool_id.split("-")[0])
 
-    client.pull(target=f"{REGISTRY_URL}/{repo}", outdir=f"{tool_id}")
-    with open(f"{tool_id}/bundle.json", "r") as f:
-        bundle = json.load(f)
+    outdir = os.path.join(TOOL_CACHE, tool_id)
+    target = f"{REGISTRY_URL}/{repo}"
+    current_mode = signing.mode()
+    if current_mode == signing.STRICT and not signing.is_immutable(target):
+        raise signing.SignatureError(
+            f"{target}: strict verification requires the caller to select an "
+            "immutable OCI manifest digest"
+        )
 
-    tool_bin = bundle["bin"]
-    shutil.copyfile(f"{tool_id}/{tool_bin}", tool_bin)
-    os.chmod(tool_bin, os.stat(tool_bin).st_mode |
-             stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    with _fetch_lock(tool_id):
+        manifest, manifest_digest, raw_manifest = fetch_manifest(target)
+        try:
+            subject = signing.immutable_reference(target, manifest_digest)
+        except signing.SignatureError:
+            subject = None
 
-    tools[tool_id] = bundle
-    return bundle
+        signing.check(target, manifest_digest, log=print)
+        evidence = evidence_verification.check(
+            subject,
+            raw_manifest,
+            client,
+            fetch_manifest,
+            log=print,
+        )
+
+        pull_target = subject if current_mode != signing.OFF and subject else target
+        if not cache_matches(outdir, manifest, pull_target):
+            staging = f"{outdir}.part.{uuid.uuid4().hex}"
+            os.makedirs(staging)
+            try:
+                client.pull(target=pull_target, outdir=staging)
+                verify_against_manifest(pull_target, staging, manifest=manifest)
+                evidence_verification.verify_pulled(
+                    staging, subject, tool_id, evidence, log=print
+                )
+                shutil.rmtree(outdir, ignore_errors=True)
+                os.replace(staging, outdir)
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+        else:
+            evidence_verification.verify_pulled(
+                outdir, subject, tool_id, evidence, log=print
+            )
+
+        with open(os.path.join(outdir, "bundle.json"), "r") as f:
+            bundle = json.load(f)
+
+        # Kept for the run manifest (#18). The registry publishes three
+        # artifacts per bundle and verify_against_manifest has just hashed all
+        # of them against the manifest -- so their identity is established here
+        # and was, until now, thrown away.
+        evidence = _bundle_evidence(outdir, manifest, target)
+
+        # Inside the lock, which is where master moved them: the cache entry and
+        # what this process believes about it are set together or a second
+        # fetcher can read one without the other.
+        tools[tool_id] = bundle
+        provenance[tool_id] = evidence
+        return ToolBundle(bundle, evidence)
+
+def _bundle_evidence(directory, manifest, target):
+    """What this bundle is, in the terms the registry stated it.
+
+    Digests come from the MANIFEST rather than from hashing the files again.
+    They are the same numbers -- verify_against_manifest has just checked that --
+    but taking them from the manifest records what the registry asserted, which
+    is the thing a reader of the manifest would want to compare against.
+    """
+    artifacts = {}
+    for layer in manifest.get("layers") or []:
+        title = (layer.get("annotations") or {}).get(_ANNOTATION_TITLE)
+        if title and layer.get("digest"):
+            artifacts[title] = layer["digest"]
+
+    evidence = {"target": target, "artifacts": artifacts}
+
+    # The hub's own build evidence, if this bundle carries it. Referenced by
+    # digest AND summarised, so a manifest is readable without the registry
+    # while still saying exactly which document it means.
+    build = os.path.join(directory, "build-evidence.json")
+    if os.path.exists(build):
+        try:
+            with open(build, "r") as handle:
+                document = json.load(handle)
+        except (OSError, ValueError):
+            return evidence
+        evidence["build_evidence"] = {
+            "schema": document.get("schema"),
+            "generated_at": document.get("generated_at"),
+            "hub": document.get("hub"),
+            "recipe": {
+                key: (document.get("recipe") or {}).get(key)
+                for key in ("id", "name", "version", "digest")
+            },
+            "operation": document.get("operation"),
+        }
+    return evidence
+
+
+def expected_uploads(workflow):
+    """The files the client has to supply, derived from the workflow itself.
+
+    Every intermediate file is named for the edge that carries it, so the set a
+    run consumes and the set it produces are both known before anything runs.
+    What is consumed but not produced by any node is what has to arrive as an
+    upload; everything else the run creates for itself.
+
+    This is the second of the two gates described in workspace.py. check_name
+    decides whether a name is a usable file name at all; this decides whether it
+    is one this run has any business receiving. Each catches what the other
+    cannot -- "samtools" is a perfectly good file name, and an output slot is a
+    name the workflow does declare.
+    """
+    produced = {name for node in workflow.nodes for name in node.outputs}
+    consumed = {name for node in workflow.nodes for name in node.inputs}
+    return consumed - produced
+
+
+def materialise_tools(workflow, ws):
+    """Put a copy of each tool's binary into this run's workspace.
+
+    Separate from fetch_tool so the cache is pulled once and every run still
+    gets its own copy. Done before the uploads, so that an upload named after a
+    binary is refused by O_EXCL rather than silently replacing it.
+
+    Once per BINARY, not once per node. Several operations routinely share one
+    executable -- 80 of the 176 in the catalogue do, including all 15 samtools
+    operations and all 20 seqtk ones -- so a workflow as ordinary as
+    "samtools sort" into "samtools index" has two nodes naming the same binary.
+    Placing it per node made the second one fail O_EXCL with FileExistsError and
+    the whole request 500. The old fetch_tool hid this behind its memo, which
+    returned early and skipped the copy; splitting the cache out lost that and
+    nothing replaced it.
+    """
+    by_name = {}
+    for node in workflow.nodes:
+        name = check_name(node.bin)
+        by_name.setdefault(name, []).append(node)
+
+    for name, nodes in by_name.items():
+        tool_id = check_name(nodes[0].id.split("-")[0])
+        source = os.path.join(TOOL_CACHE, tool_id, name)
+        with _fetch_lock(tool_id):
+            ws.place_executable(source, name)
+
+        evidenced_nodes = [node for node in nodes
+                           if getattr(node, "provenance", {})]
+        if not evidenced_nodes:
+            continue
+
+        digest = hashlib.sha256()
+        try:
+            with ws.open_read(name, regular_only=True) as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        except (OSError, ValueError) as error:
+            raise ToolIntegrityError(
+                f"staged tool {name!r} could not be read as a regular file"
+            ) from error
+        actual = "sha256:" + digest.hexdigest()
+
+        for node in evidenced_nodes:
+            evidence = node.provenance
+            expected = (evidence.get("artifacts") or {}).get(name)
+            if not expected:
+                raise ToolIntegrityError(
+                    f"tool {node.id!r} has no registry digest for executable {name!r}"
+                )
+            if expected != actual:
+                raise ToolIntegrityError(
+                    f"tool {node.id!r} executable {name!r} has digest {actual}, "
+                    f"expected {expected}"
+                )
+
+
+def rule_name_for(node_id):
+    """The snakemake rule name a node is emitted as.
+
+    Snakemake's diagnostic error headings use this name. The separate per-rule
+    log files are indexed by node id and do not depend on parsing a heading.
+    """
+    return node_id.replace(".", "_").replace("-", "_")
 
 
 def get_node_data(node_id, node_list):
@@ -117,7 +525,11 @@ def parse_biochef_workflow(biochef_workflow):
 
         tool_info = fetch_tool(node_id, node["data"]["repo"])
 
-        new_node: Node = Node(id=node_id, bin=tool_info["bin"])
+        new_node: Node = Node(
+            id=node_id,
+            bin=tool_info["bin"],
+            provenance=copy.deepcopy(getattr(tool_info, "provenance", {})),
+        )
 
         connections = [e for e in edge_list if node_id in (e["target"], e["source"])]
         for connection in connections:
@@ -163,7 +575,13 @@ def parse_biochef_workflow(biochef_workflow):
     return new_workflow
 
 
-def convert_to_snakemake(workflow: Workflow):
+def convert_to_snakemake(workflow: Workflow, step_logs=None):
+    if step_logs is not None and len(step_logs) != len(workflow.nodes):
+        raise ValueError("one pair of log names is required for each node")
+    if step_logs is not None:
+        names = [check_name(name) for pair in step_logs for name in pair]
+        if len(set(names)) != len(names):
+            raise ValueError("step log names must be distinct")
     result = []
     result.append("rule all:\n    input:")
 
@@ -171,12 +589,9 @@ def convert_to_snakemake(workflow: Workflow):
         for output in node.outputs.values():
             result.append(f"        \"{output.file}\",")
 
-    for node in workflow.nodes:
+    for index, node in enumerate(workflow.nodes):
         # print(node)
-        # Snakemake rule names must be Python identifiers, and a node id is
-        # "{operation.id}-{timestamp}", so both separators have to go.
-        rule_name = node.id.replace(".", "_").replace("-", "_")
-        result.append(f"rule {rule_name}:")
+        result.append(f"rule {rule_name_for(node.id)}:")
         cmd = [f"./{node.bin}"]
         extra_cms = []
 
@@ -228,21 +643,27 @@ def convert_to_snakemake(workflow: Workflow):
                     extra_cms.append(f"        cp {output.hardcoded_file} {{output.{output_var}}}")
             i += 1
 
+        if step_logs is not None:
+            stdout_name, stderr_name = step_logs[index]
+            result.append(
+                f"    log: stdout={json.dumps(check_name(stdout_name))}, "
+                f"stderr={json.dumps(check_name(stderr_name))}"
+            )
         cmd.extend(trailing)
         cmd.extend(redirects)
 
-        # Assembled outside the f-string. Nesting the same quote inside one is
-        # only legal from Python 3.12 (PEP 701), and relying on that here made
-        # the whole module fail to import on 3.11 and earlier -- for a line that
-        # reads no better either way.
         command_line = " ".join(cmd)
 
-        result.append("    shell:")
-        result.append('        """')
+        result.append(f"    shell:")
+        result.append(f"        \"\"\"")
+        if step_logs is not None:
+            result.append("        (")
         result.append(f"        {command_line}")
         for command in extra_cms:
             result.append(command)
-        result.append('        """')
+        if step_logs is not None:
+            result.append("        ) > {log.stdout} 2> {log.stderr}")
+        result.append(f"        \"\"\"")
 
     return "\n".join(result)
 
