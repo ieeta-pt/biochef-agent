@@ -513,3 +513,11 @@ The conventions those issues set, which any change here should follow:
 | `Biochef` | the editor, which produces the workflow JSON this service consumes |
 | `biochef-recipes` | one `biochef.yaml` per tool, declaring its operations and IO |
 | `biochef-hub` | validates recipes, builds them, and publishes bundles to the registry |
+
+### Converter intermediate document
+
+`BIOCHEF_WRITE_INTERMEDIATE` defaults to `false`. When enabled, the Agent
+writes and validates `intermediate.json` inside each run workspace before
+generating its Snakefile. Workspace retention follows `BIOCHEF_KEEP_WORKSPACE`.
+The document carries tool provenance and effective parameter values, which may
+be sensitive; it has the same local access boundary as the run workspace.

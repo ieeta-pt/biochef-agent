@@ -167,7 +167,10 @@ def perform_run(biochef_workflow: str, inputs, progress=None, on_start=None,
     ws = make_workspace(RUN_ROOT)
     try:
         workflow_dict = json.loads(biochef_workflow)
-        workflow = parse_biochef_workflow(workflow_dict)
+        workflow = through_intermediate(
+            parse_biochef_workflow(workflow_dict),
+            os.path.join(ws.path, INTERMEDIATE_FILENAME),
+        )
 
         # The tools go in first, so that an upload named after a binary is
         # refused by O_EXCL rather than quietly replacing what will be executed.

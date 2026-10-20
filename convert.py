@@ -10,8 +10,7 @@ import stat
 import threading
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from enum import Enum
+from intermediate import IO, IOMode, Node, Param, Workflow
 
 from dotenv import load_dotenv
 
@@ -38,54 +37,46 @@ client.login(
     password=REGISTRY_PASSWORD
 )
 
-class IOMode(Enum):
-    STDIN = "stdin"
-    STDOUT = "stdout"
-    FILE = "file"
+WRITE_INTERMEDIATE = os.getenv("BIOCHEF_WRITE_INTERMEDIATE", "false").lower() == "true"
+"""Feature flag for the intermediate artifact (#2).
+
+Off: the Snakefile is generated from the document held in memory, exactly as
+before. On: the document is written to intermediate.json, read back, validated
+against the schema, and the Snakefile is generated from that -- so the Snakefile
+becomes a function of a file on disk rather than of the request body. The two
+paths are asserted byte-identical over every operation in the catalogue by
+tests/test_intermediate_roundtrip.py, which is what makes turning it on safe.
+"""
+
+INTERMEDIATE_FILENAME = "intermediate.json"
 
 
-@dataclass
-class IO:
-    file: str = ""
+def write_intermediate(workflow: Workflow, path: str = INTERMEDIATE_FILENAME) -> str:
+    with open(path, "w") as f:
+        f.write(workflow.to_json())
+    return path
+
+
+def read_intermediate(path: str = INTERMEDIATE_FILENAME) -> Workflow:
+    """Read the document back, validating it on the way in.
+
+    A document that does not match the schema raises here rather than producing
+    a nonsense Snakefile further downstream.
     """
-    this is the file that the tools that are connected 
-    expect to have the input/output
+    with open(path) as f:
+        return Workflow.from_json(f.read())
+
+
+def through_intermediate(workflow: Workflow, path: str = INTERMEDIATE_FILENAME) -> Workflow:
+    """Round trip through the supplied file when enabled.
+
+    The executor supplies a path inside its run workspace. The default remains
+    for callers that explicitly control their working directory.
     """
-
-    mode: IOMode = None
-    """
-    the mode in which the input/output is received
-    """
-
-    hardcoded_file: str = ""
-    """
-    some tools have an hardcoded file that type write to
-    this file will then be copied to the actual file above when running the workflow
-    """
-
-    flag: str = ""
-    """
-    some tools receive input/output through a flag argument
-    """
-
-
-@dataclass
-class Param:
-    name: str = ""
-    value: str = ""
-    flag: str = ""
-
-
-@dataclass
-class Node:
-    """Information about each node of the workflow"""
-
-    id: str = ""
-    bin: str = ""
-    inputs: dict[str, IO] = field(default_factory=dict)
-    outputs: dict[str, IO] = field(default_factory=dict)
-    parameters: dict[str, Param] = field(default_factory=dict)
-    provenance: dict = field(default_factory=dict)
+    if not WRITE_INTERMEDIATE:
+        return workflow
+    write_intermediate(workflow, path)
+    return read_intermediate(path)
 
 
 class ToolBundle(dict):
@@ -94,11 +85,6 @@ class ToolBundle(dict):
     def __init__(self, bundle, provenance):
         super().__init__(bundle)
         self.provenance = copy.deepcopy(provenance)
-
-
-@dataclass
-class Workflow:
-    nodes: list[Node] = field(default_factory=list)
 
 
 TOOL_CACHE = os.path.realpath(os.getenv("BIOCHEF_TOOL_CACHE", "tool-cache"))
@@ -542,10 +528,10 @@ def parse_biochef_workflow(biochef_workflow):
 
             def build_io(info):
                 return IO(
-                    f"{_name}",
-                    IOMode(info.get("mode")),
-                    info.get("filename"),
-                    info.get("flag"),
+                    file=_name,
+                    mode=IOMode(info.get("mode")),
+                    hardcoded_file=info.get("filename"),
+                    flag=info.get("flag"),
                 )
 
             is_input_connection = node_id == target
@@ -565,7 +551,7 @@ def parse_biochef_workflow(biochef_workflow):
                 p for p in tool_info["parameters"] if p["name"] == param_key)
 
             new_param: Param = Param(
-                param_key, param["value"], param_info.get("flag")
+                name=param_key, value=param["value"], flag=param_info.get("flag")
             )
 
             new_node.parameters[param_key] = new_param
