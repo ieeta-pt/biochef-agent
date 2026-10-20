@@ -177,6 +177,12 @@
     "seqtk.trimfq": "sha256: e5373eb5fa5c747a",
     "ssw.align": "error: TypeError: sequence item 2: expected str instance, int found",
     "tn93.distance": "error: TypeError: sequence item 2: expected str instance, float found",
-    "viralconsensus.consensus": "sha256: 476d7b7de8e578a6"
+    "trimal.degap": "sha256: 842e1a904ac7f110",
+    "trimal.statal": "sha256: 0acbd429c5a16d0f",
+    "trimal.toclustal": "sha256: 91d3f318e7517628",
+    "trimal.tofasta": "sha256: a649ee29bf03b017",
+    "trimal.trim": "sha256: 87b92b1a640bcf00",
+    "viralconsensus.consensus": "sha256: 476d7b7de8e578a6",
+    "wgsim.simulate": "sha256: deee27f48d4aff50"
   }
 }
