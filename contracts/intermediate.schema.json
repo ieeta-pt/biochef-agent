@@ -92,6 +92,11 @@
           },
           "title": "Parameters",
           "type": "object"
+        },
+        "provenance": {
+          "additionalProperties": true,
+          "title": "Provenance",
+          "type": "object"
         }
       },
       "title": "Node",
