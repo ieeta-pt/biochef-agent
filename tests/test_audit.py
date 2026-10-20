@@ -328,7 +328,7 @@ def test_the_auth_middleware_keeps_the_identity_it_is_given():
     source = (REPO_ROOT / "auth.py").read_text()
     code = "\n".join(line.split("#", 1)[0] for line in source.splitlines())
     assert 'scope' in code and 'caller' in code
-    assert "self.provider.authenticate(Request(scope))" in code
+    assert "run_in_threadpool(self.provider.authenticate, Request(scope))" in code
     assert '"authenticated_by"' in code
 
 
