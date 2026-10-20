@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 
 import signing
 import evidence_verification
-from workspace import check_name
+from workspace import UnsafeName, check_name
 
 load_dotenv()
 
@@ -53,32 +53,59 @@ tests/test_intermediate_roundtrip.py, which is what makes turning it on safe.
 INTERMEDIATE_FILENAME = "intermediate.json"
 
 
-def write_intermediate(workflow: Workflow, path: str = INTERMEDIATE_FILENAME) -> str:
-    with open(path, "w") as f:
+class IntermediateMismatch(Exception):
+    """The intermediate document read back is not the one written."""
+
+
+def write_intermediate(workflow: Workflow, path: str) -> str:
+    """Write the document, as a new file only.
+
+    Exclusive and without following a symlink, like every file a run creates
+    in its workspace: nothing put at the path first, a file or a link to one
+    elsewhere, can stand in for the document or be written through.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as f:
         f.write(workflow.to_json())
     return path
 
 
-def read_intermediate(path: str = INTERMEDIATE_FILENAME) -> Workflow:
+def read_intermediate(path: str) -> Workflow:
     """Read the document back, validating it on the way in.
 
     A document that does not match the schema raises here rather than producing
-    a nonsense Snakefile further downstream.
+    a nonsense Snakefile further downstream. Only a regular file is read, and
+    not through a symlink.
     """
-    with open(path) as f:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise UnsafeName(f"{path!r} is not a regular file")
+    with os.fdopen(fd) as f:
         return Workflow.from_json(f.read())
 
 
-def through_intermediate(workflow: Workflow, path: str = INTERMEDIATE_FILENAME) -> Workflow:
+def through_intermediate(workflow: Workflow, path: str) -> Workflow:
     """Round trip through the supplied file when enabled.
 
-    The executor supplies a path inside its run workspace. The default remains
-    for callers that explicitly control their working directory.
+    The executor supplies a path inside its run workspace. There is no default:
+    a relative name resolves against the process's directory, which every run in
+    flight shares, so a caller that forgot the path would put concurrent runs'
+    documents in one place.
+
+    The copy read back must be the one written. The document carries each
+    node's registry evidence, which materialise_tools checks the executable
+    against and skips for a node without it, so a copy changed on disk could
+    switch that check off. It is compared as serialised, since the order of
+    inputs, outputs and parameters is the order of the command line.
     """
     if not WRITE_INTERMEDIATE:
         return workflow
     write_intermediate(workflow, path)
-    return read_intermediate(path)
+    reread = read_intermediate(path)
+    if reread.to_json() != workflow.to_json():
+        raise IntermediateMismatch(f"{path!r} read back differs from the document written")
+    return reread
 
 
 class ToolBundle(dict):

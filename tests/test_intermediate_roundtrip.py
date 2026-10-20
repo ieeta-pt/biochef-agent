@@ -11,6 +11,7 @@ makes the feature flag safe to turn on.
 """
 
 import json
+import os
 
 import pytest
 
@@ -130,19 +131,18 @@ def test_the_flag_is_off_by_default():
 
 def test_with_the_flag_off_nothing_is_written(tmp_path, monkeypatch):
     monkeypatch.setattr(convert, "WRITE_INTERMEDIATE", False)
-    monkeypatch.chdir(tmp_path)
 
     document = convert.parse_biochef_workflow(CASES[0][1])
-    assert convert.through_intermediate(document) is document
+    path = tmp_path / convert.INTERMEDIATE_FILENAME
+    assert convert.through_intermediate(document, str(path)) is document
     assert list(tmp_path.iterdir()) == []
 
 
 def test_with_the_flag_on_the_document_is_written_and_reread(tmp_path, monkeypatch):
     monkeypatch.setattr(convert, "WRITE_INTERMEDIATE", True)
-    monkeypatch.chdir(tmp_path)
 
     document = convert.parse_biochef_workflow(CASES[0][1])
-    result = convert.through_intermediate(document)
+    result = convert.through_intermediate(document, str(tmp_path / convert.INTERMEDIATE_FILENAME))
 
     written = tmp_path / convert.INTERMEDIATE_FILENAME
     assert written.exists(), "the flag was on but no document was written"
@@ -165,3 +165,72 @@ def test_a_corrupt_document_is_refused_rather_than_half_read(tmp_path):
 
     with pytest.raises(pydantic.ValidationError):
         convert.read_intermediate(str(path))
+
+
+def test_an_existing_document_is_not_overwritten(tmp_path, monkeypatch):
+    """Written as a new file only: nothing put at the path first can stand in
+    for the document."""
+    monkeypatch.setattr(convert, "WRITE_INTERMEDIATE", True)
+    path = tmp_path / convert.INTERMEDIATE_FILENAME
+    path.write_text("{}")
+
+    document = convert.parse_biochef_workflow(CASES[0][1])
+    with pytest.raises(FileExistsError):
+        convert.through_intermediate(document, str(path))
+    assert path.read_text() == "{}"
+
+
+def test_the_document_is_not_written_through_a_symlink(tmp_path, monkeypatch):
+    monkeypatch.setattr(convert, "WRITE_INTERMEDIATE", True)
+    elsewhere = tmp_path / "elsewhere.json"
+    path = tmp_path / convert.INTERMEDIATE_FILENAME
+    path.symlink_to(elsewhere)
+
+    document = convert.parse_biochef_workflow(CASES[0][1])
+    with pytest.raises(OSError):
+        convert.through_intermediate(document, str(path))
+    assert not elsewhere.exists()
+
+
+def test_only_a_regular_file_is_read_back(tmp_path):
+    from workspace import UnsafeName
+
+    path = tmp_path / convert.INTERMEDIATE_FILENAME
+    os.mkfifo(path)
+    with pytest.raises(UnsafeName):
+        convert.read_intermediate(str(path))
+
+
+def test_a_document_changed_on_disk_is_refused(tmp_path, monkeypatch):
+    """What is read back must be what was written. materialise_tools skips the
+    digest check for a node without registry evidence, so a copy that lost it
+    would run that node's executable unchecked."""
+    from intermediate import Node, Workflow
+
+    monkeypatch.setattr(convert, "WRITE_INTERMEDIATE", True)
+    workflow = Workflow(nodes=[Node(
+        id="tool-1", bin="tool", provenance={"artifacts": {"tool": "sha256:" + "0" * 64}},
+    )])
+
+    real_read = convert.read_intermediate
+
+    def read_without_evidence(path):
+        reread = real_read(path)
+        for node in reread.nodes:
+            node.provenance = {}
+        return reread
+
+    monkeypatch.setattr(convert, "read_intermediate", read_without_evidence)
+    with pytest.raises(convert.IntermediateMismatch):
+        convert.through_intermediate(workflow, str(tmp_path / convert.INTERMEDIATE_FILENAME))
+
+
+def test_the_document_has_no_default_path():
+    """A relative default resolves against the process's directory, which every
+    run in flight shares. Without a default, a new caller has to say where its
+    run's document goes."""
+    import inspect
+
+    for function in (convert.write_intermediate, convert.read_intermediate,
+                     convert.through_intermediate):
+        assert inspect.signature(function).parameters["path"].default is inspect.Parameter.empty
