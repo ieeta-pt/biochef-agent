@@ -177,6 +177,12 @@
     "seqtk.trimfq": "sha256: 02067c2760db6d0c",
     "ssw.align": "sha256: bdf4023881064e13",
     "tn93.distance": "sha256: aaad44240d59e06c",
-    "viralconsensus.consensus": "sha256: 571f2410ddc147a9"
+    "trimal.degap": "sha256: 416ef39136f15a7f",
+    "trimal.statal": "sha256: c2b421d66fefd92d",
+    "trimal.toclustal": "sha256: e075d5c2591e070a",
+    "trimal.tofasta": "sha256: ba87b4c5d530f9b1",
+    "trimal.trim": "sha256: d4c4420c4d0094d2",
+    "viralconsensus.consensus": "sha256: 571f2410ddc147a9",
+    "wgsim.simulate": "sha256: 2a268fc58147361f"
   }
 }
