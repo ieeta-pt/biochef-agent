@@ -43,7 +43,7 @@ from fastapi import FastAPI
 import audit
 import runs
 from runs import RunStore, RunState
-from test_async_runs import WORKFLOW
+from tests.test_async_runs import WORKFLOW
 
 
 def test_no_path_means_no_trail(monkeypatch):
@@ -186,7 +186,7 @@ def test_admission_audit_failure_publishes_no_run_or_upload_copy(
     import asyncio
     import tempfile
     import main
-    from test_async_runs import _bare_request
+    from tests.test_async_runs import _bare_request
 
     class UnreadUpload:
         filename = "input-1-out"
@@ -345,7 +345,7 @@ def test_there_is_no_endpoint_serving_the_trail():
 # from the route, not from a store built by hand
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_async_runs import service   # noqa: E402
+from tests.test_async_runs import service   # noqa: E402
 
 
 def test_a_run_submitted_over_http_records_who_asked(tmp_path, monkeypatch,

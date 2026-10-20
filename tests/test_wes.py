@@ -44,7 +44,7 @@ from fastapi.testclient import TestClient
 import main
 import wes
 from runs import RunState, RunStore
-from test_async_runs import service, WORKFLOW, _bare_request, _poll
+from tests.test_async_runs import service, WORKFLOW, _bare_request, _poll
 
 
 @pytest.fixture

@@ -652,11 +652,13 @@ def convert_to_snakemake(workflow: Workflow, step_logs=None):
         cmd.extend(trailing)
         cmd.extend(redirects)
 
+        command_line = " ".join(cmd)
+
         result.append(f"    shell:")
         result.append(f"        \"\"\"")
         if step_logs is not None:
             result.append("        (")
-        result.append(f"        {" ".join(cmd)}")
+        result.append(f"        {command_line}")
         for command in extra_cms:
             result.append(command)
         if step_logs is not None:

@@ -718,7 +718,7 @@ def test_a_kept_workspace_does_get_one_even_without_a_run_id(tmp_path,
 # makes a submission succeed without a registry or snakemake lives there, and
 # duplicating it here would be a second copy to keep in step.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_async_runs import _poll, _submit, service   # noqa: E402
+from tests.test_async_runs import _poll, _submit, service   # noqa: E402
 
 
 def test_a_submitted_run_serves_its_manifest_over_http(service):

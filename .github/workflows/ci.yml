@@ -26,12 +26,10 @@ jobs:
         # The floor, because it is the version most likely to break silently,
         # and the newest, because it is what development happens on. Adding a
         # version here is the same decision as changing the floor in run.sh.
-        # 3.12 is the floor THIS branch supports: convert.py here still has
-        # the f-string that nests the same quote, which is PEP 701 and so 3.12+.
-        # The PR that removes it is also the PR that declares 3.11 in run.sh,
-        # and it adds 3.11 here. Matrix and declared floor move together, or the
-        # matrix asserts support the code does not have.
-        python: ["3.12", "3.13"]
+        # 3.11 is the declared floor on this branch. Test it as well as the
+        # newer development interpreters so the code and pinned requirements
+        # prove the version promised by run.sh and .python-version.
+        python: ["3.11", "3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v4
