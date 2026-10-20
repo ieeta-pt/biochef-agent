@@ -249,6 +249,30 @@ def test_a_rotated_key_is_picked_up(broker):
     assert keys.key_for(rotated.kid) is not None
 
 
+def test_a_first_key_download_failure_is_throttled_then_retried(broker, monkeypatch):
+    now = [0.0]
+    attempts = []
+
+    def fetch(url):
+        attempts.append(now[0])
+        if len(attempts) == 1:
+            raise OSError("provider unavailable")
+        return broker.jwks()
+
+    monkeypatch.setattr(passports.time, "monotonic", lambda: now[0])
+    keys = passports.KeySet("https://keys.test/jwks", fetch=fetch)
+    with pytest.raises(OSError):
+        keys.key_for(broker.kid)
+    for instant in (0.0, 29.9):
+        now[0] = instant
+        with pytest.raises(passports.PassportError):
+            keys.key_for(broker.kid)
+    assert attempts == [0.0]
+    now[0] = 30.0
+    assert keys.key_for(broker.kid).key_id == broker.kid
+    assert attempts == [0.0, 30.0]
+
+
 # --- visas -------------------------------------------------------------------
 
 def test_a_visa_from_a_trusted_issuer_is_accepted(controller):
@@ -260,6 +284,18 @@ def test_a_visa_from_a_trusted_issuer_is_accepted(controller):
     assert len(accepted) == 1
     assert accepted[0]["type"] == "ControlledAccessGrants"
     assert not rejected
+
+
+@pytest.mark.parametrize("issuer", [[CONTROLLER], {"issuer": CONTROLLER}, None])
+def test_a_malformed_visa_issuer_does_not_hide_a_valid_visa(controller, issuer):
+    malformed = jwt.api_jws.encode(
+        json.dumps(visa_claims(issuer=issuer)).encode(), controller.private_pem,
+        algorithm="RS256", headers={"kid": controller.kid})
+    accepted, rejected = passports.verify_visas(
+        [malformed, controller.sign(visa_claims())], trusted_issuers={CONTROLLER},
+        keyset_for=lambda issuer: keyset_for(controller))
+    assert len(accepted) == 1
+    assert rejected == [("malformed", "issuer must be a string")]
 
 
 def test_a_visa_the_caller_minted_for_themselves_is_not_accepted():
@@ -1009,6 +1045,34 @@ def test_the_provider_answers_through_the_real_middleware(broker):
     assert client.get("/who", headers={"Authorization": "Bearer nonsense"}).status_code == 401
 
 
+def test_passport_authentication_runs_off_the_event_loop(broker):
+    import asyncio
+    import threading
+
+    event_loop_thread = threading.get_ident()
+    authentication_threads = []
+
+    def factory(url, issuer):
+        authentication_threads.append(threading.get_ident())
+        return keyset_for(broker)
+
+    provider = auth.PassportAuth(issuer=BROKER, audience=AUDIENCE,
+                                 keyset_factory=factory)
+    scope = {"type": "http", "headers": [
+        (b"authorization", f"Bearer {broker.sign(passport_claims())}".encode())]}
+
+    async def app(scope, receive, send):
+        assert scope["state"]["caller"] == f"{BROKER}#user-1"
+        assert scope["state"]["authenticated_by"] == "passport"
+
+    async def receive():
+        pytest.fail("authentication read the request body")
+
+    asyncio.run(auth.AuthenticationMiddleware(app, provider)(scope, receive, None))
+    assert len(authentication_threads) == 1
+    assert authentication_threads[0] != event_loop_thread
+
+
 def test_a_waiter_woken_by_a_failure_is_not_told_it_timed_out(broker):
     """Two different events, and reporting the wrong one costs somebody an
     afternoon looking for a slow provider that was in fact failing instantly."""
@@ -1238,6 +1302,27 @@ def test_a_redundant_default_port_is_not_a_different_host():
         ("https://b.test:8443/oidc", "https://b.test:8443/oidc/jwk"),
     ):
         assert passports.jwks_url_for(issuer, fetch=lambda u: {"jwks_uri": url}) == url
+
+
+@pytest.mark.parametrize("destination", [
+    "https://other.test/userinfo", "https://broker.test:8443/userinfo",
+    "http://broker.test/userinfo",
+])
+def test_userinfo_redirects_cannot_forward_tokens_to_another_origin(destination):
+    request = passports.urllib.request.Request(USERINFO, headers={
+        "Authorization": "Bearer public-test-token"})
+    with pytest.raises(passports.PassportError):
+        passports._UserInfoRedirectHandler().redirect_request(
+            request, None, 302, "Found", {}, destination)
+
+
+def test_userinfo_redirects_preserve_tokens_within_the_configured_origin():
+    url = "https://userinfo.test:443/userinfo"
+    request = passports.urllib.request.Request(url, headers={
+        "Authorization": "Bearer public-test-token"})
+    redirected = passports._UserInfoRedirectHandler().redirect_request(
+        request, None, 302, "Found", {}, "https://userinfo.test/next")
+    assert redirected.get_header("Authorization") == "Bearer public-test-token"
 
 
 def test_a_genuinely_different_port_is_still_a_different_host():

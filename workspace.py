@@ -29,6 +29,7 @@ import errno
 import os
 import re
 import shutil
+import stat
 import tempfile
 
 SAFE_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -92,6 +93,8 @@ class Workspace:
 
     def _open(self, name: str, flags: int, mode: int = 0o600) -> int:
         check_name(name)
+        if self._fd is None:
+            raise OSError(errno.EBADF, "workspace is closed")
         try:
             fd = os.open(name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, mode,
                          dir_fd=self._fd)
@@ -132,12 +135,40 @@ class Workspace:
         flags = os.O_WRONLY | os.O_CREAT | (os.O_EXCL if exclusive else os.O_TRUNC)
         return os.fdopen(self._open(name, flags), "wb")
 
-    def open_read(self, name: str):
-        return os.fdopen(self._open(name, os.O_RDONLY), "rb")
+    def open_read(self, name: str, *, regular_only: bool = False):
+        # A tool can replace a log with a FIFO; a blocking open would hang the
+        # run before its file type could be checked.
+        flags = os.O_RDONLY | (os.O_NONBLOCK if regular_only else 0)
+        fd = self._open(name, flags)
+        if regular_only and not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise UnsafeName(f"{name!r} is not a regular file")
+        return os.fdopen(fd, "rb")
 
     def write_bytes(self, name: str, data: bytes, *, exclusive: bool = True) -> int:
         with self.open_write(name, exclusive=exclusive) as fh:
             return fh.write(data)
+
+    def write_stream(self, name: str, source, *, exclusive: bool = True,
+                     chunk_size: int = 1024 * 1024) -> int:
+        """Copy a readable into the workspace without holding it in memory.
+
+        Through the same descriptor as write_bytes, so a streamed input gets the
+        identical O_EXCL and O_NOFOLLOW treatment -- the difference is how much
+        of it exists at once, not where it lands or what it may overwrite.
+
+        This is what lets a data source hand over a multi-gigabyte file. A
+        provider returning bytes would put every input through memory whole,
+        which is the ceiling D2 exists to lift.
+        """
+        written = 0
+        with self.open_write(name, exclusive=exclusive) as fh:
+            while True:
+                chunk = source.read(chunk_size)
+                if not chunk:
+                    break
+                written += fh.write(chunk)
+        return written
 
     def place_executable(self, source_path: str, name: str) -> str:
         """Copy a tool binary in and make it executable.
@@ -146,9 +177,19 @@ class Workspace:
         written through the same descriptor as everything else.
         """
         with open(source_path, "rb") as src:
-            self.write_bytes(name, src.read())
+            self.write_stream(name, src)
         os.chmod(name, 0o700, dir_fd=self._fd)
         return os.path.join(self.path, name)
+
+    def close(self) -> None:
+        """Release the directory descriptor without deleting the workspace."""
+        if self._fd is None:
+            return
+        fd, self._fd = self._fd, None
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
     def cleanup(self) -> None:
         """Remove the workspace, but only if the path still refers to it.
@@ -170,10 +211,7 @@ class Workspace:
         except OSError:
             same = False
 
-        try:
-            os.close(self._fd)
-        except OSError:
-            pass
+        self.close()
 
         if same:
             shutil.rmtree(self.path, ignore_errors=True)

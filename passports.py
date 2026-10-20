@@ -96,7 +96,7 @@ class KeySet:
         self._lock = threading.Lock()
         self._keys = None
         self._fetched_at = 0.0
-        self._last_attempt = 0.0
+        self._last_attempt = None
 
     def _load(self):
         document = self._fetch(self.url)
@@ -124,7 +124,7 @@ class KeySet:
                 return self._keys[kid]
 
             if not fresh or kid not in (self._keys or {}):
-                if self._keys is not None and (now - self._last_attempt) < self._refetch_interval:
+                if self._last_attempt is not None and (now - self._last_attempt) < self._refetch_interval:
                     if kid in (self._keys or {}):
                         return self._keys[kid]
                     raise PassportError(
@@ -246,13 +246,24 @@ def fetch_passport(userinfo_url, access_token, fetch=None):
     return raw_visas(document)
 
 
+class _UserInfoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep bearer credentials at their configured origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if (urllib.parse.urlparse(req.full_url).scheme != urllib.parse.urlparse(newurl).scheme
+                or _host_of(req.full_url) != _host_of(newurl)):
+            raise PassportError("refusing to redirect a token to another origin")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _fetch_authorised_json(url, access_token):
     if not url.startswith("https://"):
         raise PassportError(f"refusing to send a token over an insecure URL: {url}")
     request = urllib.request.Request(
         url, headers={"Authorization": f"Bearer {access_token}",
                       "Accept": "application/json"})
-    with urllib.request.urlopen(request, timeout=10) as response:
+    opener = urllib.request.build_opener(_UserInfoRedirectHandler())
+    with opener.open(request, timeout=10) as response:
         return json.loads(response.read())
 
 
@@ -356,6 +367,10 @@ def verify_visas(tokens, *, trusted_issuers, keyset_for):
                       .get("iss"))
         except jwt.PyJWTError as exc:
             rejected.append(("unreadable", str(exc)))
+            continue
+
+        if not isinstance(issuer, str):
+            rejected.append(("malformed", "issuer must be a string"))
             continue
 
         if issuer not in trusted_issuers:

@@ -207,6 +207,7 @@ def test_a_plain_name_still_works(client, tmp_path, monkeypatch):
 
     assert response.status_code == 200, response.text
     assert (Path(kept[0].path) / "input-1-out").read_bytes() == b"payload"
+    assert kept[0]._fd is None, "retaining a workspace also retained its descriptor"
     kept[0].cleanup()
 
 
@@ -243,7 +244,7 @@ def test_the_same_input_sent_twice_is_refused(client, tmp_path):
     )
 
     assert response.status_code == 400
-    assert "sent twice" in response.text
+    assert "supplied twice" in response.text
 
 
 def test_a_declared_input_that_never_arrives_is_refused(client, tmp_path):

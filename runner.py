@@ -3,8 +3,7 @@
 E2 asks for a second Runner provider. This is the first one, and the seam that
 makes a second possible.
 
-The split is deliberate and is the whole point of the file. Running a workflow is
-two things fused together in the version this replaces:
+The split is the whole point of the file. Running a workflow is two things:
 
   policy    the timeout, and killing the whole process group rather than the
             child. Every provider needs this, and it is the part that was hard
@@ -23,7 +22,19 @@ import os
 import re
 import signal
 import subprocess
+import threading
+import time
 from typing import List, NamedTuple
+
+from steplogs import TailBuffer
+
+
+def _kill_group(pgid):
+    """End a process group, tolerating one that has already gone."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 class RunResult(NamedTuple):
@@ -62,7 +73,8 @@ class Runner:
         """What this provider is, for an operator reading a log or an error."""
         return self.name
 
-    def run(self, ws, timeout_s: int) -> RunResult:
+    def run(self, ws, timeout_s: int, on_start=None, on_finish=None,
+            on_line=None) -> RunResult:
         """Launch the command in its own process group and bound how long it lives.
 
         start_new_session puts the command and everything it spawns in one
@@ -80,20 +92,142 @@ class Runner:
             self.command(ws),
             cwd=ws.path, start_new_session=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace",
         )
         pgid = os.getpgid(process.pid)
+        # Handed out so something other than the timeout can end this run.
+        # Cancellation needs precisely the lever the timeout already pulls, and
+        # a caller that has the group id can pull it without this class growing
+        # a notion of why a run is being stopped.
+        #
+        # Taken back when runner cleanup finishes, which matters more than it sounds.
+        # A process group id is a number the kernel can reissue after the group
+        # disappears, so a caller still holding it can signal a later group.
+        # The id is the leader's pid, but killpg targets the whole group even
+        # after the original leader exits.
+        # Read lines as they arrive so the caller can report progress before
+        # the process exits. communicate() drains both pipes too, but returns
+        # buffered output only after the process has finished.
+        #
+        # Two threads, one per stream, because draining only one of them is the
+        # deadlock communicate() exists to avoid: a tool that fills the other
+        # pipe's buffer blocks forever waiting for someone to read it.
+        # Bounded, so a chatty tool cannot decide how much memory the agent
+        # uses. Nothing is lost that would have survived being recorded: the
+        # store keeps MAX_LOG_BYTES of a stream either way.
+        collected = {"stdout": TailBuffer(), "stderr": TailBuffer()}
+        reader_errors = []
+
+        def pump(stream, name):
+            try:
+                for line in stream:
+                    collected[name].append(line)
+                    if on_line is not None:
+                        try:
+                            on_line(name, line)
+                        except Exception:            # noqa: BLE001
+                            # A defect in reporting must not take the run with
+                            # it. The line is still collected either way.
+                            pass
+            except BaseException as error:  # noqa: BLE001
+                reader_errors.append(error)
+            finally:
+                try:
+                    stream.close()
+                except Exception:                    # noqa: BLE001
+                    pass
+
+        readers = [
+            threading.Thread(target=pump, args=(process.stdout, "stdout"),
+                             daemon=True),
+            threading.Thread(target=pump, args=(process.stderr, "stderr"),
+                             daemon=True),
+        ]
+        reader_streams = dict(zip(readers, (process.stdout, process.stderr)))
+        started_readers = []
+
         try:
-            out, err = process.communicate(timeout=timeout_s)
-            return RunResult(process.returncode, out, err)
+            if on_start is not None:
+                on_start(pgid)
+            for reader in readers:
+                reader.start()
+                started_readers.append(reader)
+            # Pass the configured value unchanged to the parent wait (among
+            # other things, this keeps provider-level timeout observation
+            # precise), then spend only the remaining budget draining pipes.
+            deadline = time.monotonic() + timeout_s
+            process.wait(timeout=timeout_s)
+            returncode = process.returncode
+            for reader in started_readers:
+                reader.join(timeout=max(0, deadline - time.monotonic()))
+            if any(reader.is_alive() for reader in started_readers):
+                # A descendant can keep a pipe open after the parent exits.
+                # Treat unfinished reading as a timeout, even if the parent
+                # succeeded. Cleanup stays bounded if a child left the group
+                # or a line callback is still blocked.
+                _kill_group(pgid)
+                process.wait()
+                for reader in started_readers:
+                    reader.join(timeout=10)
+                if returncode == 0:
+                    returncode = -signal.SIGKILL
+            if reader_errors:
+                raise reader_errors[0]
         except subprocess.TimeoutExpired:
-            os.killpg(pgid, signal.SIGKILL)
-            out, err = process.communicate()
-            # The real code, not a constant. This used to return -SIGKILL
-            # literally, which reported the signal we meant to send rather than
-            # what happened -- so changing the signal, or the process dying some
-            # other way, still claimed SIGKILL. It also made the timeout test
-            # unable to tell the two apart.
-            return RunResult(process.returncode, out or "", err or "")
+            _kill_group(pgid)
+            process.wait()
+            for reader in started_readers:
+                reader.join(timeout=10)
+            returncode = process.returncode
+            if returncode == 0:
+                returncode = -signal.SIGKILL
+        except BaseException:
+            # Any other way out -- a broken pipe, an interpreter shutdown, a
+            # KeyboardInterrupt -- and the child has NOT been reaped. The
+            # finally below is about to forget its group id, which would leave
+            # the tool running with nothing able to stop it, against a workspace
+            # perform_run is on its way to deleting.
+            #
+            # Demonstrated by making wait() raise OSError: the group was
+            # still alive and the only handle to it had just been cleared.
+            _kill_group(pgid)
+            # Reaped as well as killed. SIGKILL ends the processes but leaves
+            # this one's direct child a zombie until it is waited for, and a
+            # zombie still occupies the process group -- so the group would
+            # outlive everything in it, which is both a leak and a number that
+            # cannot be reissued. CI caught this on Linux where the timing
+            # differs from a laptop's.
+            try:
+                process.wait(timeout=10)
+            except Exception:                    # noqa: BLE001
+                pass
+            for reader in started_readers:
+                reader.join(timeout=10)
+            raise
+        finally:
+            # Reached by every path, and by now the group is either reaped
+            # normally or killed above -- including the paths that raise, which
+            # is why the kill is in an except rather than only in the timeout.
+            #
+            for reader in readers:
+                if reader not in started_readers:
+                    stream = reader_streams[reader]
+                    try:
+                        stream.close()
+                    except Exception:                # noqa: BLE001
+                        pass
+            if on_finish is not None:
+                on_finish()
+
+        # The local, not process.returncode. Both branches of this merge were
+        # guarding the same line against different mistakes and the one below
+        # already covers both: it takes the process's real code -- so a run that
+        # had already exited 3 does not come back claiming the signal we sent --
+        # and substitutes only when that code is 0 after we killed the group,
+        # because reading that overran the deadline did not produce a success.
+        return RunResult(returncode,
+                         collected["stdout"].text(),
+                         collected["stderr"].text())
 
 
 class SubprocessRunner(Runner):
@@ -138,7 +272,7 @@ created and destroyed per run, so an image cached inside one would be pulled
 again every time.
 """
 
-APPTAINER_ARGS = os.getenv("BIOCHEF_APPTAINER_ARGS", "--contain")
+APPTAINER_ARGS = os.getenv("BIOCHEF_APPTAINER_ARGS", "--contain --cleanenv")
 """Extra flags for the apptainer invocation itself.
 
 --contain by default, and the default is the point. Apptainer binds the host's
@@ -150,8 +284,10 @@ workspace, which for a service whose reason to exist is keeping one dataset away
 from another is the wrong half to get right. The container runs as the same
 user, so the 0700 mode on a workspace does not help.
 
-Emptying this variable turns containment off, for an operator who needs the host
-/tmp visible and knows what that means.
+--cleanenv stops ordinary Agent environment variables, including registry
+credentials, being inherited by the tool process. It does not isolate /proc or
+the network. Emptying this variable turns both protections off, for an operator
+who needs host access and knows what that means.
 """
 
 _IMAGE_SHAPE = re.compile(r"\A[A-Za-z0-9/][A-Za-z0-9._:/@+-]{0,255}\Z")
