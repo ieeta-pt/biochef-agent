@@ -3,7 +3,16 @@
 Written before any change, so that the refactor in this PR can be shown to
 preserve behaviour rather than merely claimed to. Every expectation here was
 recorded from the current implementation, including the ones that look wrong.
+
+Two expectations gained `:q` when the shell quoting went in (#35). That is the
+one deliberate change to emitted text since these were recorded: the field
+reference is now quoted by Snakemake at expansion, so a path containing a space
+stays one argument. The argv the tool receives is unchanged for every name in
+the catalogue -- see tests/test_shell_quoting.py, which checks that against a
+real snakemake run rather than against the emitted string.
 """
+
+import json
 
 import pytest
 
@@ -40,14 +49,24 @@ def workflow(tool_id, in_handle, out_handle, params=None):
 
 
 def shell_line(text):
-    return [l.strip() for l in text.splitlines() if l.strip().startswith("./")][0]
+    """The shell body, decoded from the Python string literal it is emitted as.
+
+    It used to be recoverable by looking for a line starting with "./", because
+    the body sat raw inside a triple-quoted block. It is a single literal now --
+    that is what stops a value being read as Python (#35).
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "shell:":
+            return json.loads(lines[i + 1].strip())
+    raise AssertionError(f"no shell body found in:\n{text}")
 
 
 def test_positional_input_with_flagged_output():
     sm = convert.convert_to_snakemake(
         convert.parse_biochef_workflow(workflow("tn93.distance", "in", "out"))
     )
-    assert shell_line(sm) == "./tn93 -o {output.o_0} {input.i_0}"
+    assert shell_line(sm) == "./tn93 -o {output.o_0:q} {input.i_0:q}"
     assert 'o_0="tn93.distance-1-out",' in sm
     assert 'rule all:' in sm
 
@@ -56,7 +75,7 @@ def test_stdout_output_is_redirected_last():
     sm = convert.convert_to_snakemake(
         convert.parse_biochef_workflow(workflow("edlib.align", "queries", "out"))
     )
-    assert shell_line(sm) == "./edlib-aligner {input.i_0} > {output.o_0}"
+    assert shell_line(sm) == "./edlib-aligner {input.i_0:q} > {output.o_0:q}"
 
 
 def test_enabled_parameter_reaches_the_command():

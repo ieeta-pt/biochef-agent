@@ -661,7 +661,10 @@ def test_the_regex_is_not_the_limit_on_which_names_can_be_attributed():
 
     from steplogs import _ERROR_IN_RULE
 
-    unmatchable = [convert.rule_name_for(n) for n in ("1-tool", "a b", "tool+1")]
+    for node_id in ("1-tool", "a b", "tool+1"):
+        with pytest.raises(ValueError, match="usable rule name"):
+            convert.rule_name_for(node_id)
+    unmatchable = ("1_tool", "a b", "tool+1")
     for rule in unmatchable:
         assert not _ERROR_IN_RULE.search(f"Error in rule {rule}:\n")
 
