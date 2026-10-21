@@ -70,11 +70,18 @@ def operations(recipes_root):
 
 
 def editor_export(operation):
-    """One input node, the tool, one output node -- the shape the editor sends."""
+    """Synthetic editor shape; placeholder values are never executed."""
     io = operation.get("io") or {}
     inputs, outputs = io.get("inputs") or [], io.get("outputs") or []
+    def sample_value(parameter):
+        value = parameter.get("default", "")
+        if (value is None or value == "") and parameter.get("required") \
+                and parameter.get("type") != "flag":
+            return {"integer": 1, "float": 1.0}.get(parameter.get("type"), "x")
+        return value
+
     values = {
-        parameter["name"]: {"enabled": True, "value": parameter.get("default", "")}
+        parameter["name"]: {"enabled": True, "value": sample_value(parameter)}
         for parameter in (operation.get("parameters") or [])
     }
     nodes = [
