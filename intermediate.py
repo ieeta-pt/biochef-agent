@@ -123,6 +123,7 @@ class Node(BaseModel):
     inputs: Dict[str, IO] = Field(default_factory=dict)
     outputs: Dict[str, IO] = Field(default_factory=dict)
     parameters: Dict[str, Param] = Field(default_factory=dict)
+    provenance: dict = Field(default_factory=dict)
 
 
 class Workflow(BaseModel):
