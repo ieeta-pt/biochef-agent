@@ -135,7 +135,7 @@ def test_the_converter_still_knows_nothing_about_sources():
     """
     workflow = convert.Workflow(nodes=[
         convert.Node(id="tool-1", bin="t",
-                     inputs={"input-1-out": convert.IO()},
+                     inputs={"in": convert.IO(file="input-1-out")},
                      outputs={"tool-1-out": convert.IO()}),
     ])
 
