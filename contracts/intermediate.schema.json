@@ -92,6 +92,11 @@
           },
           "title": "Parameters",
           "type": "object"
+        },
+        "provenance": {
+          "additionalProperties": true,
+          "title": "Provenance",
+          "type": "object"
         }
       },
       "title": "Node",
@@ -118,18 +123,6 @@
           "title": "Name",
           "type": "string"
         },
-        "type": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Type"
-        },
         "value": {
           "anyOf": [
             {
@@ -147,6 +140,18 @@
           ],
           "default": "",
           "title": "Value"
+        },
+        "type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Type"
         }
       },
       "title": "Param",
