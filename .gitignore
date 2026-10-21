@@ -9,6 +9,11 @@ venv/
 # Where pulled tool bundles are cached between runs.
 tool-cache/
 
+# The same, for container images pulled by the apptainer runner. Its default is
+# relative to the process's working directory, exactly like tool-cache above, so
+# running the service from a checkout drops .simg files into the repository.
+apptainer-cache/
+
 # A run's generated workflow and its validated document. They belong to the run
 # that produced them, not to the repository.
 Snakefile

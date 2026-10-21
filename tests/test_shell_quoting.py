@@ -165,18 +165,11 @@ def test_no_payload_escapes_its_argument(payload):
 
 
 def test_an_empty_value_stays_absent_rather_than_becoming_an_empty_argument():
-    """The regression the catalogue sweep caught, and unit tests could not.
-
-    An empty value used to vanish by accident: " ".join put "" between two
-    spaces and the shell collapsed the gap. shlex.quote("") is '' -- a real
-    argument. 100 of the 176 catalogue operations declare flag-type parameters
-    with an empty value, so quoting naively turned "-c" into "-c ''" and passed
-    every one of them an argument it never received before.
-    """
+    """A typed empty value omits its flag too, as the browser does (#54)."""
     command = shell_block(convert.convert_to_snakemake(
         convert.parse_biochef_workflow(workflow_with(""))))
 
-    assert command == "./edlib-aligner -m {input.i_0:q} > {output.o_0:q}"
+    assert command == "./edlib-aligner {input.i_0:q} > {output.o_0:q}"
     assert "''" not in command
 
 
@@ -292,3 +285,57 @@ def test_the_tool_receives_the_payload_as_one_argument(payload, tmp_path):
 
     argv = json.loads((tmp_path / "argv.json").read_text())
     assert argv[argv.index("-m") + 1] == payload, "the value did not arrive intact"
+
+
+@pytest.mark.skipif(not SNAKEMAKE, reason="snakemake is not installed")
+@pytest.mark.parametrize("with_logs", [False, True])
+def test_registry_strings_reach_the_tool_without_running_as_shell_code(monkeypatch, tmp_path, with_logs):
+    """#42: flags and a hardcoded output name come from a selected bundle."""
+    hostile = {
+        "id": "h", "name": "h", "bin": "h",
+        "io": {
+            "inputs": [{"name": "in", "types": ["T"], "mode": "file",
+                        "flag": "-i; touch PWNED_INPUT #"}],
+            "outputs": [{"name": "out", "types": ["T"], "mode": "file",
+                         "filename": "fixed.txt; touch PWNED_CP"}],
+        },
+        "parameters": [{"name": "mode", "type": "string",
+                        "flag": "-p $(touch PWNED_PARAM)"}],
+    }
+    monkeypatch.setattr(convert, "fetch_tool", lambda tool_id, repo: hostile)
+
+    workflow = convert.parse_biochef_workflow(
+        workflow_with("v", tool="h", in_handle="in"))
+    step_logs = [("step.stdout", "step.stderr")] if with_logs else None
+    (tmp_path / "Snakefile").write_text(
+        convert.convert_to_snakemake(workflow, step_logs=step_logs))
+    tool = tmp_path / "h"
+    tool.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "root = Path(__file__).resolve().parent\n"
+        "(root / 'argv.json').write_text(json.dumps(sys.argv[1:]))\n"
+        "(root / 'fixed.txt; touch PWNED_CP').write_text('ok')\n"
+        "print('tool stdout')\n"
+        "print('tool stderr', file=sys.stderr)\n"
+    )
+    tool.chmod(0o755)
+    (tmp_path / "input-1-out").write_text("input")
+
+    result = subprocess.run(
+        [SNAKEMAKE, "--cores", "1", "-s", str(tmp_path / "Snakefile"),
+         "-d", str(tmp_path), "all"],
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert json.loads((tmp_path / "argv.json").read_text()) == [
+        "-p $(touch PWNED_PARAM)", "v", "-i; touch PWNED_INPUT #",
+        "input-1-out", "h-1-out",
+    ]
+    assert (tmp_path / "h-1-out").read_text() == "ok"
+    assert not any(p.name.startswith("PWNED") for p in tmp_path.iterdir())
+    if with_logs:
+        assert (tmp_path / "step.stdout").read_text() == "tool stdout\n"
+        assert (tmp_path / "step.stderr").read_text() == "tool stderr\n"

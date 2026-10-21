@@ -111,10 +111,11 @@ def test_an_optional_parameter_is_still_the_client_s_choice():
 def test_a_required_parameter_with_no_default_is_not_invented():
     """29 of the 100 required parameters are visible ones a user must supply --
     sed's script, tr's set1. There is nothing to fall back on, and making one up
-    would be worse than leaving it out."""
+    would be worse than rejecting the run."""
     bundle = dict(BUNDLE)
     bundle["parameters"] = [{"name": "script", "type": "string", "required": True}]
     convert.fetch_tool = lambda tool_id, repo: bundle
     convert.tools.clear()
 
-    assert emit({}) == "./samtools {input.i_0:q} > {output.o_0:q}"
+    with pytest.raises(convert.WorkflowInputError, match="missing required parameter 'script'"):
+        emit({})

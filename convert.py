@@ -1,15 +1,24 @@
 from fastapi import FastAPI
+import copy
+import fcntl
+import hashlib
 import json
-import oras.client
-import os
 import keyword
 import shlex
+import oras.client
+import os
 import shutil
 import stat
+import threading
+import uuid
+from contextlib import contextmanager
+from intermediate import IO, IOMode, Node, Param, Workflow
 
 from dotenv import load_dotenv
 
-from intermediate import IO, IOMode, Node, Param, Workflow
+import signing
+import evidence_verification
+from workspace import UnsafeName, check_name
 
 load_dotenv()
 
@@ -44,73 +53,533 @@ tests/test_intermediate_roundtrip.py, which is what makes turning it on safe.
 INTERMEDIATE_FILENAME = "intermediate.json"
 
 
-def intermediate_path(directory: str) -> str:
-    """Where this run's document lives.
+class IntermediateMismatch(Exception):
+    """The intermediate document read back is not the one written."""
 
-    A run has to say where. There is deliberately no default: a relative one
-    would be resolved against whatever the process's working directory happened
-    to be, and that is shared by every request in flight. While the handler
-    chdir'd into a run directory that was invisibly fine; the moment it stops
-    doing so -- which is what #40 is -- a default would silently put every
-    concurrent run's document at the same path, and one run could then generate
-    its Snakefile from another run's validated document.
 
-    Removing the default is what makes that impossible to reintroduce by
-    forgetting, rather than only fixed at the one call site that exists today.
+def write_intermediate(workflow: Workflow, path: str) -> str:
+    """Write the document, as a new file only.
+
+    Exclusive and without following a symlink, like every file a run creates
+    in its workspace: nothing put at the path first, a file or a link to one
+    elsewhere, can stand in for the document or be written through.
     """
-    return os.path.join(directory, INTERMEDIATE_FILENAME)
-
-
-def write_intermediate(workflow: Workflow, directory: str) -> str:
-    path = intermediate_path(directory)
-    with open(path, "w") as f:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as f:
         f.write(workflow.to_json())
     return path
 
 
-def read_intermediate(directory: str) -> Workflow:
+def read_intermediate(path: str) -> Workflow:
     """Read the document back, validating it on the way in.
 
     A document that does not match the schema raises here rather than producing
-    a nonsense Snakefile further downstream.
+    a nonsense Snakefile further downstream. Only a regular file is read, and
+    not through a symlink.
     """
-    with open(intermediate_path(directory)) as f:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise UnsafeName(f"{path!r} is not a regular file")
+    with os.fdopen(fd) as f:
         return Workflow.from_json(f.read())
 
 
-def through_intermediate(workflow: Workflow, directory: str) -> Workflow:
-    """Round trip the document through this run's directory when the flag is on.
+def through_intermediate(workflow: Workflow, path: str) -> Workflow:
+    """Round trip through the supplied file when enabled.
 
-    `directory` is required for the reason given on intermediate_path.
+    The executor supplies a path inside its run workspace. There is no default:
+    a relative name resolves against the process's directory, which every run in
+    flight shares, so a caller that forgot the path would put concurrent runs'
+    documents in one place.
+
+    The copy read back must be the one written. The document carries each
+    node's registry evidence, which materialise_tools checks the executable
+    against and skips for a node without it, so a copy changed on disk could
+    switch that check off. It is compared as serialised, since the order of
+    inputs, outputs and parameters is the order of the command line.
     """
     if not WRITE_INTERMEDIATE:
         return workflow
-    write_intermediate(workflow, directory)
-    return read_intermediate(directory)
+    write_intermediate(workflow, path)
+    reread = read_intermediate(path)
+    if reread.to_json() != workflow.to_json():
+        raise IntermediateMismatch(f"{path!r} read back differs from the document written")
+    return reread
 
+
+class ToolBundle(dict):
+    """A bundle plus the evidence snapshot observed when it was fetched."""
+
+    def __init__(self, bundle, provenance):
+        super().__init__(bundle)
+        self.provenance = copy.deepcopy(provenance)
+
+
+TOOL_CACHE = os.path.realpath(os.getenv("BIOCHEF_TOOL_CACHE", "tool-cache"))
+"""Where pulled bundles live, shared by every run.
+
+Each run has its own workspace, while downloaded bundles can be reused. On
+every fetch, the cached files are checked against the registry manifest; a
+matching entry avoids another pull. materialise_tools copies the executable
+into whichever run workspace needs it.
+"""
 
 tools = {}
+
+provenance = {}
+"""What each pulled bundle was, kept for the run manifest (#18)."""
+
+_fetch_locks = {}
+_fetch_locks_guard = threading.Lock()
+
+
+@contextmanager
+def _fetch_lock(tool_id):
+    """Lock one local cache entry across cooperating threads and processes."""
+    with _fetch_locks_guard:
+        thread_lock = _fetch_locks.setdefault(tool_id, threading.Lock())
+
+    with thread_lock:
+        os.makedirs(TOOL_CACHE, exist_ok=True)
+        # Keep this file: recreating it could let processes lock different inodes.
+        lock_path = os.path.join(TOOL_CACHE, f".{tool_id}.lock")
+        lock_fd = os.open(
+            lock_path,
+            os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+
+class ToolIntegrityError(Exception):
+    """The bytes that arrived are not the bytes the registry vouched for."""
+
+
+# Spelled out rather than imported from oras.defaults, because every test module
+# here replaces the oras package with a stub so nothing reaches the registry, and
+# importing a submodule of that stub fails. These two values are part of the OCI
+# specification rather than of oras.
+_ANNOTATION_TITLE = "org.opencontainers.image.title"
+_DIR_MEDIA_TYPE = "application/vnd.oci.image.layer.v1.tar+gzip"
+
+
+def _contained_path(root, name, target):
+    """Where a manifest title lands, refusing anything that escapes `root`.
+
+    check_name is the wrong instrument here and was the first thing tried. It
+    admits one plain file name, so it refused "bin/tool" and "lib/libz.so.1" --
+    titles oras itself accepts and sanitises. A bundle laid out in
+    subdirectories would have been rejected as an integrity failure.
+
+    Containment is the property that actually matters: the manifest comes from
+    the registry, the client chooses the registry, and a title of
+    "../../etc/cron.d/x" must not decide which path gets hashed. Resolving and
+    checking the prefix allows nesting and still refuses escape.
+    """
+    resolved = os.path.realpath(os.path.join(root, name))
+    base = os.path.realpath(root)
+    if resolved != base and not resolved.startswith(base + os.sep):
+        raise ToolIntegrityError(
+            f"{target}: the manifest names {name!r}, which resolves outside the "
+            f"directory the pull was staged in"
+        )
+    return resolved
+
+
+def _sha256_of(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def cache_matches(directory, manifest, target):
+    """Whether what is on disk already is what the manifest describes.
+
+    Silent, unlike verify_against_manifest: a mismatch here is a reason to pull
+    again, not a reason to fail. The tag may simply have moved to a new version,
+    which is the ordinary case and not an incident.
+    """
+    if not os.path.exists(os.path.join(directory, "bundle.json")):
+        return False
+    try:
+        verify_against_manifest(target, directory, manifest=manifest)
+    except ToolIntegrityError:
+        return False
+    return True
+
+
+def verify_against_manifest(target, staging, manifest=None):
+    """Check every staged file against the digest the manifest claims for it.
+
+    oras never does this. It builds the blob URL from the digest and streams the
+    response to a file, so the digest names what was asked for and never what
+    arrived (#9). What arrives is then made executable and run.
+
+    A layer's on-disk file IS the blob for ordinary layers, so hashing the staged
+    file is the comparison the specification intends. A directory layer is
+    different: oras downloads it to a temporary archive and extracts it, so
+    nothing on disk is the blob and the digest cannot be checked after the fact.
+    That case is refused rather than skipped -- an unverifiable artifact must not
+    be quietly treated as a verified one, which is the failure this whole issue
+    is about.
+    """
+    if manifest is None:
+        manifest = client.get_manifest(client.get_container(target))
+    layers = manifest.get("layers") or []
+    if not layers:
+        raise ToolIntegrityError(
+            f"{target} has no layers in its manifest, so there is nothing to "
+            f"verify the pulled files against"
+        )
+
+    for layer in layers:
+        digest = layer.get("digest")
+        if not digest:
+            raise ToolIntegrityError(f"{target}: a layer declares no digest")
+
+        if layer.get("mediaType") == _DIR_MEDIA_TYPE:
+            raise ToolIntegrityError(
+                f"{target}: layer {digest} is a directory archive, which is "
+                f"extracted on the way in, so what lands on disk is not the "
+                f"blob and its digest cannot be checked. Refusing rather than "
+                f"treating it as verified."
+            )
+
+        name = (layer.get("annotations") or {}).get(_ANNOTATION_TITLE) or digest
+        path = _contained_path(staging, name, target)
+        if not os.path.exists(path):
+            raise ToolIntegrityError(
+                f"{target}: the manifest declares {name!r} but the pull did not "
+                f"produce it"
+            )
+
+        actual = _sha256_of(path)
+        if actual != digest:
+            raise ToolIntegrityError(
+                f"{target}: {name!r} does not match the manifest. "
+                f"expected {digest}, got {actual}. Either the bytes are not the "
+                f"ones the registry vouched for, or the tag moved between the "
+                f"pull and this check -- an ordinary push to the same tag looks "
+                f"identical from here."
+            )
+
+
+# Taken from oras rather than restated: a manifest media type oras would accept
+# must not be refused here just because this file has an older list.
+try:
+    import oras.defaults
+    _MANIFEST_TYPES = ", ".join(oras.defaults.default_manifest_accepted_media_types)
+except Exception:  # pragma: no cover - a stubbed oras in the test suite
+    _MANIFEST_TYPES = "application/vnd.oci.image.manifest.v1+json"
+
+
+def fetch_manifest(target):
+    """The manifest and the digest that names it, from a single fetch, along with the raw bytes.
+
+    oras parses the response and throws it away, so the manifest digest -- which
+    is defined as the hash of the exact bytes served, not of anything we could
+    re-serialise -- is not recoverable from what get_manifest returns. Signature
+    verification needs that digest, and needs it to name the same artifact the
+    blobs are pulled from, so the request happens here and both are kept.
+
+    The digest is computed from the bytes rather than taken from the registry's
+    Docker-Content-Digest header. The header is advisory and comes from the same
+    party as the manifest; if both are present and disagree, that is refused,
+    because a registry answering one thing and labelling it another is not a
+    situation to pick a winner in.
+
+    Falls back to oras's own accessor for any client that cannot do a raw
+    request, returning no digest -- which strict mode refuses, so the fallback
+    cannot quietly become a way to skip verification.
+    """
+    container = client.get_container(target)
+    if not (hasattr(client, "do_request") and hasattr(client, "prefix")):
+        return client.get_manifest(container), None, None
+
+    url = f"{client.prefix}://{container.manifest_url()}"
+    response = client.do_request(url, "GET", headers={"Accept": _MANIFEST_TYPES})
+    if response.status_code != 200:
+        raise ToolIntegrityError(
+            f"{target}: the registry answered {response.status_code} for its manifest"
+        )
+
+    body = response.content
+    digest = "sha256:" + hashlib.sha256(body).hexdigest()
+    advertised = response.headers.get("Docker-Content-Digest")
+    if advertised and advertised != digest:
+        raise ToolIntegrityError(
+            f"{target}: the registry served a manifest whose digest is {digest} "
+            f"but labelled it {advertised}"
+        )
+    requested = getattr(container, "digest", None)
+    if requested and requested != digest:
+        raise ToolIntegrityError(
+            f"{target}: the registry served manifest {digest}, but the requested "
+            f"immutable reference names {requested}"
+        )
+    return json.loads(body), digest, body
+
+
 def fetch_tool(tool_id, repo):
-    tool_id = tool_id.split("-")[0]
+    """Pull a bundle into the shared cache and return it.
 
-    if tool_id in tools:
-        return tools[tool_id]
+    The signature is unchanged on purpose: parse_biochef_workflow calls this,
+    and threading a workspace through would make the parse know about run
+    directories for no reason. It no longer copies or chmods anything -- placing
+    the binary is a separate pass that runs once the workspace exists.
+    """
+    tool_id = check_name(tool_id.split("-")[0])
 
-    client.pull(target=f"{REGISTRY_URL}/{repo}", outdir=f"{tool_id}")
-    with open(f"{tool_id}/bundle.json", "r") as f:
-        bundle = json.load(f)
+    outdir = os.path.join(TOOL_CACHE, tool_id)
+    target = f"{REGISTRY_URL}/{repo}"
+    current_mode = signing.mode()
+    if current_mode == signing.STRICT and not signing.is_immutable(target):
+        raise signing.SignatureError(
+            f"{target}: strict verification requires the caller to select an "
+            "immutable OCI manifest digest"
+        )
 
-    tool_bin = bundle["bin"]
-    shutil.copyfile(f"{tool_id}/{tool_bin}", tool_bin)
-    os.chmod(tool_bin, os.stat(tool_bin).st_mode |
-             stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    with _fetch_lock(tool_id):
+        manifest, manifest_digest, raw_manifest = fetch_manifest(target)
+        try:
+            subject = signing.immutable_reference(target, manifest_digest)
+        except signing.SignatureError:
+            subject = None
 
-    tools[tool_id] = bundle
-    return bundle
+        signing.check(target, manifest_digest, log=print)
+        evidence = evidence_verification.check(
+            subject,
+            raw_manifest,
+            client,
+            fetch_manifest,
+            log=print,
+        )
+
+        pull_target = subject if current_mode != signing.OFF and subject else target
+        if not cache_matches(outdir, manifest, pull_target):
+            staging = f"{outdir}.part.{uuid.uuid4().hex}"
+            os.makedirs(staging)
+            try:
+                client.pull(target=pull_target, outdir=staging)
+                verify_against_manifest(pull_target, staging, manifest=manifest)
+                evidence_verification.verify_pulled(
+                    staging, subject, tool_id, evidence, log=print
+                )
+                shutil.rmtree(outdir, ignore_errors=True)
+                os.replace(staging, outdir)
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+        else:
+            evidence_verification.verify_pulled(
+                outdir, subject, tool_id, evidence, log=print
+            )
+
+        with open(os.path.join(outdir, "bundle.json"), "r") as f:
+            bundle = json.load(f)
+
+        # Kept for the run manifest (#18). The registry publishes three
+        # artifacts per bundle and verify_against_manifest has just hashed all
+        # of them against the manifest -- so their identity is established here
+        # and was, until now, thrown away.
+        evidence = _bundle_evidence(outdir, manifest, target)
+
+        # Inside the lock, which is where master moved them: the cache entry and
+        # what this process believes about it are set together or a second
+        # fetcher can read one without the other.
+        tools[tool_id] = bundle
+        provenance[tool_id] = evidence
+        return ToolBundle(bundle, evidence)
+
+def _bundle_evidence(directory, manifest, target):
+    """What this bundle is, in the terms the registry stated it.
+
+    Digests come from the MANIFEST rather than from hashing the files again.
+    They are the same numbers -- verify_against_manifest has just checked that --
+    but taking them from the manifest records what the registry asserted, which
+    is the thing a reader of the manifest would want to compare against.
+    """
+    artifacts = {}
+    for layer in manifest.get("layers") or []:
+        title = (layer.get("annotations") or {}).get(_ANNOTATION_TITLE)
+        if title and layer.get("digest"):
+            artifacts[title] = layer["digest"]
+
+    evidence = {"target": target, "artifacts": artifacts}
+
+    # The hub's own build evidence, if this bundle carries it. Referenced by
+    # digest AND summarised, so a manifest is readable without the registry
+    # while still saying exactly which document it means.
+    build = os.path.join(directory, "build-evidence.json")
+    if os.path.exists(build):
+        try:
+            with open(build, "r") as handle:
+                document = json.load(handle)
+        except (OSError, ValueError):
+            return evidence
+        evidence["build_evidence"] = {
+            "schema": document.get("schema"),
+            "generated_at": document.get("generated_at"),
+            "hub": document.get("hub"),
+            "recipe": {
+                key: (document.get("recipe") or {}).get(key)
+                for key in ("id", "name", "version", "digest")
+            },
+            "operation": document.get("operation"),
+        }
+    return evidence
+
+
+def expected_uploads(workflow):
+    """The files the client has to supply, derived from the workflow itself.
+
+    Every intermediate file is named for the edge that carries it, so the set a
+    run consumes and the set it produces are both known before anything runs.
+    What is consumed but not produced by any node is what has to arrive as an
+    upload; everything else the run creates for itself.
+
+    This is the second of the two gates described in workspace.py. check_name
+    decides whether a name is a usable file name at all; this decides whether it
+    is one this run has any business receiving. Each catches what the other
+    cannot -- "samtools" is a perfectly good file name, and an output slot is a
+    name the workflow does declare.
+    """
+    produced = {name for node in workflow.nodes for name in node.outputs}
+    consumed = {io.file for node in workflow.nodes for io in node.inputs.values()}
+    return consumed - produced
+
+
+def materialise_tools(workflow, ws):
+    """Put a copy of each tool's binary into this run's workspace.
+
+    Separate from fetch_tool so the cache is pulled once and every run still
+    gets its own copy. Done before the uploads, so that an upload named after a
+    binary is refused by O_EXCL rather than silently replacing it.
+
+    Once per BINARY, not once per node. Several operations routinely share one
+    executable -- 80 of the 176 in the catalogue do, including all 15 samtools
+    operations and all 20 seqtk ones -- so a workflow as ordinary as
+    "samtools sort" into "samtools index" has two nodes naming the same binary.
+    Placing it per node made the second one fail O_EXCL with FileExistsError and
+    the whole request 500. The old fetch_tool hid this behind its memo, which
+    returned early and skipped the copy; splitting the cache out lost that and
+    nothing replaced it.
+    """
+    by_name = {}
+    for node in workflow.nodes:
+        name = check_name(node.bin)
+        by_name.setdefault(name, []).append(node)
+
+    for name, nodes in by_name.items():
+        tool_id = check_name(nodes[0].id.split("-")[0])
+        source = os.path.join(TOOL_CACHE, tool_id, name)
+        with _fetch_lock(tool_id):
+            ws.place_executable(source, name)
+
+        evidenced_nodes = [node for node in nodes
+                           if getattr(node, "provenance", {})]
+        if not evidenced_nodes:
+            continue
+
+        digest = hashlib.sha256()
+        try:
+            with ws.open_read(name, regular_only=True) as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        except (OSError, ValueError) as error:
+            raise ToolIntegrityError(
+                f"staged tool {name!r} could not be read as a regular file"
+            ) from error
+        actual = "sha256:" + digest.hexdigest()
+
+        for node in evidenced_nodes:
+            evidence = node.provenance
+            expected = (evidence.get("artifacts") or {}).get(name)
+            if not expected:
+                raise ToolIntegrityError(
+                    f"tool {node.id!r} has no registry digest for executable {name!r}"
+                )
+            if expected != actual:
+                raise ToolIntegrityError(
+                    f"tool {node.id!r} executable {name!r} has digest {actual}, "
+                    f"expected {expected}"
+                )
+
+
+def sh_literal(value) -> str:
+    """A token that must reach the shell as one argument, exactly as written.
+
+    Two escapes, applied in this order, for two different readers.
+
+    `shlex.quote` makes the value a single shell word, so a value of `; id`
+    becomes `'; id'` and the shell reads text where it used to read a second
+    command. `str()` first because a value is whatever JSON decoded -- a recipe
+    default of `2` arrives as an int, and joining that raised TypeError (#37).
+
+    Then the braces are doubled, because Snakemake formats the shell block
+    before any shell sees it. Verified against snakemake 9.21.0: a lone `{` in a
+    shell block is a NameError and the run exits 1, while `{{` renders as `{`.
+    Doubling also means a value containing `{input.i_0}` is written out as text
+    instead of expanding to another rule's field.
+    """
+    return shlex.quote(str(value)).replace("{", "{{").replace("}", "}}")
+
+
+def sh_field(reference: str) -> str:
+    """A Snakemake field reference, quoted by Snakemake when it expands.
+
+    `:q` applies shell quoting to whatever the field expands to, so a path
+    containing a space stays one argument rather than becoming two. Verified
+    against snakemake 9.21.0.
+
+    The braces here are deliberately NOT doubled -- they are what makes this a
+    reference rather than literal text.
+    """
+    return f"{{{reference}:q}}"
+
+
+def py_string(value: str) -> str:
+    """A Python string literal for the input:/output: sections of a rule.
+
+    Those sections are Python, not shell, so a name containing a quote would
+    end the literal and let the rest be read as code. json.dumps produces the
+    same bytes as the hand-written f-string for every name in the catalogue and
+    stays valid for names that are not.
+    """
+    return json.dumps(value)
+
+
+def rule_name_for(node_id: str) -> str:
+    """Snakemake rule names are Python identifiers.
+
+    A node id is "{operation.id}-{timestamp}", so both separators have to go.
+    The result is checked rather than assumed: a node id is client-supplied, and
+    one containing a newline would otherwise write new lines into the Snakefile
+    at the point where a rule is declared -- which no amount of shell quoting
+    further down would help with.
+    """
+    name = node_id.replace(".", "_").replace("-", "_")
+    if not name.isidentifier() or keyword.iskeyword(name):
+        raise ValueError(f"node id {node_id!r} does not make a usable rule name")
+    return name
 
 
 def get_node_data(node_id, node_list):
     return next(node for node in node_list if node["id"] == node_id)
+
+
+class WorkflowInputError(ValueError):
+    pass
 
 
 def parse_biochef_workflow(biochef_workflow):
@@ -124,7 +593,10 @@ def parse_biochef_workflow(biochef_workflow):
 
         tool_info = fetch_tool(node_id, node["data"]["repo"])
 
-        new_node: Node = Node(id=node_id, bin=tool_info["bin"])
+        new_node: Node = Node(
+            id=node_id, bin=tool_info["bin"],
+            provenance=copy.deepcopy(getattr(tool_info, "provenance", {})),
+        )
 
         connections = [e for e in edge_list if node_id in (e["target"], e["source"])]
 
@@ -206,7 +678,7 @@ def parse_biochef_workflow(biochef_workflow):
             # Only where the recipe declares a default. The other 29 required
             # parameters are visible ones a user genuinely has to supply --
             # sed's script, tr's set1 -- and there is nothing to fall back on;
-            # inventing a value for those would be worse than omitting them.
+            # inventing a value for those would be worse than rejecting the run.
             if not enabled:
                 if not param_info.get("required"):
                     continue
@@ -218,18 +690,25 @@ def parse_biochef_workflow(biochef_workflow):
                     # and gives nothing to fall back on because there is nothing
                     # to fall back to.
                     value = ""
-                elif param_info.get("default") is None:
-                    continue
                 else:
-                    value = param_info["default"]
+                    value = param_info.get("default")
             else:
-                value = param["value"]
+                value = (param.get("value") if param_info.get("required")
+                         else param["value"])
                 # An enabled required parameter with nothing in it falls back to
                 # the recipe too, so a client that sends the key but leaves the
                 # value empty is no worse off than one that omits it entirely.
-                if value == "" and param_info.get("required") \
+                if (value is None or value == "") and param_info.get("required") \
                         and param_info.get("default") is not None:
                     value = param_info["default"]
+
+            if param_info.get("required"):
+                if param_info.get("type") == "flag":
+                    value = ""
+                elif value is None or value == "":
+                    raise WorkflowInputError(
+                        f"node {node_id!r} is missing required parameter {param_key!r}"
+                    )
 
             new_param: Param = Param(
                 name=param_key,
@@ -245,65 +724,13 @@ def parse_biochef_workflow(biochef_workflow):
     return new_workflow
 
 
-def sh_literal(value) -> str:
-    """A token that must reach the shell as one argument, exactly as written.
-
-    Two escapes, applied in this order, for two different readers.
-
-    `shlex.quote` makes the value a single shell word, so a value of `; id`
-    becomes `'; id'` and the shell reads text where it used to read a second
-    command. `str()` first because a value is whatever JSON decoded -- a recipe
-    default of `2` arrives as an int, and joining that raised TypeError (#37).
-
-    Then the braces are doubled, because Snakemake formats the shell block
-    before any shell sees it. Verified against snakemake 9.21.0: a lone `{` in a
-    shell block is a NameError and the run exits 1, while `{{` renders as `{`.
-    Doubling also means a value containing `{input.i_0}` is written out as text
-    instead of expanding to another rule's field.
-    """
-    return shlex.quote(str(value)).replace("{", "{{").replace("}", "}}")
-
-
-def sh_field(reference: str) -> str:
-    """A Snakemake field reference, quoted by Snakemake when it expands.
-
-    `:q` applies shell quoting to whatever the field expands to, so a path
-    containing a space stays one argument rather than becoming two. Verified
-    against snakemake 9.21.0.
-
-    The braces here are deliberately NOT doubled -- they are what makes this a
-    reference rather than literal text.
-    """
-    return f"{{{reference}:q}}"
-
-
-def py_string(value: str) -> str:
-    """A Python string literal for the input:/output: sections of a rule.
-
-    Those sections are Python, not shell, so a name containing a quote would
-    end the literal and let the rest be read as code. json.dumps produces the
-    same bytes as the hand-written f-string for every name in the catalogue and
-    stays valid for names that are not.
-    """
-    return json.dumps(value)
-
-
-def rule_name_for(node_id: str) -> str:
-    """Snakemake rule names are Python identifiers.
-
-    A node id is "{operation.id}-{timestamp}", so both separators have to go.
-    The result is checked rather than assumed: a node id is client-supplied, and
-    one containing a newline would otherwise write new lines into the Snakefile
-    at the point where a rule is declared -- which no amount of shell quoting
-    further down would help with.
-    """
-    name = node_id.replace(".", "_").replace("-", "_")
-    if not name.isidentifier() or keyword.iskeyword(name):
-        raise ValueError(f"node id {node_id!r} does not make a usable rule name")
-    return name
-
-
-def convert_to_snakemake(workflow: Workflow):
+def convert_to_snakemake(workflow: Workflow, step_logs=None):
+    if step_logs is not None and len(step_logs) != len(workflow.nodes):
+        raise ValueError("one pair of log names is required for each node")
+    if step_logs is not None:
+        names = [check_name(name) for pair in step_logs for name in pair]
+        if len(set(names)) != len(names):
+            raise ValueError("step log names must be distinct")
     result = []
     result.append("rule all:\n    input:")
 
@@ -311,12 +738,15 @@ def convert_to_snakemake(workflow: Workflow):
         for output in node.outputs.values():
             result.append(f"        {py_string(output.file)},")
 
-    for node in workflow.nodes:
+    for index, node in enumerate(workflow.nodes):
         result.append(f"rule {rule_name_for(node.id)}:")
         cmd = [sh_literal(f"./{node.bin}")]
         extra_cms = []
 
         for param_name, param in node.parameters.items():
+            # Omit empty typed values with their flags, matching the browser.
+            if param.type not in (None, "flag") and param.value == "":
+                continue
             if param.flag:
                 cmd.append(sh_literal(param.flag))
 
@@ -419,6 +849,13 @@ def convert_to_snakemake(workflow: Workflow):
         # doubling done by sh_literal survives untouched, so Snakemake's
         # formatter still reads what it should.
         shell_body = "\n".join([command_line] + extra_cms)
+        if step_logs is not None:
+            stdout_name, stderr_name = step_logs[index]
+            result.append(
+                f"    log: stdout={py_string(check_name(stdout_name))}, "
+                f"stderr={py_string(check_name(stderr_name))}"
+            )
+            shell_body = "(\n" + shell_body + "\n) > {log.stdout:q} 2> {log.stderr:q}"
         result.append("    shell:")
         result.append(f"        {py_string(shell_body)}")
 
