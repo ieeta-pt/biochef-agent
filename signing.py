@@ -52,6 +52,7 @@ REQUIRED = (
 )
 
 DEFAULT_TIMEOUT_SECONDS = 60
+SIGNATURE_PREDICATE_TYPE = "https://sigstore.dev/cosign/sign/v1"
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -173,7 +174,8 @@ def verify(reference, digest, policy, cosign=None, timeout=DEFAULT_TIMEOUT_SECON
     target = immutable_reference(reference, digest)
 
     command = [
-        binary, "verify",
+        binary, "verify-attestation",
+        "--type", SIGNATURE_PREDICATE_TYPE,
         "--certificate-identity", policy["certificate_identity"],
         "--certificate-oidc-issuer", policy["certificate_oidc_issuer"],
         target,
