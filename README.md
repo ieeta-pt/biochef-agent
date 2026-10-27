@@ -521,3 +521,11 @@ writes and validates `intermediate.json` inside each run workspace before
 generating its Snakefile. Workspace retention follows `BIOCHEF_KEEP_WORKSPACE`.
 The document carries tool provenance and effective parameter values, which may
 be sensitive; it has the same local access boundary as the run workspace.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
