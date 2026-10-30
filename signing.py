@@ -52,6 +52,7 @@ REQUIRED = (
 )
 
 DEFAULT_TIMEOUT_SECONDS = 60
+SIGNATURE_PREDICATE_TYPE = "https://sigstore.dev/cosign/sign/v1"
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -117,8 +118,8 @@ def covered_by(reference, policy):
     Verifying a signature on an artifact the policy was not written for proves
     nothing about the artifact we are about to run. An operator who points the
     service at a different registry has not thereby made that registry
-    trusted -- and without this check, `cosign verify` succeeding against some
-    other prefix would look exactly like success against this one.
+    trusted -- and without this check, a signature check succeeding against
+    some other prefix would look exactly like success against this one.
     """
     return reference.lower().startswith(policy["registry_prefix"].lower())
 
@@ -173,7 +174,8 @@ def verify(reference, digest, policy, cosign=None, timeout=DEFAULT_TIMEOUT_SECON
     target = immutable_reference(reference, digest)
 
     command = [
-        binary, "verify",
+        binary, "verify-attestation",
+        "--type", SIGNATURE_PREDICATE_TYPE,
         "--certificate-identity", policy["certificate_identity"],
         "--certificate-oidc-issuer", policy["certificate_oidc_issuer"],
         target,
