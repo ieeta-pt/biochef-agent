@@ -183,6 +183,12 @@
     "trimal.tofasta": "sha256: ba87b4c5d530f9b1",
     "trimal.trim": "sha256: adb70d7b7d4b25e1",
     "viralconsensus.consensus": "sha256: 610353d1daca2c9e",
-    "wgsim.simulate": "sha256: 14ce4cb75496780f"
+    "wgsim.simulate": "sha256: 14ce4cb75496780f",
+    "yak.count": "sha256: 1dafc7e66b825d8b",
+    "yak.inspect": "sha256: 424ec64da71b83ff",
+    "yak.isec": "sha256: 38ffb377df0f4c4c",
+    "yak.print": "sha256: 57ce7804f52a852e",
+    "yak.qv": "sha256: f13f434dc862ee9c",
+    "yak.subtract": "sha256: 023ef449d181f725"
   }
 }
