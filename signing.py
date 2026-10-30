@@ -118,8 +118,8 @@ def covered_by(reference, policy):
     Verifying a signature on an artifact the policy was not written for proves
     nothing about the artifact we are about to run. An operator who points the
     service at a different registry has not thereby made that registry
-    trusted -- and without this check, `cosign verify` succeeding against some
-    other prefix would look exactly like success against this one.
+    trusted -- and without this check, a signature check succeeding against
+    some other prefix would look exactly like success against this one.
     """
     return reference.lower().startswith(policy["registry_prefix"].lower())
 
