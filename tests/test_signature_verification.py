@@ -253,6 +253,11 @@ def test_cosign_is_asked_about_the_digest_and_not_the_tag(tmp_path, monkeypatch)
     policy = signing.load_policy(_policy_file(tmp_path))
     signing.verify(REFERENCE, DIGEST, policy, cosign=str(cosign))
     argv = recorder.read_text().split("\n")
+    assert argv[:3] == [
+        "verify-attestation",
+        "--type",
+        "https://sigstore.dev/cosign/sign/v1",
+    ]
     assert f"registry.example.test/biochef-plugins-samtools.view@{DIGEST}" in argv
     assert POLICY["certificate_identity"] in argv
     assert POLICY["certificate_oidc_issuer"] in argv
