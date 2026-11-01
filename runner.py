@@ -3,8 +3,7 @@
 E2 asks for a second Runner provider. This is the first one, and the seam that
 makes a second possible.
 
-The split is deliberate and is the whole point of the file. Running a workflow is
-two things fused together in the version this replaces:
+The split is the whole point of the file. Running a workflow is two things:
 
   policy    the timeout, and killing the whole process group rather than the
             child. Every provider needs this, and it is the part that was hard
@@ -26,6 +25,8 @@ import subprocess
 import threading
 import time
 from typing import List, NamedTuple
+
+from steplogs import TailBuffer
 
 
 def _kill_group(pgid):
@@ -111,7 +112,10 @@ class Runner:
         # Two threads, one per stream, because draining only one of them is the
         # deadlock communicate() exists to avoid: a tool that fills the other
         # pipe's buffer blocks forever waiting for someone to read it.
-        collected = {"stdout": [], "stderr": []}
+        # Bounded, so a chatty tool cannot decide how much memory the agent
+        # uses. Nothing is lost that would have survived being recorded: the
+        # store keeps MAX_LOG_BYTES of a stream either way.
+        collected = {"stdout": TailBuffer(), "stderr": TailBuffer()}
         reader_errors = []
 
         def pump(stream, name):
@@ -201,10 +205,9 @@ class Runner:
                 reader.join(timeout=10)
             raise
         finally:
-            # Reached by every path, and by now the group is either reaped or
-            # killed above. An earlier version of this comment said "both paths
-            # reach here, and both have reaped the child", which was true of the
-            # two paths it named and false of every other.
+            # Reached by every path, and by now the group is either reaped
+            # normally or killed above -- including the paths that raise, which
+            # is why the kill is in an except rather than only in the timeout.
             #
             for reader in readers:
                 if reader not in started_readers:
@@ -216,11 +219,15 @@ class Runner:
             if on_finish is not None:
                 on_finish()
 
-        # Reading may exceed the deadline after the direct child exits 0.
-        # That must still be reported as a failed run.
+        # The local, not process.returncode. Both branches of this merge were
+        # guarding the same line against different mistakes and the one below
+        # already covers both: it takes the process's real code -- so a run that
+        # had already exited 3 does not come back claiming the signal we sent --
+        # and substitutes only when that code is 0 after we killed the group,
+        # because reading that overran the deadline did not produce a success.
         return RunResult(returncode,
-                         "".join(collected["stdout"]),
-                         "".join(collected["stderr"]))
+                         collected["stdout"].text(),
+                         collected["stderr"].text())
 
 
 class SubprocessRunner(Runner):
