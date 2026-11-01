@@ -78,10 +78,6 @@ MALFORMED = {
     "a parameter is a string":
         '{"nodes": [{"id": "t-1", "type": "workflowNode",'
         ' "data": {"repo": "r", "paramValues": {"k": "v"}}}], "edges": []}',
-    "an enabled parameter has no value":
-        '{"nodes": [{"id": "t-1", "type": "workflowNode",'
-        ' "data": {"repo": "r", "paramValues": {"k": {"enabled": true}}}}],'
-        ' "edges": []}',
     "an edge is a number": '{"nodes": [], "edges": [3]}',
     "an edge has no source": '{"nodes": [], "edges": [{"target": "x"}]}',
     "an edge has no target": '{"nodes": [], "edges": [{"source": "x"}]}',
@@ -221,8 +217,8 @@ def test_the_shape_check_runs_before_a_workspace_is_made():
 # naming something the tool does not declare
 #
 # read_workflow_document cannot catch these: it runs before the bundle is
-# pulled, so it does not know which handles or parameters a tool has. They
-# were three bare next(...) calls with no default, which raised StopIteration
+# pulled, so it does not know which handles a tool has. They were bare
+# next(...) calls with no default, which raised StopIteration
 # from the middle of a run -- 500 on /convert, and SYSTEM_ERROR carrying
 # "coroutine raised StopIteration" on /runs. The same mistake this file is
 # about, in the one place its own check cannot reach.
@@ -246,8 +242,6 @@ def _naming(**change):
 
 
 @pytest.mark.parametrize("label, document, named", [
-    ("a parameter the tool does not declare",
-     _naming(parameter="not-a-real-flag"), "not-a-real-flag"),
     ("an input handle the tool does not have",
      _naming(target_handle="no-such-input"), "no-such-input"),
     ("an output handle the tool does not have",
@@ -268,7 +262,6 @@ def test_naming_what_the_tool_lacks_is_refused(service, label, document, named):
 
 
 @pytest.mark.parametrize("label, document", [
-    ("parameter", _naming(parameter="not-a-real-flag")),
     ("input handle", _naming(target_handle="no-such-input")),
     ("output handle", _naming(source_handle="no-such-output")),
 ])
@@ -298,7 +291,7 @@ def test_runs_calls_these_the_submissions_fault_too(service):
     with TestClient(main.app) as client:
         submitted = client.post(
             "/runs",
-            data={"biochef_workflow": _naming(parameter="not-a-real-flag")},
+            data={"biochef_workflow": _naming(target_handle="no-such-input")},
             files=UPLOAD)
         assert submitted.status_code == 202
         run_id = submitted.json()["run_id"]
@@ -322,3 +315,61 @@ def test_a_valid_workflow_is_unaffected(service):
 
     assert response.status_code == 200, response.text
     assert response.json()["tool-1"]["out"]
+
+
+# ---------------------------------------------------------------------------
+# an enabled parameter with no value
+#
+# Only the recipe says whether a parameter is required, and a required one
+# falls back to its default, so this is decided after the bundle is pulled and
+# not in read_workflow_document. A parameter the recipe does not declare is
+# ignored (test_parameter_order.py), so these use one it declares.
+
+PARAMETER_BUNDLE = {
+    "id": "t", "name": "t", "bin": "t",
+    "io": {"inputs": [{"name": "in", "types": ["T"], "mode": "file"}],
+           "outputs": [{"name": "out", "types": ["T"], "mode": "stdout"}]},
+    "parameters": [
+        {"name": "optional", "type": "string", "flag": "-o"},
+        {"name": "needed", "type": "string", "flag": "-n", "required": True,
+         "default": "fallback"},
+    ],
+}
+
+
+def _with_parameters(param_values):
+    return {
+        "nodes": [
+            {"id": "input-1", "type": "inputWorkflowNode", "data": {}},
+            {"id": "t-1", "type": "workflowNode",
+             "data": {"label": "t", "repo": "r", "outputs": {},
+                      "paramValues": param_values}},
+            {"id": "output-1", "type": "outputWorkflowNode", "data": {}},
+        ],
+        "edges": [
+            {"source": "input-1", "sourceHandle": "out",
+             "target": "t-1", "targetHandle": "in"},
+            {"source": "t-1", "sourceHandle": "out",
+             "target": "output-1", "targetHandle": "in"},
+        ],
+    }
+
+
+def test_an_enabled_optional_parameter_with_no_value_is_refused(monkeypatch):
+    monkeypatch.setattr(convert, "fetch_tool", lambda tool_id, repo: PARAMETER_BUNDLE)
+    convert.tools.clear()
+
+    with pytest.raises(convert.WorkflowInputError,
+                       match="parameter 'optional' is enabled and has no 'value'"):
+        convert.parse_biochef_workflow(
+            _with_parameters({"optional": {"enabled": True}}))
+
+
+def test_an_enabled_required_parameter_with_no_value_takes_its_default(monkeypatch):
+    monkeypatch.setattr(convert, "fetch_tool", lambda tool_id, repo: PARAMETER_BUNDLE)
+    convert.tools.clear()
+
+    workflow = convert.parse_biochef_workflow(
+        _with_parameters({"needed": {"enabled": True}}))
+
+    assert workflow.nodes[0].parameters["needed"].value == "fallback"
