@@ -136,6 +136,23 @@ def test_close_keeps_workspace_and_releases_descriptor(tmp_path):
     assert not path.exists()
 
 
+def test_a_closed_workspace_cannot_open_a_same_named_cwd_file(tmp_path,
+                                                              monkeypatch):
+    """A released dirfd must not turn a workspace read into a cwd lookup."""
+    ws = make_workspace(str(tmp_path / "runs"))
+    Path(ws.path, "result").write_bytes(b"workspace result")
+    monkeypatch.chdir(tmp_path)
+    Path("result").write_bytes(b"unrelated cwd file")
+    ws.close()
+
+    try:
+        with pytest.raises(OSError):
+            with ws.open_read("result") as handle:
+                handle.read()
+    finally:
+        ws.cleanup()
+
+
 # --------------------------------------------------------------------------
 # the timeout, which is only correct if it kills the group
 
