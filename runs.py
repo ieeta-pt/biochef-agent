@@ -1,8 +1,7 @@
 """A run that outlives the request that asked for it (#5).
 
-B1 wants the WES `RunState` vocabulary rather than one of our own, so that
-exposing this as a WES endpoint later (F5) is an adapter and not a rewrite. The
-names below are exactly WES's, spelled the same way.
+B1 uses the eight WES-style `RunState` names required by issue #5. A complete
+WES API remains a separate endpoint task.
 
 The store is in memory and deliberately small in ambition. It is enough for
 "submit, poll, collect", which is what B1 asks for, and it is honest about what
@@ -14,6 +13,8 @@ persistent store is its own piece of work.
 import os
 import threading
 import uuid
+
+import audit
 from collections import OrderedDict
 from enum import Enum
 
@@ -22,7 +23,7 @@ from typing import Optional
 
 
 class RunState(str, Enum):
-    """The WES run states, verbatim.
+    """The eight WES-style run states required by issue #5.
 
     str-valued so a state serialises as its own name in JSON without anything
     having to convert it, and so a comparison against the string works.
@@ -70,15 +71,21 @@ class IllegalTransition(Exception):
     """A state change the machine does not permit."""
 
 
+class RunCapacityError(Exception):
+    """This process cannot retain another run."""
+
+
 MAX_RUNS = int(os.getenv("BIOCHEF_MAX_RUNS", "256"))
 """How many runs are remembered.
 
 Bounded because this is a dictionary that only ever grew otherwise, and a
 long-lived service accepting runs would use memory in proportion to its uptime.
-When it is full the oldest FINISHED run is forgotten; a run still in flight is
-never evicted, because forgetting it would lose the only handle to work that is
-still happening.
+When it is full the oldest FINISHED run is forgotten; if every slot is still
+in flight, a new submission is refused instead of evicting live work.
 """
+
+if MAX_RUNS < 1:
+    raise ValueError("BIOCHEF_MAX_RUNS must be positive")
 
 
 class Run:
@@ -92,7 +99,14 @@ class Run:
         self.stdout = ""
         self.stderr = ""
         self.failed_steps = {}
+        self.manifest = None
+        """How this run was produced (#18), once it has finished."""
+        self.output_files = {}
+        """Which file in the workspace holds each output, once a run has made
+        them. What the streaming endpoint serves, so that a client never names a
+        path -- it names a node and a handle, and this says what that means."""
         self.step_status = {}
+        self.node_logs = {}
         self.pgid = None
         """The process group executing this run, once there is one.
 
@@ -102,11 +116,11 @@ class Run:
         """
 
     def logs_as_dict(self) -> dict:
-        """What this run printed, and which steps failed.
+        """Run-level output, diagnostic error blocks, and per-node output.
 
-        `steps` is only ever the failing ones, and the docstring on steplogs
-        explains why: snakemake attributes failures by name and does not
-        separate anything else.
+        `failed_steps` is populated only on a failed workflow, from Snakemake-style
+        stderr headings. Tool output can imitate those headings. `node_logs`
+        comes from separate files opened for each executed rule.
         """
         return {
             "run_id": self.run_id,
@@ -114,6 +128,7 @@ class Run:
             "stdout": self.stdout,
             "stderr": self.stderr,
             "failed_steps": self.failed_steps,
+            "node_logs": self.node_logs,
         }
 
     def as_dict(self) -> dict:
@@ -150,13 +165,74 @@ class RunStore:
         self._runs = OrderedDict()
         self._lock = threading.Lock()
         self._max = MAX_RUNS if max_runs is None else max_runs
+        if self._max < 1:
+            raise ValueError("max_runs must be positive")
 
-    def create(self) -> Run:
-        run = Run(uuid.uuid4().hex)
+    def create(self, caller=None, authenticated_by=None) -> Run:
         with self._lock:
             self._evict_if_needed()
+            run = Run(uuid.uuid4().hex)
+            # Set before the run is published into _runs, and inside the lock
+            # that publishes it, so no reader can ever see a run whose caller is
+            # not yet recorded -- an audit trail with a gap in it is worse than
+            # one that is late.
+            run.caller = caller
+            run.authenticated_by = authenticated_by
+            self._record_state(run, RunState.QUEUED)
             self._runs[run.run_id] = run
         return run
+
+    @staticmethod
+    def _record_state(run: Run, state: RunState,
+                      error: Optional[str] = None) -> None:
+        audit.record(
+            "run.state",
+            run_id=run.run_id,
+            # .value, not str(): this is a str-Enum, and str() gives
+            # "RunState.RUNNING" rather than the WES term "RUNNING". #64
+            # adopted that vocabulary precisely so the states would be
+            # legible to something that is not this service, and an
+            # exported trail is exactly that reader.
+            state=state.value,
+            caller=getattr(run, "caller", None),
+            authenticated_by=getattr(run, "authenticated_by", None),
+            error=error if error is not None else run.error,
+        )
+
+    def discard(self, run_id: str) -> None:
+        """Undo admission when request upload fails before a run is launched."""
+        with self._lock:
+            del self._runs[run_id]
+
+    def state_counts(self) -> dict:
+        """How many retained runs sit in each state.
+
+        Walked from the store rather than kept as a running tally. A tally
+        drifts the first time an eviction or a refused transition is not
+        accounted for, and a count that is quietly wrong is worse than one that
+        costs a walk of at most MAX_RUNS entries -- a hub routes work on this.
+
+        Under the lock, because requests arrive while this walk is happening:
+        an admission inserts and may evict, which changes the dict's size
+        mid-iteration and is a RuntimeError in whichever thread is unlucky,
+        while a worker advancing a run changes the state being read.
+        """
+        counts = {}
+        with self._lock:
+            for run in self._runs.values():
+                counts[run.state.value] = counts.get(run.state.value, 0) + 1
+        return counts
+
+    def all(self):
+        """Every run still held, newest first.
+
+        A copy taken under the lock. Handing out the OrderedDict itself would let
+        a caller iterate it while a worker thread advances a run or eviction
+        removes one, which is a RuntimeError in the reader and a puzzle to
+        diagnose in a request that merely listed something.
+        """
+        with self._lock:
+            return list(reversed(self._runs.values()))
 
     def get(self, run_id: str) -> Run:
         with self._lock:
@@ -186,6 +262,27 @@ class RunStore:
                     f"transition this run may make"
                 )
 
+            # Here rather than at each call site, because this is the only place
+            # a state changes. A hook at the call sites is one a new transition
+            # forgets to add, and the gap in an audit trail is invisible from
+            # inside the thing that should have written it. Keep the audit
+            # attempt and the state commit under this lock so a concurrent
+            # cancellation cannot slip between them.
+            try:
+                self._record_state(run, state, error)
+            except audit.AuditError as exc:
+                # Keep cancellation possible through an audit outage, and expose
+                # that missing record in the run's pollable error.
+                cause = error if error is not None else run.error
+                failure = {"error": "audit_error", "message": str(exc)}
+                if cause is not None:
+                    failure["cause"] = cause
+                run.state = (state if state in (RunState.CANCELING, RunState.CANCELED)
+                             else RunState.SYSTEM_ERROR)
+                run.outputs = None
+                run.error = failure
+                raise
+
             run.state = state
             if outputs is not None:
                 run.outputs = outputs
@@ -193,12 +290,28 @@ class RunStore:
                 run.error = error
             return run
 
-    def attach(self, run_id: str, pgid: int) -> None:
-        """Record the process group, so something can end it later."""
+    def attach(self, run_id: str, pgid: int) -> bool:
+        """Record the group and report if cancellation arrived before it did."""
         with self._lock:
             run = self._runs.get(run_id)
             if run is not None:
                 run.pgid = pgid
+                return run.state is RunState.CANCELING
+            return False
+
+    def record_manifest(self, run_id: str, document) -> None:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is not None:
+                run.manifest = document
+
+    def record_outputs(self, run_id: str, catalogue) -> None:
+        """What each output handle is called inside the workspace."""
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is not None:
+                run.output_files = {node: dict(handles)
+                                    for node, handles in catalogue.items()}
 
     def record_progress(self, run_id: str, step_status) -> None:
         """Per-step status, replaced wholesale as it changes.
@@ -211,8 +324,9 @@ class RunStore:
             if run is not None:
                 run.step_status = dict(step_status)
 
-    def record_logs(self, run_id: str, stdout, stderr, steps) -> None:
-        """Keep what the run printed, bounded, with failures already attributed.
+    def record_logs(self, run_id: str, stdout, stderr, steps,
+                    node_logs=None) -> None:
+        """Keep bounded stream tails, node logs, and diagnostic blocks.
 
         The attribution arrives finished rather than being worked out here.
         Doing it in this module would mean importing the emitter for its rule
@@ -226,6 +340,7 @@ class RunStore:
             run.stdout = clamp(stdout)
             run.stderr = clamp(stderr)
             run.failed_steps = steps
+            run.node_logs = node_logs or {}
 
     def detach(self, run_id: str) -> None:
         """Forget the process group, because it no longer exists.
@@ -246,8 +361,4 @@ class RunStore:
                     del self._runs[run_id]
                     break
             else:
-                # Everything remembered is still in flight. Forgetting one would
-                # lose the only handle to work that is still happening, so the
-                # store grows past its bound rather than doing that, and the
-                # ceiling is enforced again as soon as anything finishes.
-                return
+                raise RunCapacityError("all remembered runs are still in flight")

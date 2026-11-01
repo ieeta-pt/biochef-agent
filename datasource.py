@@ -68,6 +68,64 @@ class UploadSource(DataSource):
         ws.write_bytes(name, bytes(spec))
 
 
+class SpooledSource(DataSource):
+    """An upload starlette has already spooled to a temporary file.
+
+    Starlette writes a part larger than a megabyte to disk rather than keeping
+    it in memory, and hands back a file object. Reading that with `await
+    f.read()` -- which is what the service did -- undoes the favour by pulling
+    the whole thing back into one bytes object.
+
+    This copies from the spooled file to the workspace in chunks instead, so a
+    multi-gigabyte input never exists whole anywhere. The spec is the readable
+    itself rather than its contents, which is the difference.
+    """
+
+    name = "spooled"
+
+    def fetch(self, ws, name: str, spec) -> None:
+        if not hasattr(spec, "read"):
+            raise DataSourceError(
+                f"{name!r}: the spooled source expects something readable, got "
+                f"{type(spec).__name__}"
+            )
+        ws.write_stream(name, spec)
+
+
+class HandedOverSource(DataSource):
+    """A temporary file this service wrote and now owns.
+
+    The asynchronous path needs it. A submission returns immediately, so the
+    request -- and the file starlette spooled for it -- is long gone before the
+    work starts. The upload has to be taken into a file of our own while the
+    request is still open, without ever holding it in memory.
+
+    It deletes that file once the workspace has it, on every path. A source that
+    leaks one temporary file per input on a service built for large ones is a
+    slower version of the problem D2 exists to fix.
+
+    Not something a client can ask for: the path is one this service just wrote,
+    never one a caller supplies.
+    """
+
+    name = "handedover"
+
+    def fetch(self, ws, name: str, spec) -> None:
+        if not isinstance(spec, str) or not spec:
+            raise DataSourceError(
+                f"{name!r}: the handedover source expects a path, got "
+                f"{type(spec).__name__}"
+            )
+        try:
+            with open(spec, "rb") as source:
+                ws.write_stream(name, source)
+        finally:
+            try:
+                os.unlink(spec)
+            except OSError:
+                pass
+
+
 class LocalPathSource(DataSource):
     """A file already on the agent's host.
 
@@ -92,6 +150,10 @@ class LocalPathSource(DataSource):
                 "guessing at one, because the client chooses the path."
             )
         self.root = os.path.realpath(root)
+        if not os.path.isdir(self.root):
+            raise ValueError(
+                f"BIOCHEF_LOCAL_ROOT {self.root!r} is not an existing directory"
+            )
 
     def describe(self) -> str:
         return f"{self.name} ({self.root})"
@@ -102,6 +164,9 @@ class LocalPathSource(DataSource):
                 f"{name!r}: the localpath source expects a path, got "
                 f"{type(spec).__name__}"
             )
+
+        if "\x00" in spec:
+            raise DataSourceError(f"{name!r}: the localpath path contains a NUL byte")
 
         # Resolved and then checked against the root, rather than checked and
         # then resolved. A symlink inside the root pointing outside it passes
@@ -389,6 +454,8 @@ def _open_url(url, headers, follow_redirects=False):
 
 PROVIDERS = {
     UploadSource.name: UploadSource,
+    SpooledSource.name: SpooledSource,
+    HandedOverSource.name: HandedOverSource,
     LocalPathSource.name: LocalPathSource,
     DrsSource.name: DrsSource,
 }
@@ -412,13 +479,15 @@ engine attached.
 
 ENABLED = [
     part.strip() for part in
-    os.getenv("BIOCHEF_DATA_SOURCES", UploadSource.name).split(",")
+    os.getenv("BIOCHEF_DATA_SOURCES",
+              f"{UploadSource.name},{SpooledSource.name},"
+              f"{HandedOverSource.name}").split(",")
     if part.strip()
 ]
 """Which sources a deployment permits, most restrictive first in the docs.
 
-Defaults to `upload` alone, so nothing changes for an existing deployment and
-localpath is something an operator turns on knowingly.
+Defaults to `upload,spooled,handedover`: `upload` handles bytes directly as the current status expects, `spooled` supports `/convert` and `handedover` keeps uploaded files available for `/runs` after the request ends. localpath is something an operator
+turns on knowingly.
 """
 
 

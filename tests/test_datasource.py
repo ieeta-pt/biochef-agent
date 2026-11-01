@@ -67,8 +67,14 @@ from workspace import make_workspace
 
 def test_the_current_sources_are_providers():
     """Named exactly, so adding one is a decision somebody made rather than
-    something that happened. F2 (drs) arrived this way; F1 (htsget) will."""
-    assert sorted(PROVIDERS) == ["drs", "localpath", "upload"]
+    something that happened. F2 (drs) arrived this way; F1 (htsget) will.
+
+    Two of them exist for D2 rather than for a client to choose. `spooled`
+    takes the file starlette already wrote to disk, and `handedover` takes one
+    this service wrote while a request was still open -- neither is a path a
+    caller supplies.
+    """
+    assert sorted(PROVIDERS) == ["drs", "handedover", "localpath", "spooled", "upload"]
     assert isinstance(get_sources(["upload"])["upload"], UploadSource)
 
 
@@ -131,7 +137,7 @@ def test_the_converter_still_knows_nothing_about_sources():
     """
     workflow = convert.Workflow(nodes=[
         convert.Node(id="tool-1", bin="t",
-                     inputs={"input-1-out": convert.IO()},
+                     inputs={"in": convert.IO(file="input-1-out")},
                      outputs={"tool-1-out": convert.IO()}),
     ])
 
@@ -182,6 +188,26 @@ def test_localpath_refuses_to_exist_without_a_root():
     arbitrary-file-read with a workflow engine attached."""
     with pytest.raises(ValueError, match="BIOCHEF_LOCAL_ROOT"):
         LocalPathSource(root="")
+
+
+@pytest.mark.parametrize("kind", ["missing", "file"])
+def test_localpath_requires_a_directory_root(tmp_path, kind):
+    root = tmp_path / "data"
+    if kind == "file":
+        root.write_bytes(b"not a directory")
+    with pytest.raises(ValueError, match="BIOCHEF_LOCAL_ROOT.*directory"):
+        LocalPathSource(root=str(root))
+
+
+def test_localpath_refuses_a_nul_in_the_source_path(tmp_path):
+    ws = make_workspace(str(tmp_path / "runs"))
+    try:
+        with pytest.raises(DataSourceError, match="NUL"):
+            LocalPathSource(root=str(tmp_path)).fetch(
+                ws, "input-1-out", "reads\x00.fastq")
+        assert not Path(ws.path, "input-1-out").exists()
+    finally:
+        ws.cleanup()
 
 
 def test_localpath_copies_a_file_from_inside_its_root(tmp_path):

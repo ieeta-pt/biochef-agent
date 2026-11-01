@@ -121,6 +121,38 @@ def test_the_workspace_is_private(tmp_path):
         ws.cleanup()
 
 
+def test_close_keeps_workspace_and_releases_descriptor(tmp_path):
+    ws = make_workspace(str(tmp_path))
+    path = Path(ws.path)
+    descriptor = ws._fd
+
+    ws.close()
+
+    assert path.is_dir(), "close is not cleanup; retained files must survive"
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+    ws.cleanup()
+    assert not path.exists()
+
+
+def test_a_closed_workspace_cannot_open_a_same_named_cwd_file(tmp_path,
+                                                              monkeypatch):
+    """A released dirfd must not turn a workspace read into a cwd lookup."""
+    ws = make_workspace(str(tmp_path / "runs"))
+    Path(ws.path, "result").write_bytes(b"workspace result")
+    monkeypatch.chdir(tmp_path)
+    Path("result").write_bytes(b"unrelated cwd file")
+    ws.close()
+
+    try:
+        with pytest.raises(OSError):
+            with ws.open_read("result") as handle:
+                handle.read()
+    finally:
+        ws.cleanup()
+
+
 # --------------------------------------------------------------------------
 # the timeout, which is only correct if it kills the group
 
@@ -504,7 +536,7 @@ def test_run_snakemake_is_given_the_directory_explicitly(tmp_path, monkeypatch):
             captured["argv"] = argv
             captured["cwd"] = kwargs.get("cwd")
             captured["new_session"] = kwargs.get("start_new_session")
-            self.pid = os.getpid()
+            self.pid = 2**30
             self.returncode = 0
             self.stdout = io.StringIO("")
             self.stderr = io.StringIO("")
@@ -512,12 +544,9 @@ def test_run_snakemake_is_given_the_directory_explicitly(tmp_path, monkeypatch):
         def wait(self, timeout=None):
             return 0
 
-    # main.os IS the os module, so patching through it patches os.getpgid
-    # globally -- a lambda calling os.getpgid would then call itself. Keep the
-    # real one.
-    real_getpgid = os.getpgid
     monkeypatch.setattr(main.subprocess, "Popen", FakePopen)
-    monkeypatch.setattr(main.os, "getpgid", lambda pid: real_getpgid(os.getpid()))
+    # The fake process has no kernel process group.
+    monkeypatch.setattr(main.os, "getpgid", lambda pid: pid)
     try:
         main.run_snakemake(ws)
     finally:
