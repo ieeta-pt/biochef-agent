@@ -6,11 +6,12 @@ import provenance
 import wes
 import tempfile
 import weakref
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import (FastAPI, Header, HTTPException, File, Form, Request,
+                     UploadFile)
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from datetime import datetime, timezone
-from typing import List
+from typing import Annotated, List
 import json
 from pydantic import BaseModel
 import os
@@ -22,7 +23,8 @@ import logging
 import audit
 from workspace import UnsafeName, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
-from runs import (IllegalTransition, RunCapacityError, RunState, RunStore,
+from runs import (IllegalTransition, KeyInFlight, Replay, RunCapacityError,
+                  RunState, RunStore,
                   TERMINAL, UnknownRun)
 from datasource import DataSourceError, get_sources
 from retention import Retained
@@ -30,6 +32,7 @@ from steplogs import (LiveLog, Progress, clamp, failing_steps,
                       make_step_log_names, read_node_logs)
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
 from requestid import RequestIdMiddleware
+import idempotency
 from evidence_verification import EvidenceVerificationError
 from runner import SubprocessRunner, get_runner
 from signing import SignatureError
@@ -665,7 +668,7 @@ def _advance(run_id, state, **detail):
         pass
 
 
-def _admit_run(request):
+def _admit_run(request, idempotency_key=None):
     # Whatever the authentication provider knew about the caller, which for the
     # bearer provider is nothing. Recorded as None rather than as a guess: the
     # audit trail says which provider authorised the request, so "we do not know
@@ -678,8 +681,11 @@ def _admit_run(request):
     try:
         return RUNS.create(caller=state.get("caller"),
                            authenticated_by=state.get("authenticated_by"),
-                           request_id=state.get("request_id"))
+                           request_id=state.get("request_id"),
+                           idempotency_key=idempotency_key)
     except RunCapacityError:
+        # Before any key was recorded, so a transient refusal does not become a
+        # permanent one: the same key can be retried when a slot frees up.
         raise HTTPException(
             status_code=503, detail="agent run capacity reached; retry later",
             headers={"Retry-After": "1"},
@@ -687,12 +693,25 @@ def _admit_run(request):
 
 
 @app.post("/runs", status_code=202, responses={
+    200: {"description": "This Idempotency-Key already created this run"},
+    400: {"description": "The Idempotency-Key cannot be used; nothing was run"},
+    409: {"description": "A request with this Idempotency-Key is still being "
+                         "admitted; retry shortly"},
+    422: {"description": "This Idempotency-Key was used for a different "
+                         "submission"},
     503: {"description": "Agent capacity reached; retry later"},
 })
 async def submit_run(
     request: Request,
     biochef_workflow: str = Form(...),
-    files: List[UploadFile] = File(...)
+    files: List[UploadFile] = File(...),
+    # Annotated, so the actual default is None. With the older
+    # `= Header(default=None)` spelling the default IS the Header object, and
+    # the two tests that call this handler directly -- bypassing fastapi's
+    # dependency resolution -- received that object and passed it to the
+    # validator.
+    idempotency_key: Annotated[str | None,
+                               Header(alias="Idempotency-Key")] = None,
 ):
     """Accept a workflow and answer immediately with something to poll.
 
@@ -705,35 +724,98 @@ async def submit_run(
     request.state where RequestIdMiddleware put the validated value. Not read
     from the header here: that would be the raw caller input, and the whole
     point of the middleware is that nothing downstream handles that.
+
+    With an Idempotency-Key (#87), a key that already created a run returns
+    that run instead of starting a second one. The lookup and the creation are
+    one operation inside the store, because two retries that each looked first
+    and then created would both find nothing -- and two retries racing is the
+    likeliest shape for a retry to arrive in.
+
+    A replay still reads the uploads. It has to: whether this is the same
+    submission or the same key used for a different one cannot be known
+    without looking at the body, and answering either without checking would
+    be the worse of the two mistakes.
     """
-    run = _admit_run(request)
+    try:
+        key = idempotency.validated(idempotency_key)
+    except idempotency.MalformedKey as unusable:
+        # Refused rather than run without it. Accepting the submission while
+        # quietly dropping the key would return a 202 that looks like
+        # protection and is not -- see idempotency.py.
+        raise HTTPException(status_code=400, detail=str(unusable)) from None
+
+    try:
+        run = _admit_run(request, idempotency_key=key)
+    except KeyInFlight:
+        raise HTTPException(
+            status_code=409,
+            detail="a request with this Idempotency-Key is still being "
+                   "admitted; retry shortly",
+            headers={"Retry-After": "1"},
+        ) from None
+    except Replay as replay:
+        # Hashed as it streams past and kept nowhere: nothing will run, so
+        # there is nothing to hand over.
+        offered = idempotency.Fingerprint(biochef_workflow)
+        for f in files:
+            part = offered.part(f.filename)
+            while True:
+                chunk = await f.read(1024 * 1024)
+                if not chunk:
+                    break
+                part.update(chunk)
+        if offered.hexdigest() != replay.run.fingerprint:
+            raise HTTPException(
+                status_code=422,
+                detail="this Idempotency-Key was used for a different "
+                       "submission; use a new key for new work",
+            ) from None
+        # 200 rather than the route's 202: nothing was accepted here, and a
+        # hub reading its own log should be able to tell a replay from an
+        # acceptance. Returned as a response rather than by mutating an
+        # injected one, which keeps this handler callable with the same
+        # positional arguments it had before.
+        return JSONResponse(status_code=200, content=replay.run.as_dict())
+
     inputs = []
+    seen = idempotency.Fingerprint(biochef_workflow) if key is not None else None
     try:
         # Read to disk here rather than kept as the request's own spooled file.
         # The request is over long before the work starts, and starlette closes
         # what it spooled when it ends -- so the asynchronous path has to take
         # ownership of the bytes while it still can, without holding them in
-        # memory.
+        # memory. The fingerprint is fed the same chunks on the way past, so a
+        # key costs no second read of anything.
         for f in files:
             spooled = tempfile.NamedTemporaryFile(delete=False)
             # Recorded before it is written, not after: a failure part way
             # through the copy would otherwise leave a file nothing knows the
             # name of, and the cleanup below could not reach it.
             inputs.append(("handedover", f.filename, spooled.name))
+            part = seen.part(f.filename) if seen is not None else None
             try:
                 while True:
                     chunk = await f.read(1024 * 1024)
                     if not chunk:
                         break
                     spooled.write(chunk)
+                    if part is not None:
+                        part.update(chunk)
             finally:
                 spooled.close()
+        if seen is not None:
+            # Only now can a concurrent retry be compared against this one, so
+            # until this point the key reads as in flight rather than done.
+            RUNS.settle_fingerprint(run.run_id, seen.hexdigest())
         task = asyncio.create_task(_execute(run.run_id, biochef_workflow, inputs))
     except BaseException:
         # The handedover source deletes each file once the workspace has it, on
         # every path -- but nothing has reached it yet, so these are ours. A
         # refused submission would otherwise leave one temporary file per input
-        # behind, on a service built for large ones.
+        # behind, on a service built for large ones. Discarding the run takes
+        # its key with it, or a submission that never ran would hold the key
+        # for the life of the store and every retry would be told the work is
+        # already done.
         for _, _, path in inputs:
             try:
                 os.unlink(path)
