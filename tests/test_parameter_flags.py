@@ -6,55 +6,71 @@ the browser joins the value to it; the agent must build the same command, or a
 workflow that runs in the browser fails here.
 """
 
-import sys
-import types
-from pathlib import Path
+import json
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT))
-
-if "oras" not in sys.modules:
-    oras = types.ModuleType("oras")
-    client_mod = types.ModuleType("oras.client")
-
-    class _Client:
-        def __init__(self, *a, **k):
-            pass
-
-        def login(self, *a, **k):
-            pass
-
-        def pull(self, *a, **k):
-            raise AssertionError("a test reached the registry")
-
-    client_mod.OrasClient = _Client
-    oras.client = client_mod
-    sys.modules["oras"] = oras
-    sys.modules["oras.client"] = client_mod
+import pytest
 
 import convert
 
 
-def _command_for(**parameters):
-    node = convert.Node(id="tool-1", bin="t", parameters=parameters)
-    snakefile = convert.convert_to_snakemake(convert.Workflow(nodes=[node]))
-    return next(line.strip() for line in snakefile.splitlines()
-                if line.strip().startswith("./t"))
+BUNDLE = {
+    "id": "t", "name": "t", "bin": "t",
+    "io": {"inputs": [{"name": "in", "types": ["T"], "mode": "file"}],
+           "outputs": [{"name": "out", "types": ["T"], "mode": "stdout"}]},
+    "parameters": [
+        {"name": "format", "type": "string", "flag": "--format="},
+        {"name": "preset", "type": "string", "flag": "-x"},
+    ],
+}
+
+
+@pytest.fixture(autouse=True)
+def stub_registry(monkeypatch):
+    monkeypatch.setattr(convert, "fetch_tool", lambda tool_id, repo: BUNDLE)
+    convert.tools.clear()
+
+
+def emit(param_values):
+    export = {
+        "nodes": [
+            {"id": "input-1", "type": "inputWorkflowNode",
+             "data": {"outputs": {"out": {"kind": "text", "data": "x"}}}},
+            {"id": "t-1", "type": "workflowNode",
+             "data": {"label": "t", "repo": "r", "outputs": {},
+                      "paramValues": param_values}},
+            {"id": "output-1", "type": "outputWorkflowNode", "data": {}},
+        ],
+        "edges": [
+            {"source": "input-1", "sourceHandle": "out",
+             "target": "t-1", "targetHandle": "in"},
+            {"source": "t-1", "sourceHandle": "out",
+             "target": "output-1", "targetHandle": "in"},
+        ],
+    }
+    text = convert.convert_to_snakemake(convert.parse_biochef_workflow(export))
+    lines = text.splitlines()
+    return json.loads(lines[[l.strip() for l in lines].index("shell:") + 1].strip())
 
 
 def test_a_flag_ending_in_equals_takes_its_value_in_the_same_argument():
-    command = _command_for(format=convert.Param("format", "general", "--format="))
+    command = emit({"format": {"enabled": True, "value": "general"}})
 
-    assert command == "./t --format=general"
+    assert command.startswith("./t --format=general ")
 
 
 def test_any_other_flag_takes_its_value_as_the_next_argument():
-    command = _command_for(preset=convert.Param("preset", "asm5", "-x"))
+    command = emit({"preset": {"enabled": True, "value": "asm5"}})
 
-    assert command == "./t -x asm5"
+    assert command.startswith("./t -x asm5 ")
 
 
-def test_a_parameter_without_a_flag_is_passed_as_is():
-    command = _command_for(region=convert.Param("region", "chr1", ""))
+def test_the_joined_argument_is_still_one_shell_word():
+    command = emit({"format": {"enabled": True, "value": "a b;id"}})
 
-    assert command == "./t chr1"
+    assert command.startswith("./t '--format=a b;id' ")
+
+
+def test_an_empty_value_drops_the_flag_too():
+    command = emit({"format": {"enabled": True, "value": ""}})
+
+    assert "--format" not in command

@@ -73,7 +73,7 @@ def build(*, run_id, workflow_document, workflow, ws, inputs, outputs,
             "digest": _canonical_digest(workflow_document),
             "nodes": [
                 {"id": node.id, "bin": node.bin,
-                 "inputs": sorted(node.inputs),
+                 "inputs": sorted({io.file for io in node.inputs.values()}),
                  "outputs": sorted(node.outputs)}
                 for node in workflow.nodes
             ],

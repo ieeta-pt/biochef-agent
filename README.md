@@ -216,6 +216,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_LOCAL_ROOT` | | the only directory `localpath` may read from |
 | `BIOCHEF_RUN_ROOT` | the system temp directory | where a run's private directory is created |
 | `BIOCHEF_RUN_TIMEOUT` | `900` | seconds before a run's whole process group is killed |
+| `BIOCHEF_AUDIT_LOG` | *(unset)* | path to an append-only JSONL audit trail; unset writes none |
 | `BIOCHEF_KEEP_WORKSPACE` | `false` | leave a run's directory behind, for debugging |
 | `BIOCHEF_MAX_UPLOAD_BYTES` | `536870912` | largest request body accepted, in bytes |
 | `BIOCHEF_MAX_RUNS` | `256` | maximum run records retained for polling |
@@ -225,6 +226,13 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_MAX_CONCURRENT_RUNS` | `4` | execution slots shared by `/runs` and `/convert`; admitted `/runs` jobs wait in `QUEUED` |
 | `BIOCHEF_AUTH` | `none` | who may call it: `none` or `bearer` |
 | `BIOCHEF_AUTH_TOKEN` | | the shared token, required when `BIOCHEF_AUTH=bearer` |
+| `BIOCHEF_PASSPORT_ISSUER` | *(unset)* | the issuer whose passports are accepted, when `BIOCHEF_AUTH=passport` |
+| `BIOCHEF_PASSPORT_AUDIENCE` | *(required)* | the audience a passport must name; `any` to accept tokens minted for other services |
+| `BIOCHEF_PASSPORT_JWKS_URL` | *(discovered)* | override the issuer's published key set URL |
+| `BIOCHEF_PASSPORT_USERINFO_URL` | *(discovered)* | override the issuer's published UserInfo endpoint |
+| `BIOCHEF_PASSPORT_VISA_ISSUERS` | *(unset)* | comma-separated issuers whose visas count |
+| `BIOCHEF_PASSPORT_REQUIRE_VISA` | *(unset)* | a visa type a caller must hold to be let in |
+| `BIOCHEF_PASSPORT_REQUIRE_VISA_VALUE` | *(unset)* | the exact value that visa must carry |
 | `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess` or `apptainer` |
 | `BIOCHEF_CONTAINER_IMAGE` | `docker://debian:stable-slim` | image each step runs in, under the `apptainer` runner |
 | `BIOCHEF_APPTAINER_CACHE` | `apptainer-cache` | where pulled container images are kept between runs |
@@ -242,6 +250,17 @@ not identity -- every holder is the same caller -- but it is the difference
 between an open endpoint and a closed one. Selecting `bearer` without a token
 stops the service from starting rather than letting it run with a token nobody
 has to guess.
+
+**The audit trail records a caller only when the provider says its return names
+one.** Every provider has to declare that, and one that does not stops the
+service from starting — alongside the empty token and the unknown provider
+name. There is deliberately no default: `bearer` returns a marker every holder
+of the secret presents, and writing that into the trail's `caller` field would
+read as a name to whoever opens the log years later; but a provider added later
+that *does* carry identity and merely forgot to declare would have its callers
+silently dropped instead, which is the worse of the two and the one nothing
+would notice. So "we do not know who" stays a recorded fact about the
+deployment rather than a gap in the log.
 
 `BIOCHEF_DATA_SOURCES` decides which input providers are enabled. It defaults to
 `upload,spooled,handedover`: direct bytes, the synchronous route's request spool,
@@ -314,6 +333,132 @@ a re-pull in the meantime.
 
 `BIOCHEF_APPTAINER_ARGS` defaults to `--contain --cleanenv`. Without `--contain`, apptainer binds the host's `/tmp` into the container, and that is where a run's directory lives unless `BIOCHEF_RUN_ROOT` says otherwise. Without it, a containerised tool is walled off from `/usr` and `/etc` while still able to read **every other run's data**. Without `--cleanenv`, the tool process also inherits the Agent's environment. Emptying this variable turns both protections off deliberately.
 
+## The audit trail
+
+`BIOCHEF_AUDIT_LOG` names a file that records every state a run reaches — who
+asked, which run, which state, when, and the error if one ended it. One JSON
+object per line, appended and never rewritten. Unset writes nothing, which is
+the existing behaviour and stays the default.
+
+```json
+{"schema":"biochef.audit-event.v1","event":"run.state","at":"2026-08-28T10:11:12+00:00","authenticated_by":"bearer","caller":null,"error":null,"run_id":"9f3c…","state":"COMPLETE"}
+```
+
+The record is written at the single point where a run's state changes, not at
+each call site, because a hook per call site is one a new transition forgets —
+and a gap in an audit trail is invisible from inside the thing that should have
+written it.
+
+Three things it deliberately does not claim:
+
+- **It is append-only, not immutable.** Anything that can write the file can
+  truncate it. Immutability is the filesystem's job: ship the file somewhere
+  append-only, or set the append-only attribute. Claiming otherwise would be the
+  dangerous kind of assurance.
+- **`caller` is whatever the authentication provider knew**, which for `bearer`
+  is nothing — a shared secret is not an identity and every holder is the same
+  caller. The event records which provider authorised the request, so "we do not
+  know who" reads as a fact about the deployment rather than a hole in the log.
+  A provider that carries identity lights this field up without the format
+  changing.
+- **There is no endpoint that serves it.** An audit trail reachable over the
+  same API it audits is a thing an attacker reads to find out what you noticed.
+  Export it from the filesystem.
+
+If the trail cannot be written, the run fails rather than proceeding unrecorded.
+A deployment that believes it is auditing and is not is in a worse position than
+one that knows it is not.
+
+## Passports
+
+`BIOCHEF_AUTH=passport` accepts a GA4GH Passport instead of a shared secret, and
+names the caller `<issuer>#<subject>` — with the issuer, because two brokers can
+each have a subject `12345` and recording only the second half would merge two
+people into one caller.
+
+It is the first provider that genuinely names anyone, so it is the first to
+declare that what it returns is a name and not a marker every caller shares.
+That declaration is what puts the caller in the audit trail; `none` and `bearer`
+decline it, and a provider that says nothing at all refuses to start.
+
+**The visas do not come from the access token.** The GA4GH AAI profile is
+explicit that "access tokens MUST NOT contain GA4GH Claims directly": the token
+is the credential this service presents to the broker's UserInfo endpoint to
+fetch the passport. LS AAI works exactly this way, handing a passport-scoped
+access token to a downstream service which calls back to obtain the visas.
+
+**A visa is signed separately from the passport carrying it**, usually by
+somebody else: a broker authenticates you, and a data controller independently
+asserts what you may see. So verifying the access token tells you *nothing*
+about its visas. Each one is verified on its own, against its own issuer's keys,
+and only from issuers named in `BIOCHEF_PASSPORT_VISA_ISSUERS`.
+
+Without that list the feature would be worse than absent — anyone could stand up
+an issuer, mint themselves the very visa being required, and be admitted by a
+service that believes it is checking credentials. Setting
+`BIOCHEF_PASSPORT_REQUIRE_VISA` without it **refuses to start**.
+
+A visa here is a condition of being let in, not an authorisation model. What a
+named caller may then do is still undecided, deliberately: returning roles
+nobody consults would be worse than the gap.
+
+Visas from issuers not on the list are **ignored, not fatal** — a passport
+legitimately carries visas about institutions this service knows nothing about,
+and refusing the request because of one would make a caller's unrelated
+affiliations break their access here.
+
+A passport carrying more than 128 visas is refused outright rather than having
+the first 128 examined, because a legitimate passport whose relevant visa sat
+past a silent cut would be denied for a reason nobody could see.
+
+Both the key set and the UserInfo endpoint are required to be on the **issuer's
+own host**. They are read from a document and then trusted completely, and a
+`jwks_uri` pointing elsewhere is a full authentication bypass, since keys fetched
+from there validate tokens. A `userinfo_endpoint` pointing elsewhere sends every
+caller's access token to whoever is listening. LS AAI serves both from its own
+host; a deployment that genuinely splits them sets the endpoint explicitly.
+
+Refusals do not say which check failed. Whether it was the signature, the
+issuer, the audience or the expiry is a fact about this deployment's
+configuration, and telling an unauthenticated caller is telling them how to aim.
+
+## The GA4GH WES surface
+
+The same runs, at the standard path, so third parties do not have to learn this
+service's own API:
+
+```
+GET  /ga4gh/wes/v1/service-info
+GET  /ga4gh/wes/v1/runs
+POST /ga4gh/wes/v1/runs
+GET  /ga4gh/wes/v1/runs/{run_id}
+GET  /ga4gh/wes/v1/runs/{run_id}/status
+POST /ga4gh/wes/v1/runs/{run_id}/cancel
+```
+
+It is a mapping, not a second implementation: every endpoint reads the same run
+store the bespoke API reads, and a run submitted through either is the same run.
+That is why the run states are WES's `RunState` vocabulary and why cancel was
+already at WES's path. The bespoke endpoints stay — the editor uses them.
+
+**The declared workflow type is `BIOCHEF`, not `CWL`.** This service runs
+BioChef workflow documents converted to Snakemake; it cannot run CWL, and saying
+otherwise would make every conformant client discover this server, upload its
+data, and then fail. `service-info` exists so a client can find that out before
+it commits, so a submission naming another type is refused by name with a
+message saying what would have been accepted.
+
+`service-info` also lists, under `tags.not_implemented`, where the standard
+surface stops: `workflow_url` may only name an attachment (a remote URL is not
+fetched, which would mean executing a document from wherever a caller pointed
+this service), run listing is not paginated, and `task_logs` carries one entry
+per workflow step without per-task commands.
+
+Tool parameters stay in the frontend's workflow JSON. `workflow_params` accepts
+only an empty object (`{}`); malformed or non-empty values return HTTP 400.
+Submission tags are not retained. WES submissions use the same admission limit
+and HTTP 503 capacity refusal as `/runs`.
+
 ## How a request is served
 
 1. A private directory is created for this run, and uploaded files are written
@@ -368,3 +513,19 @@ The conventions those issues set, which any change here should follow:
 | `Biochef` | the editor, which produces the workflow JSON this service consumes |
 | `biochef-recipes` | one `biochef.yaml` per tool, declaring its operations and IO |
 | `biochef-hub` | validates recipes, builds them, and publishes bundles to the registry |
+
+### Converter intermediate document
+
+`BIOCHEF_WRITE_INTERMEDIATE` defaults to `false`. When enabled, the Agent
+writes and validates `intermediate.json` inside each run workspace before
+generating its Snakefile. Workspace retention follows `BIOCHEF_KEEP_WORKSPACE`.
+The document carries tool provenance and effective parameter values, which may
+be sensitive; it has the same local access boundary as the run workspace.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
