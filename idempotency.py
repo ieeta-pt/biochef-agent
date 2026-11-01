@@ -76,28 +76,66 @@ def validated(offered):
     return offered
 
 
-def fingerprint(biochef_workflow: str, uploads) -> str:
-    """What makes two submissions the same submission.
+class Fingerprint:
+    """What makes two submissions the same submission, built as it arrives.
 
-    The workflow and every uploaded byte. Length-prefixed rather than
-    concatenated, because joining on a separator lets two different
+    The workflow and every uploaded byte. The uploads are streamed to disk in
+    chunks rather than held in memory, so the hash is fed the same chunks on
+    the way past instead of reading anything back.
+
+    Each part is hashed on its own: its name length-prefixed, then its bytes,
+    then their length. Joining on a separator would let two different
     submissions hash the same -- a file named `a` holding `bc` against one
     named `ab` holding `c` -- and this value decides whether work is skipped.
+    The length goes after the bytes because it is only known once they have
+    all passed; with the name's length fixed in front, the last eight bytes
+    are unambiguous.
 
-    Sorted by name, so the order parts arrive in does not make the same
-    submission look like a different one. Uploads are already read fully into
-    memory by the caller, so this costs a hash of what is already there.
+    The part digests are sorted before they are combined, so the order parts
+    arrive in does not make the same submission look like a different one.
     """
-    digest = hashlib.sha256()
 
-    def chunk(value: bytes):
-        digest.update(len(value).to_bytes(8, "big"))
-        digest.update(value)
+    def __init__(self, biochef_workflow: str):
+        self._workflow = biochef_workflow.encode()
+        self._parts = []
 
-    chunk(biochef_workflow.encode())
-    parts = sorted((name or "", body) for name, body in uploads)
-    digest.update(len(parts).to_bytes(8, "big"))
-    for name, body in parts:
-        chunk(name.encode())
-        chunk(body)
-    return digest.hexdigest()
+    def part(self, name):
+        """Start the next upload; feed its bytes to the returned hash."""
+        part = _Part(name or "")
+        self._parts.append(part)
+        return part
+
+    def hexdigest(self) -> str:
+        digest = hashlib.sha256()
+        digest.update(len(self._workflow).to_bytes(8, "big"))
+        digest.update(self._workflow)
+        digest.update(len(self._parts).to_bytes(8, "big"))
+        for value in sorted(part.digest() for part in self._parts):
+            digest.update(value)
+        return digest.hexdigest()
+
+
+class _Part:
+    def __init__(self, name: str):
+        encoded = name.encode()
+        self._hash = hashlib.sha256()
+        self._hash.update(len(encoded).to_bytes(8, "big"))
+        self._hash.update(encoded)
+        self._length = 0
+
+    def update(self, chunk: bytes) -> None:
+        self._hash.update(chunk)
+        self._length += len(chunk)
+
+    def digest(self) -> bytes:
+        final = self._hash.copy()
+        final.update(self._length.to_bytes(8, "big"))
+        return final.digest()
+
+
+def fingerprint(biochef_workflow: str, uploads) -> str:
+    """Fingerprint of (name, bytes) pairs already in memory."""
+    built = Fingerprint(biochef_workflow)
+    for name, body in uploads:
+        built.part(name).update(body)
+    return built.hexdigest()

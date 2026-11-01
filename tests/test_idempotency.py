@@ -150,6 +150,32 @@ def test_the_run_says_which_key_created_it(service, counted):
     assert polled.json()["idempotency_key"] == KEY
 
 
+def test_a_replay_writes_nothing_to_disk(service, counted, monkeypatch,
+                                       tmp_path):
+    """Nothing will run, so nothing is handed over: the body is hashed as it
+    streams past and kept nowhere, rather than spooled like an accepted
+    submission and then left behind."""
+    import tempfile
+
+    client, _ = counted
+    _post(client)
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(spool))
+    assert _post(client).status_code == 200
+    assert list(spool.iterdir()) == []
+
+
+def test_a_fingerprint_built_in_chunks_matches_one_built_whole():
+    """The uploads reach the hash in whatever chunks the stream yields, and a
+    retry's chunks need not fall where the first submission's did."""
+    built = idempotency.Fingerprint("w")
+    part = built.part("a")
+    for piece in (b"b", b"", b"cd"):
+        part.update(piece)
+    assert built.hexdigest() == idempotency.fingerprint("w", [("a", b"bcd")])
+
+
 # --- the same key used for something else -----------------------------------
 
 @pytest.mark.parametrize("difference", [
@@ -270,7 +296,7 @@ def test_a_submission_whose_body_never_arrived_does_not_burn_the_key():
         filename = "input-1-out"
         size = 4
 
-        async def read(self):
+        async def read(self, size=-1):
             raise OSError("input stream failed")
 
     store = RunStore()

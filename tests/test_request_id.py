@@ -462,6 +462,7 @@ def test_a_handler_reads_the_validated_value_and_not_the_raw_header():
     the run record and the response body however careful the middleware was.
     """
     source = (REPO_ROOT / "main.py").read_text()
-    assert 'request.state, "request_id"' in source
+    # _admit_run reads it from the request's state, where the middleware put it.
+    assert 'state.get("request_id")' in source
     assert 'headers.get("x-request-id")' not in source.lower()
     assert 'headers["x-request-id"]' not in source.lower()

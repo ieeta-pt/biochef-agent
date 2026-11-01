@@ -1,7 +1,10 @@
 from fastapi import FastAPI
+import copy
 import fcntl
 import hashlib
 import json
+import keyword
+import shlex
 import oras.client
 import os
 import shutil
@@ -9,14 +12,13 @@ import stat
 import threading
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from enum import Enum
+from intermediate import IO, IOMode, Node, Param, Workflow
 
 from dotenv import load_dotenv
 
 import signing
 import evidence_verification
-from workspace import check_name
+from workspace import UnsafeName, check_name
 
 load_dotenv()
 
@@ -37,58 +39,81 @@ client.login(
     password=REGISTRY_PASSWORD
 )
 
-class IOMode(Enum):
-    STDIN = "stdin"
-    STDOUT = "stdout"
-    FILE = "file"
+WRITE_INTERMEDIATE = os.getenv("BIOCHEF_WRITE_INTERMEDIATE", "false").lower() == "true"
+"""Feature flag for the intermediate artifact (#2).
+
+Off: the Snakefile is generated from the document held in memory, exactly as
+before. On: the document is written to intermediate.json, read back, validated
+against the schema, and the Snakefile is generated from that -- so the Snakefile
+becomes a function of a file on disk rather than of the request body. The two
+paths are asserted byte-identical over every operation in the catalogue by
+tests/test_intermediate_roundtrip.py, which is what makes turning it on safe.
+"""
+
+INTERMEDIATE_FILENAME = "intermediate.json"
 
 
-@dataclass
-class IO:
-    file: str = ""
+class IntermediateMismatch(Exception):
+    """The intermediate document read back is not the one written."""
+
+
+def write_intermediate(workflow: Workflow, path: str) -> str:
+    """Write the document, as a new file only.
+
+    Exclusive and without following a symlink, like every file a run creates
+    in its workspace: nothing put at the path first, a file or a link to one
+    elsewhere, can stand in for the document or be written through.
     """
-    this is the file that the tools that are connected 
-    expect to have the input/output
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(workflow.to_json())
+    return path
+
+
+def read_intermediate(path: str) -> Workflow:
+    """Read the document back, validating it on the way in.
+
+    A document that does not match the schema raises here rather than producing
+    a nonsense Snakefile further downstream. Only a regular file is read, and
+    not through a symlink.
     """
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise UnsafeName(f"{path!r} is not a regular file")
+    with os.fdopen(fd) as f:
+        return Workflow.from_json(f.read())
 
-    mode: IOMode = None
+
+def through_intermediate(workflow: Workflow, path: str) -> Workflow:
+    """Round trip through the supplied file when enabled.
+
+    The executor supplies a path inside its run workspace. There is no default:
+    a relative name resolves against the process's directory, which every run in
+    flight shares, so a caller that forgot the path would put concurrent runs'
+    documents in one place.
+
+    The copy read back must be the one written. The document carries each
+    node's registry evidence, which materialise_tools checks the executable
+    against and skips for a node without it, so a copy changed on disk could
+    switch that check off. It is compared as serialised, since the order of
+    inputs, outputs and parameters is the order of the command line.
     """
-    the mode in which the input/output is received
-    """
-
-    hardcoded_file: str = ""
-    """
-    some tools have an hardcoded file that type write to
-    this file will then be copied to the actual file above when running the workflow
-    """
-
-    flag: str = ""
-    """
-    some tools receive input/output through a flag argument
-    """
+    if not WRITE_INTERMEDIATE:
+        return workflow
+    write_intermediate(workflow, path)
+    reread = read_intermediate(path)
+    if reread.to_json() != workflow.to_json():
+        raise IntermediateMismatch(f"{path!r} read back differs from the document written")
+    return reread
 
 
-@dataclass
-class Param:
-    name: str = ""
-    value: str = ""
-    flag: str = ""
+class ToolBundle(dict):
+    """A bundle plus the evidence snapshot observed when it was fetched."""
 
-
-@dataclass
-class Node:
-    """Information about each node of the workflow"""
-
-    id: str = ""
-    bin: str = ""
-    inputs: dict[str, IO] = field(default_factory=dict)
-    outputs: dict[str, IO] = field(default_factory=dict)
-    parameters: dict[str, Param] = field(default_factory=dict)
-
-
-@dataclass
-class Workflow:
-    nodes: list[Node] = field(default_factory=list)
+    def __init__(self, bundle, provenance):
+        super().__init__(bundle)
+        self.provenance = copy.deepcopy(provenance)
 
 
 TOOL_CACHE = os.path.realpath(os.getenv("BIOCHEF_TOOL_CACHE", "tool-cache"))
@@ -101,6 +126,10 @@ into whichever run workspace needs it.
 """
 
 tools = {}
+
+provenance = {}
+"""What each pulled bundle was, kept for the run manifest (#18)."""
+
 _fetch_locks = {}
 _fetch_locks_guard = threading.Lock()
 
@@ -356,8 +385,56 @@ def fetch_tool(tool_id, repo):
         with open(os.path.join(outdir, "bundle.json"), "r") as f:
             bundle = json.load(f)
 
+        # Kept for the run manifest (#18). The registry publishes three
+        # artifacts per bundle and verify_against_manifest has just hashed all
+        # of them against the manifest -- so their identity is established here
+        # and was, until now, thrown away.
+        evidence = _bundle_evidence(outdir, manifest, target)
+
+        # Inside the lock, which is where master moved them: the cache entry and
+        # what this process believes about it are set together or a second
+        # fetcher can read one without the other.
         tools[tool_id] = bundle
-        return bundle
+        provenance[tool_id] = evidence
+        return ToolBundle(bundle, evidence)
+
+def _bundle_evidence(directory, manifest, target):
+    """What this bundle is, in the terms the registry stated it.
+
+    Digests come from the MANIFEST rather than from hashing the files again.
+    They are the same numbers -- verify_against_manifest has just checked that --
+    but taking them from the manifest records what the registry asserted, which
+    is the thing a reader of the manifest would want to compare against.
+    """
+    artifacts = {}
+    for layer in manifest.get("layers") or []:
+        title = (layer.get("annotations") or {}).get(_ANNOTATION_TITLE)
+        if title and layer.get("digest"):
+            artifacts[title] = layer["digest"]
+
+    evidence = {"target": target, "artifacts": artifacts}
+
+    # The hub's own build evidence, if this bundle carries it. Referenced by
+    # digest AND summarised, so a manifest is readable without the registry
+    # while still saying exactly which document it means.
+    build = os.path.join(directory, "build-evidence.json")
+    if os.path.exists(build):
+        try:
+            with open(build, "r") as handle:
+                document = json.load(handle)
+        except (OSError, ValueError):
+            return evidence
+        evidence["build_evidence"] = {
+            "schema": document.get("schema"),
+            "generated_at": document.get("generated_at"),
+            "hub": document.get("hub"),
+            "recipe": {
+                key: (document.get("recipe") or {}).get(key)
+                for key in ("id", "name", "version", "digest")
+            },
+            "operation": document.get("operation"),
+        }
+    return evidence
 
 
 def expected_uploads(workflow):
@@ -375,7 +452,7 @@ def expected_uploads(workflow):
     name the workflow does declare.
     """
     produced = {name for node in workflow.nodes for name in node.outputs}
-    consumed = {name for node in workflow.nodes for name in node.inputs}
+    consumed = {io.file for node in workflow.nodes for io in node.inputs.values()}
     return consumed - produced
 
 
@@ -395,27 +472,114 @@ def materialise_tools(workflow, ws):
     returned early and skipped the copy; splitting the cache out lost that and
     nothing replaced it.
     """
-    placed = set()
+    by_name = {}
     for node in workflow.nodes:
         name = check_name(node.bin)
-        if name in placed:
+        by_name.setdefault(name, []).append(node)
+
+    for name, nodes in by_name.items():
+        tool_id = check_name(nodes[0].id.split("-")[0])
+        source = os.path.join(TOOL_CACHE, tool_id, name)
+        with _fetch_lock(tool_id):
+            ws.place_executable(source, name)
+
+        evidenced_nodes = [node for node in nodes
+                           if getattr(node, "provenance", {})]
+        if not evidenced_nodes:
             continue
-        source = os.path.join(TOOL_CACHE, check_name(node.id.split("-")[0]), name)
-        ws.place_executable(source, name)
-        placed.add(name)
+
+        digest = hashlib.sha256()
+        try:
+            with ws.open_read(name, regular_only=True) as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        except (OSError, ValueError) as error:
+            raise ToolIntegrityError(
+                f"staged tool {name!r} could not be read as a regular file"
+            ) from error
+        actual = "sha256:" + digest.hexdigest()
+
+        for node in evidenced_nodes:
+            evidence = node.provenance
+            expected = (evidence.get("artifacts") or {}).get(name)
+            if not expected:
+                raise ToolIntegrityError(
+                    f"tool {node.id!r} has no registry digest for executable {name!r}"
+                )
+            if expected != actual:
+                raise ToolIntegrityError(
+                    f"tool {node.id!r} executable {name!r} has digest {actual}, "
+                    f"expected {expected}"
+                )
 
 
-def rule_name_for(node_id):
-    """The snakemake rule name a node is emitted as.
+def sh_literal(value) -> str:
+    """A token that must reach the shell as one argument, exactly as written.
 
-    Snakemake's diagnostic error headings use this name. The separate per-rule
-    log files are indexed by node id and do not depend on parsing a heading.
+    Two escapes, applied in this order, for two different readers.
+
+    `shlex.quote` makes the value a single shell word, so a value of `; id`
+    becomes `'; id'` and the shell reads text where it used to read a second
+    command. `str()` first because a value is whatever JSON decoded -- a recipe
+    default of `2` arrives as an int, and joining that raised TypeError (#37).
+
+    Then the braces are doubled, because Snakemake formats the shell block
+    before any shell sees it. Verified against snakemake 9.21.0: a lone `{` in a
+    shell block is a NameError and the run exits 1, while `{{` renders as `{`.
+    Doubling also means a value containing `{input.i_0}` is written out as text
+    instead of expanding to another rule's field.
     """
-    return node_id.replace(".", "_").replace("-", "_")
+    return shlex.quote(str(value)).replace("{", "{{").replace("}", "}}")
+
+
+def sh_field(reference: str) -> str:
+    """A Snakemake field reference, quoted by Snakemake when it expands.
+
+    `:q` applies shell quoting to whatever the field expands to, so a path
+    containing a space stays one argument rather than becoming two. Verified
+    against snakemake 9.21.0.
+
+    The braces here are deliberately NOT doubled -- they are what makes this a
+    reference rather than literal text.
+    """
+    return f"{{{reference}:q}}"
+
+
+def py_string(value: str) -> str:
+    """A Python string literal for the input:/output: sections of a rule.
+
+    Those sections are Python, not shell, so a name containing a quote would
+    end the literal and let the rest be read as code. json.dumps produces the
+    same bytes as the hand-written f-string for every name in the catalogue and
+    stays valid for names that are not.
+    """
+    return json.dumps(value)
+
+
+def rule_name_for(node_id: str) -> str:
+    """Snakemake rule names are Python identifiers.
+
+    A node id is "{operation.id}-{timestamp}", so both separators have to go.
+    The result is checked rather than assumed: a node id is client-supplied, and
+    one containing a newline would otherwise write new lines into the Snakefile
+    at the point where a rule is declared -- which no amount of shell quoting
+    further down would help with.
+    """
+    name = node_id.replace(".", "_").replace("-", "_")
+    if not name.isidentifier() or keyword.iskeyword(name):
+        raise ValueError(f"node id {node_id!r} does not make a usable rule name")
+    return name
 
 
 def get_node_data(node_id, node_list):
     return next(node for node in node_list if node["id"] == node_id)
+
+
+class WorkflowInputError(ValueError):
+    pass
 
 
 def parse_biochef_workflow(biochef_workflow):
@@ -429,43 +593,128 @@ def parse_biochef_workflow(biochef_workflow):
 
         tool_info = fetch_tool(node_id, node["data"]["repo"])
 
-        new_node: Node = Node(id=node_id, bin=tool_info["bin"])
+        new_node: Node = Node(
+            id=node_id, bin=tool_info["bin"],
+            provenance=copy.deepcopy(getattr(tool_info, "provenance", {})),
+        )
 
         connections = [e for e in edge_list if node_id in (e["target"], e["source"])]
-        for connection in connections:
-            source, source_handle, target, target_handle = (
-                connection["source"], connection.get("sourceHandle"),
-                connection["target"], connection.get("targetHandle"),
+
+        def build_io(info, file_name):
+            # `.get` returning None where a recipe omits the key is kept as None
+            # rather than flattened to "": the two mean different things to the
+            # frontend and both occur in the catalogue, so the model records
+            # which one the recipe actually said.
+            return IO(
+                file=file_name,
+                mode=IOMode(info.get("mode")),
+                hardcoded_file=info.get("filename"),
+                flag=info.get("flag"),
             )
 
-            _name = f"{source}-{source_handle}"
+        # Inputs, in the order the recipe declares them and keyed by which
+        # declared input each one fills.
+        #
+        # Both were previously taken from the edges: the dict was keyed by
+        # f"{source}-{source_handle}" and built by walking the edge list. Two
+        # things went wrong. Order followed however the client happened to list
+        # its edges rather than what the tool expects (#31). And one source
+        # feeding two inputs of the same tool produced the same key twice, so
+        # the second overwrote the first and the tool was invoked an argument
+        # short with nothing saying so (#32).
+        #
+        # The file name is unchanged -- it is still f"{source}-{source_handle}",
+        # because that is the file the upstream node writes. Only the key and
+        # the order change.
+        incoming = [e for e in connections if e["target"] == node_id]
+        for input_info in tool_info["io"]["inputs"]:
+            handle = input_info["name"]
+            connection = next(
+                (e for e in incoming if e.get("targetHandle") == handle), None)
+            if connection is None:
+                continue  # a declared input nothing is wired to
+            file_name = f"{connection['source']}-{connection.get('sourceHandle')}"
+            new_node.inputs[handle] = build_io(input_info, file_name)
 
-            def build_io(info):
-                return IO(
-                    f"{_name}",
-                    IOMode(info.get("mode")),
-                    info.get("filename"),
-                    info.get("flag"),
-                )
-
-            is_input_connection = node_id == target
-            if is_input_connection:
-                input_info = next(
-                    i for i in tool_info["io"]["inputs"] if i["name"] == target_handle)
-                new_node.inputs[_name] = build_io(input_info)
-            else:
-                output_info = next(
-                    i for i in tool_info["io"]["outputs"] if i["name"] == source_handle)
-                new_node.outputs[_name] = build_io(output_info)
-
-        for param_key, param in node["data"]["paramValues"].items():
-            if param.get("enabled") != True:
+        # Outputs keep their file-derived key. Nothing reads it as an identity
+        # -- main.py splits the handle back off it -- and changing it would be a
+        # second, unrelated break of the same contract.
+        for connection in connections:
+            if connection["target"] == node_id:
                 continue
-            param_info = next(
-                p for p in tool_info["parameters"] if p["name"] == param_key)
+            source_handle = connection.get("sourceHandle")
+            file_name = f"{connection['source']}-{source_handle}"
+            output_info = next(
+                i for i in tool_info["io"]["outputs"] if i["name"] == source_handle)
+            new_node.outputs[file_name] = build_io(output_info, file_name)
+
+        # Walk the recipe, not the request. paramValues is a JSON object, so
+        # its order is whatever the client serialised -- the same workflow sent
+        # twice with different key order produced two different commands (#44).
+        # The recipe's parameter list is the one thing that says what order the
+        # tool expects, and it is what the frontend walks
+        # (RecipePanel.js:584).
+        #
+        # A parameter the recipe does not declare is now ignored rather than
+        # raising StopIteration from inside the parse. It cannot be emitted --
+        # there is no flag or type for it -- and a request carrying one is not a
+        # reason to fail with an exception that names nothing.
+        supplied = node["data"]["paramValues"]
+        for param_info in tool_info["parameters"]:
+            param_key = param_info["name"]
+            param = supplied.get(param_key)
+            enabled = param is not None and param.get("enabled") == True
+
+            # A required parameter is resolved from the recipe rather than
+            # depending on the client to volunteer it (#33).
+            #
+            # Deciding purely on the client's `enabled` flag meant a subcommand
+            # survived only because RecipePanel.js initialises required
+            # parameters as enabled. Any client that does not replicate that
+            # produced `./samtools {input}` -- not samtools doing the wrong
+            # thing, samtools with no subcommand at all. 65 of the catalogue's
+            # 73 hidden parameters are subcommand selectors.
+            #
+            # Only where the recipe declares a default. The other 29 required
+            # parameters are visible ones a user genuinely has to supply --
+            # sed's script, tr's set1 -- and there is nothing to fall back on;
+            # inventing a value for those would be worse than rejecting the run.
+            if not enabled:
+                if not param_info.get("required"):
+                    continue
+                if param_info.get("type") == "flag":
+                    # A required flag needs no default: its presence IS the
+                    # value, and the emitter drops the value for this type
+                    # anyway. Requiring a default here would have skipped
+                    # samtools fixmate's -m, which the recipe declares required
+                    # and gives nothing to fall back on because there is nothing
+                    # to fall back to.
+                    value = ""
+                else:
+                    value = param_info.get("default")
+            else:
+                value = (param.get("value") if param_info.get("required")
+                         else param["value"])
+                # An enabled required parameter with nothing in it falls back to
+                # the recipe too, so a client that sends the key but leaves the
+                # value empty is no worse off than one that omits it entirely.
+                if (value is None or value == "") and param_info.get("required") \
+                        and param_info.get("default") is not None:
+                    value = param_info["default"]
+
+            if param_info.get("required"):
+                if param_info.get("type") == "flag":
+                    value = ""
+                elif value is None or value == "":
+                    raise WorkflowInputError(
+                        f"node {node_id!r} is missing required parameter {param_key!r}"
+                    )
 
             new_param: Param = Param(
-                param_key, param["value"], param_info.get("flag")
+                name=param_key,
+                value=value,
+                flag=param_info.get("flag"),
+                type=param_info.get("type"),
             )
 
             new_node.parameters[param_key] = new_param
@@ -487,64 +736,128 @@ def convert_to_snakemake(workflow: Workflow, step_logs=None):
 
     for node in workflow.nodes:
         for output in node.outputs.values():
-            result.append(f"        \"{output.file}\",")
+            result.append(f"        {py_string(output.file)},")
 
     for index, node in enumerate(workflow.nodes):
-        # print(node)
         result.append(f"rule {rule_name_for(node.id)}:")
-        cmd = [f"./{node.bin}"]
+        cmd = [sh_literal(f"./{node.bin}")]
         extra_cms = []
 
         for param_name, param in node.parameters.items():
+            # Omit empty typed values with their flags, matching the browser.
+            if param.type not in (None, "flag") and param.value == "":
+                continue
             if param.flag:
-                cmd.append(param.flag)
-            cmd.append(param.value)
+                cmd.append(sh_literal(param.flag))
+
+            if param.type == "flag":
+                # A flag parameter is its flag. It has no value, and emitting
+                # one would hand the tool an argument it does not take -- which
+                # is what the frontend has always done (RecipePanel.js:590) and
+                # what the model can now express. 469 of the catalogue's 1107
+                # parameters are this type.
+                continue
+
+            # An empty value stays absent rather than becoming an empty
+            # argument: shlex.quote("") is '', which is a real argument the tool
+            # never used to receive.
+            if param.value == "":
+                continue
+
+            # In declared position, flagged or not. An unflagged value is NOT
+            # held back the way an unflagged file is: every one of them in the
+            # catalogue is a hidden subcommand declared first -- "consensus" in
+            # `bcftools consensus -c ...` -- and moving it after the flags
+            # breaks the invocation. #49 argued the opposite from the getopt
+            # rule that applies to filenames; it does not apply here, and the
+            # frontend has always emitted these in place.
+            cmd.append(sh_literal(param.value))
+
+        # Arguments with no flag are held back and appended after every flagged
+        # one. A bare filename ahead of a flag makes a getopt-style parser stop
+        # scanning, so the flags that follow are never seen: tn93 given
+        # "in.fa -o out.txt" prints its usage and exits 1, while
+        # "-o out.txt in.fa" runs. The frontend orders them the same way.
+        trailing = []
+        # Redirections are kept apart from the arguments and written last. The
+        # shell accepts them anywhere, but "tool > out.txt in.fa" reads as
+        # though the input were part of the redirect.
+        redirects = []
 
         result.append("    input:")
         i = 0
         for input_name, input in node.inputs.items():
             input_var = f"i_{i}"
-            result.append(f"        {input_var}=\"{input.file}\",")
+            result.append(f"        {input_var}={py_string(input.file)},")
             if input.mode == IOMode.STDIN:
-                cmd.append("<")
-                cmd.append(f"{{input.{input_var}}}")
+                redirects.append(f"< {sh_field(f'input.{input_var}')}")
             elif input.mode == IOMode.FILE:
-                if input.flag: cmd.append(f"{input.flag}")
-                cmd.append(f"{{input.{input_var}}}")
+                if input.flag:
+                    cmd.append(sh_literal(input.flag))
+                    cmd.append(sh_field(f"input.{input_var}"))
+                else:
+                    trailing.append(sh_field(f"input.{input_var}"))
             i += 1
 
         result.append("    output:")
         i = 0
         for output_name, output in node.outputs.items():
             output_var = f"o_{i}"
-            result.append(f"        {output_var}=\"{output.file}\",")
+            result.append(f"        {output_var}={py_string(output.file)},")
             if output.mode == IOMode.STDOUT:
-                cmd.append(">")
-                cmd.append(f"{{output.{output_var}}}")
+                redirects.append(f"> {sh_field(f'output.{output_var}')}")
             elif output.mode == IOMode.FILE:
-                if output.flag: cmd.append(f"{output.flag}")
-                cmd.append(f"{{output.{output_var}}}")
+                if output.flag:
+                    cmd.append(sh_literal(output.flag))
+                    cmd.append(sh_field(f"output.{output_var}"))
+                else:
+                    trailing.append(sh_field(f"output.{output_var}"))
                 if output.hardcoded_file and not output.flag:
-                    extra_cms.append(f"        cp {output.hardcoded_file} {{output.{output_var}}}")
+                    extra_cms.append(
+                        f"cp {sh_literal(output.hardcoded_file)} "
+                        f"{sh_field(f'output.{output_var}')}"
+                    )
             i += 1
 
+        cmd.extend(trailing)
+        cmd.extend(redirects)
+
+        # Assembled outside the f-string. Nesting the same quote inside one is
+        # only legal from Python 3.12 (PEP 701), and relying on that here made
+        # the whole module fail to import on 3.11 and earlier -- for a line that
+        # reads no better either way.
+        command_line = " ".join(cmd)
+
+        # A Python string literal, not a triple-quoted block.
+        #
+        # There is one more reader than the shell and Snakemake's formatter, and
+        # it is the outermost one: a Snakefile IS Python source, so Python parses
+        # this literal before anything else sees it. In a """...""" block that
+        # meant two escapes:
+        #
+        #   a value containing a backslash escape was decoded by Python AFTER
+        #   shlex.quote had finished, so "x\x27; touch PWNED; \x27" became a real
+        #   quote and broke out of the shell quoting;
+        #
+        #   a value containing three double quotes ended the literal, and the
+        #   rest of it ran as Python at parse time -- arbitrary code on the agent
+        #   host, before any tool started, with the run still reporting success.
+        #
+        # json.dumps emits a literal in which neither is expressible: every
+        # backslash and quote it produces is already escaped for Python, and the
+        # value it decodes to is exactly the text that was assembled. The brace
+        # doubling done by sh_literal survives untouched, so Snakemake's
+        # formatter still reads what it should.
+        shell_body = "\n".join([command_line] + extra_cms)
         if step_logs is not None:
             stdout_name, stderr_name = step_logs[index]
             result.append(
-                f"    log: stdout={json.dumps(check_name(stdout_name))}, "
-                f"stderr={json.dumps(check_name(stderr_name))}"
+                f"    log: stdout={py_string(check_name(stdout_name))}, "
+                f"stderr={py_string(check_name(stderr_name))}"
             )
-
-        result.append(f"    shell:")
-        result.append(f"        \"\"\"")
-        if step_logs is not None:
-            result.append("        (")
-        result.append(f"        {" ".join(cmd)}")
-        for command in extra_cms:
-            result.append(command)
-        if step_logs is not None:
-            result.append("        ) > {log.stdout} 2> {log.stderr}")
-        result.append(f"        \"\"\"")
+            shell_body = "(\n" + shell_body + "\n) > {log.stdout:q} 2> {log.stderr:q}"
+        result.append("    shell:")
+        result.append(f"        {py_string(shell_body)}")
 
     return "\n".join(result)
 

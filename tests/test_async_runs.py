@@ -29,6 +29,7 @@ version of that which fits inside one HTTP request.
 """
 
 import inspect
+import tempfile
 import sys
 import types
 from pathlib import Path
@@ -63,6 +64,7 @@ import time
 
 import pytest
 
+import audit
 import convert
 from runs import (ALLOWED, TERMINAL, IllegalTransition, RunCapacityError,
                   RunState, RunStore, UnknownRun)
@@ -138,17 +140,22 @@ def service(tmp_path, monkeypatch):
     convert.tools.clear()
 
 
-def _bare_request(request_id=None):
+def _bare_request(request_id=None, caller=None, authenticated_by=None):
     """A real Request for the two tests that call submit_run directly.
 
     The handler takes one so it can read the id RequestIdMiddleware validated
-    (#84). A stub with the right attributes would do, but the real type means
-    these tests break if the way the id is read changes, which is the point.
+    (#84) and the caller the audit trail records (#19), and these two bypass
+    fastapi's dependency resolution -- so the request is theirs to supply. A
+    real Request rather than a stub, so they break if the way either is read
+    changes, which is the point of them.
     """
     from starlette.requests import Request
 
-    return Request({"type": "http", "method": "POST", "path": "/runs",
-                    "headers": [], "state": {"request_id": request_id}})
+    return Request({
+        "type": "http", "method": "POST", "path": "/runs", "headers": [],
+        "state": {"request_id": request_id, "caller": caller,
+                  "authenticated_by": authenticated_by},
+    })
 
 
 def _submit(client):
@@ -225,6 +232,51 @@ def test_a_defect_in_the_service_is_SYSTEM_ERROR_not_the_workflows_fault(service
         body = _poll(client, run_id)
 
     assert body["state"] == RunState.SYSTEM_ERROR.value, body
+
+
+@pytest.mark.parametrize("failed_state", [RunState.INITIALIZING, RunState.RUNNING])
+def test_an_initializing_or_running_audit_failure_stops_before_the_runner(
+        service, monkeypatch, failed_state):
+    from fastapi.testclient import TestClient
+
+    launched = []
+
+    def fail_transition(event, **fields):
+        if fields.get("state") == failed_state.value:
+            raise audit.AuditError("audit destination is unavailable")
+
+    monkeypatch.setattr(audit, "record", fail_transition)
+    monkeypatch.setattr(main, "run_snakemake",
+                        lambda *args, **kwargs: launched.append(True))
+
+    with TestClient(main.app) as client:
+        run_id = _submit(client).json()["run_id"]
+        body = _poll(client, run_id)
+
+    assert body["state"] == RunState.SYSTEM_ERROR.value, body
+    assert body["error"]["error"] == "audit_error"
+    assert not launched, "runner started after its INITIALIZING event failed"
+    assert "outputs" not in body
+
+
+def test_a_completion_audit_failure_is_pollable_and_has_no_outputs(
+        service, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    def fail_completion(event, **fields):
+        if fields.get("state") == RunState.COMPLETE.value:
+            raise audit.AuditError("completion event was not recorded")
+
+    monkeypatch.setattr(audit, "record", fail_completion)
+
+    with TestClient(main.app) as client:
+        run_id = _submit(client).json()["run_id"]
+        body = _poll(client, run_id)
+
+    assert body["state"] == RunState.SYSTEM_ERROR.value, body
+    assert body["error"]["error"] == "audit_error"
+    assert "completion event was not recorded" in body["error"]["message"]
+    assert "outputs" not in body
 
 
 def test_an_unknown_run_is_404_not_500(service):
@@ -364,22 +416,40 @@ def test_concurrent_admission_cannot_exceed_one_slot():
     assert store.get(admitted[0]).state is RunState.QUEUED
 
 
-def test_upload_read_failure_releases_reserved_capacity(service, monkeypatch):
+def test_upload_read_failure_releases_reserved_capacity(service, monkeypatch,
+                                                        tmp_path):
+    """And leaves no half-written spool behind.
+
+    read() takes a size now, because the submission copies the upload to disk a
+    megabyte at a time rather than calling read() for the whole of it -- which
+    is what starlette's own UploadFile.read(size=-1) has always accepted. The
+    stub followed the code.
+
+    The second assertion is new with that change: the copy creates a temporary
+    file of our own, and the handedover source only deletes it once a workspace
+    has taken it. A submission that fails here never reaches the source, so the
+    file is the handler's to remove, and a service built for large inputs cannot
+    leak one per failed input.
+    """
     import asyncio
 
     class BrokenUpload:
         filename = "input-1-out"
         size = 1
 
-        async def read(self):
+        async def read(self, size=-1):
             raise OSError("input stream failed")
 
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     store = RunStore(max_runs=1)
     monkeypatch.setattr(main, "RUNS", store)
     with pytest.raises(OSError, match="input stream failed"):
         asyncio.run(main.submit_run(_bare_request(), WORKFLOW,
                                     [BrokenUpload()]))
     assert store.create().state is RunState.QUEUED
+    assert list(tmp_path.iterdir()) == [], (
+        f"a failed submission left {[p.name for p in tmp_path.iterdir()]} behind"
+    )
 
 
 def test_full_store_refuses_before_upload_is_read(service, monkeypatch):
@@ -397,7 +467,7 @@ def test_full_store_refuses_before_upload_is_read(service, monkeypatch):
     accepted = store.create()
     monkeypatch.setattr(main, "RUNS", store)
     with pytest.raises(HTTPException) as refused:
-        asyncio.run(main.submit_run(_bare_request("hub-7"), WORKFLOW,
+        asyncio.run(main.submit_run(_bare_request(request_id="hub-7", caller="someone"), WORKFLOW,
                                     [UnreadUpload()]))
     assert refused.value.status_code == 503
     assert store.get(accepted.run_id).state is RunState.QUEUED
