@@ -63,3 +63,22 @@ def test_the_readme_says_which_runner_is_the_default():
     assert "BIOCHEF_RUNNER" in readme
     assert "subprocess" in readme and "apptainer" in readme
     assert "on the host" in readme
+
+
+def test_the_readme_states_what_the_defaults_cost_in_memory():
+    """Runs are held in memory, and "in memory" is not a number.
+
+    At the defaults the logs alone reach MAX_RUNS x MAX_LOG_BYTES x two streams.
+    An operator should be able to read that off the page rather than multiply it
+    themselves, and the figure should stop being right if the defaults move.
+    """
+    import runs
+    import steplogs
+
+    expected_mib = runs.MAX_RUNS * steplogs.MAX_LOG_BYTES * 2 // (1024 * 1024)
+    readme = (REPO_ROOT / "README.md").read_text()
+
+    assert f"{expected_mib} MiB" in readme, (
+        f"the README should say {expected_mib} MiB for the current defaults "
+        f"(MAX_RUNS={runs.MAX_RUNS}, MAX_LOG_BYTES={steplogs.MAX_LOG_BYTES})"
+    )

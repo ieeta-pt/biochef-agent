@@ -106,8 +106,10 @@ rule neighbour:
 rule from_workspace:
     output:
         o_0="exec.txt"
+    log:
+        stdout="work.stdout", stderr="work.stderr"
     shell:
-        "./tool > {output.o_0}"
+        "( ./tool > {output.o_0} ) > {log.stdout} 2> {log.stderr}"
 
 rule env_inheritance:
     output:
@@ -142,7 +144,8 @@ def _prepare(root, preamble, sentinel):
     # separate question that CI cannot answer without credentials.
     tool = os.path.join(ws.path, "tool")
     with open(tool, "w") as f:
-        f.write("#!/bin/sh\necho executed-from-workspace\n")
+        f.write("#!/bin/sh\necho executed-from-workspace\n"
+                "echo step-stderr-marker >&2\n")
     os.chmod(tool, 0o700)
     return ws
 
@@ -190,17 +193,16 @@ def main():
             return 1
         outcomes[label] = (_read(ws, "result.txt"), _read(ws, "where.txt"),
                            _read(ws, "neighbour.txt"), _read(ws, "exec.txt"),
-                           _read(ws, "env_inheritance.txt"))
+                           _read(ws, "env_inheritance.txt"),
+                           _read(ws, "work.stdout"), _read(ws, "work.stderr"))
         print(f"    ran on: {outcomes[label][1].decode().strip()!r}   "
               f"other runs' data: {outcomes[label][2].decode().strip()!r}",
               flush=True)
 
-    plain_result, plain_where, plain_neighbour, plain_exec, plain_env_result = (
-        outcomes["subprocess"]
-    )
-    boxed_result, boxed_where, boxed_neighbour, boxed_exec, boxed_env_result = (
-        outcomes["apptainer"]
-    )
+    (plain_result, plain_where, plain_neighbour, plain_exec,
+     plain_env_result, plain_log_out, plain_log_err) = outcomes["subprocess"]
+    (boxed_result, boxed_where, boxed_neighbour, boxed_exec,
+     boxed_env_result, boxed_log_out, boxed_log_err) = outcomes["apptainer"]
 
     failures = []
     if plain_result != boxed_result:
@@ -241,6 +243,14 @@ def main():
             failures.append(
                 f"{label}: a file placed in the workspace did not execute "
                 f"({got.strip()!r}); the emitter only ever produces ./<bin>"
+            )
+
+    for label, stdout, stderr in (("subprocess", plain_log_out, plain_log_err),
+                                  ("apptainer", boxed_log_out, boxed_log_err)):
+        if stdout or stderr.strip() != b"step-stderr-marker":
+            failures.append(
+                f"{label}: per-rule log capture failed "
+                f"(stdout={stdout!r}, stderr={stderr!r})"
             )
 
     if plain_env_result.strip() != b"inherited":
