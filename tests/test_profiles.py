@@ -1,6 +1,6 @@
 """Named profiles, and whether selecting one means anything (#17, E4).
 
-There are sixteen settings and the two that decide how exposed a run is default
+There are thirty-six settings and the two that decide how exposed a run is default
 to the unguarded option: BIOCHEF_RUNNER runs tools on the host as this service's
 user, and BIOCHEF_AUTH answers anybody. Neither default is wrong for a laptop.
 Both are wrong for a machine holding data, and nothing in a response says which

@@ -1,6 +1,6 @@
 """Named starting points for the settings that decide how exposed a run is (#17).
 
-There are sixteen settings, and the ones that matter most are the ones an
+There are thirty-six settings, and the ones that matter most are the ones an
 operator is least likely to know exist. `BIOCHEF_RUNNER` defaults to running
 every tool on the host as this service's user. `BIOCHEF_AUTH` defaults to
 answering anybody. Neither default is wrong for a laptop and both are wrong for
