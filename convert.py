@@ -770,12 +770,15 @@ def convert_to_snakemake(workflow: Workflow, step_logs=None):
                 continue
 
             # In declared position, flagged or not. An unflagged value is NOT
-            # held back the way an unflagged file is: every one of them in the
-            # catalogue is a hidden subcommand declared first -- "consensus" in
+            # held back the way an unflagged file is: 71 of the catalogue's 81
+            # are a hidden subcommand declared first -- "consensus" in
             # `bcftools consensus -c ...` -- and moving it after the flags
-            # breaks the invocation. #49 argued the opposite from the getopt
-            # rule that applies to filenames; it does not apply here, and the
-            # frontend has always emitted these in place.
+            # breaks the invocation. The other 10 are visible, and this order
+            # suits all but one: seqtk.hrun's min_length, which seqtk reads
+            # after the file and gets before it, here and in the frontend. #49
+            # argued the opposite from the getopt rule that applies to
+            # filenames; it does not apply here, and the frontend has always
+            # emitted these in place.
             cmd.append(sh_literal(param.value))
 
         # Arguments with no flag are held back and appended after every flagged
