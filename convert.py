@@ -216,23 +216,20 @@ def cache_matches(directory, manifest, target):
     return True
 
 
-def verify_against_manifest(target, staging, manifest=None):
-    """Check every staged file against the digest the manifest claims for it.
+def refuse_unusable_layers(target, manifest):
+    """Refuse a manifest with a layer that no bundle would have.
 
-    oras never does this. It builds the blob URL from the digest and streams the
-    response to a file, so the digest names what was asked for and never what
-    arrived (#9). What arrives is then made executable and run.
+    Runs before the pull as well as after it. oras extracts a directory layer
+    as it pulls, so refusing one afterwards means the archive has already been
+    unpacked, and an archive that is not valid fails inside oras as an unrelated
+    error.
 
-    A layer's on-disk file IS the blob for ordinary layers, so hashing the staged
-    file is the comparison the specification intends. A directory layer is
-    different: oras downloads it to a temporary archive and extracts it, so
-    nothing on disk is the blob and the digest cannot be checked after the fact.
-    That case is refused rather than skipped -- an unverifiable artifact must not
-    be quietly treated as a verified one, which is the failure this whole issue
-    is about.
+    A layer with no title is refused because a bundle has none: the Hub names
+    every file it publishes, and a bundle is those named files. Without a title
+    oras saves the layer under its digest, so its hash matches and it would pass
+    as verified while being no part of the tool. A layer added to a published
+    image looks exactly like this.
     """
-    if manifest is None:
-        manifest = client.get_manifest(client.get_container(target))
     layers = manifest.get("layers") or []
     if not layers:
         raise ToolIntegrityError(
@@ -253,7 +250,36 @@ def verify_against_manifest(target, staging, manifest=None):
                 f"treating it as verified."
             )
 
-        name = (layer.get("annotations") or {}).get(_ANNOTATION_TITLE) or digest
+        if not (layer.get("annotations") or {}).get(_ANNOTATION_TITLE):
+            raise ToolIntegrityError(
+                f"{target}: layer {digest} has no title, so it is not one of "
+                f"the files of a bundle. Refusing rather than storing it "
+                f"beside the tool."
+            )
+
+
+def verify_against_manifest(target, staging, manifest=None):
+    """Check every staged file against the digest the manifest claims for it.
+
+    oras never does this. It builds the blob URL from the digest and streams the
+    response to a file, so the digest names what was asked for and never what
+    arrived (#9). What arrives is then made executable and run.
+
+    A layer's on-disk file IS the blob for ordinary layers, so hashing the staged
+    file is the comparison the specification intends. A directory layer is
+    different: oras downloads it to a temporary archive and extracts it, so
+    nothing on disk is the blob and the digest cannot be checked after the fact.
+    That case is refused rather than skipped -- an unverifiable artifact must not
+    be quietly treated as a verified one, which is the failure this whole issue
+    is about.
+    """
+    if manifest is None:
+        manifest = client.get_manifest(client.get_container(target))
+    refuse_unusable_layers(target, manifest)
+
+    for layer in manifest["layers"]:
+        digest = layer["digest"]
+        name = layer["annotations"][_ANNOTATION_TITLE]
         path = _contained_path(staging, name, target)
         if not os.path.exists(path):
             raise ToolIntegrityError(
@@ -365,6 +391,7 @@ def fetch_tool(tool_id, repo):
 
         pull_target = subject if current_mode != signing.OFF and subject else target
         if not cache_matches(outdir, manifest, pull_target):
+            refuse_unusable_layers(pull_target, manifest)
             staging = f"{outdir}.part.{uuid.uuid4().hex}"
             os.makedirs(staging)
             try:
