@@ -226,6 +226,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_MAX_CONCURRENT_RUNS` | `4` | execution slots shared by `/runs` and `/convert`; admitted `/runs` jobs wait in `QUEUED` |
 | `BIOCHEF_AUTH` | `none` | who may call it: `none` or `bearer` |
 | `BIOCHEF_AUTH_TOKEN` | | the shared token, required when `BIOCHEF_AUTH=bearer` |
+| `BIOCHEF_CORS_ORIGINS` | *(unset)* | browser origins allowed to call the agent, comma separated; unset sends no CORS headers |
 | `BIOCHEF_PASSPORT_ISSUER` | *(unset)* | the issuer whose passports are accepted, when `BIOCHEF_AUTH=passport` |
 | `BIOCHEF_PASSPORT_AUDIENCE` | *(required)* | the audience a passport must name; `any` to accept tokens minted for other services |
 | `BIOCHEF_PASSPORT_JWKS_URL` | *(discovered)* | override the issuer's published key set URL |
@@ -250,6 +251,16 @@ not identity -- every holder is the same caller -- but it is the difference
 between an open endpoint and a closed one. Selecting `bearer` without a token
 stops the service from starting rather than letting it run with a token nobody
 has to guess.
+
+`BIOCHEF_CORS_ORIGINS` lets a page on another origin — the editor — read the
+agent's responses. It is unset by default, which sends no CORS headers. Name
+each origin exactly as a browser sends it, `scheme://host[:port]` with no path
+or trailing slash; `*` and anything else that is not an origin stop the service
+from starting. Without it, a browser calling `/convert` still sends the request
+and the agent still runs the workflow — only the response is withheld from the
+page. CORS is not access control: a request from an unlisted origin is still
+served, the browser only hides the reply. Who may run anything is decided by
+`BIOCHEF_AUTH`.
 
 **The audit trail records a caller only when the provider says its return names
 one.** Every provider has to declare that, and one that does not stops the
