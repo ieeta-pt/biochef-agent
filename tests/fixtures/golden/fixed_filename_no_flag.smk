@@ -7,4 +7,4 @@ rule unflagged_1:
     output:
         o_0="unflagged-1-out",
     shell:
-        "./t {input.i_0:q} {output.o_0:q}\ncp result.txt {output.o_0:q}"
+        "./t {input.i_0:q}\ncp result.txt {output.o_0:q}"

@@ -812,11 +812,16 @@ def convert_to_snakemake(workflow: Workflow, step_logs=None):
             if output.mode == IOMode.STDOUT:
                 redirects.append(f"> {sh_field(f'output.{output_var}')}")
             elif output.mode == IOMode.FILE:
+                # The frontend's three cases (toolUtils.js): a flag names the
+                # path, "" makes it positional, and no flag at all leaves it off
+                # the command line, because the tool picks its own file name.
                 if output.flag:
                     cmd.append(sh_literal(output.flag))
                     cmd.append(sh_field(f"output.{output_var}"))
-                else:
-                    trailing.append(sh_field(f"output.{output_var}"))
+                elif output.flag == "":
+                    trailing.append(
+                        sh_literal(output.hardcoded_file) if output.hardcoded_file
+                        else sh_field(f"output.{output_var}"))
                 if output.hardcoded_file and not output.flag:
                     extra_cms.append(
                         f"cp {sh_literal(output.hardcoded_file)} "
