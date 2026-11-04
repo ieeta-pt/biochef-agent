@@ -1,4 +1,4 @@
-"""Manual compatibility check for one pinned BioCHEF registry bundle.
+"""Compatibility check for one pinned BioCHEF registry bundle, run in CI (#60).
 
 This checks the two runners, not the Agent's ORAS fetch or evidence-verification path.
 """
