@@ -237,6 +237,9 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_CONTAINER_IMAGE` | `docker://debian:stable-slim` | image each step runs in, under the `apptainer` runner |
 | `BIOCHEF_APPTAINER_CACHE` | `apptainer-cache` | where pulled container images are kept between runs |
 | `BIOCHEF_APPTAINER_ARGS` | `--contain --cleanenv` | extra flags for apptainer itself |
+| `BIOCHEF_TOOL_CATALOG` | `required` | `required` or `off`: whether every tool is resolved through the signed catalog |
+| `BIOCHEF_CATALOG_PUBLIC_JWK` | *(the web app's key)* | the catalog's EC P-256 public key, as JSON, for a registry with its own catalog key |
+| `BIOCHEF_CATALOG_PACKAGE` | `biochef-plugins-index` | the repository the catalog is published under |
 | `BIOCHEF_SIGNING_MODE` | `off` | `off`, `warn`, or `strict` — whether a bundle must be signed to run |
 | `BIOCHEF_SIGNING_POLICY` | *(unset)* | path to the Hub's `biochef.signing-policy.v1` document |
 | `BIOCHEF_COSIGN` | `cosign` | the cosign executable to verify with |
@@ -296,6 +299,17 @@ instead. The container is the boundary between an untrusted tool binary and the
 machine, so on any deployment holding data that matters, `apptainer` is the
 setting you want.
 
+`BIOCHEF_TOOL_CATALOG` defaults to `required`: a workflow names a package, and
+the Hub's signed catalog decides which manifest that is. The catalog is fetched
+from the registry, its ES256 signature checked against the same key the web app
+pins, and every reference resolved to the catalog's digest before anything is
+fetched. A bare package name, `latest` or the catalog's version all resolve to
+it. Any other tag, a digest the catalog does not list, or a package it does not
+contain is refused. So is a catalog older than one this service has already
+accepted, which is recorded next to the tool cache. A tag is a name anyone who
+can write to the registry can move; the catalog is not. `off` sends references
+to the registry as written, for a development registry that has no catalog.
+
 `BIOCHEF_SIGNING_MODE` defaults to `off`, which is what this service did before
 it could verify anything and is named so that it reads as a decision. The Hub
 signs and attests every bundle it publishes; `strict` makes a bundle that does
@@ -309,7 +323,8 @@ manifest whose digest could not be established are all refusals. A verification
 step that passes when it could not run is worse than none, because it is
 believed.
 
-In `strict`, the caller must provide an immutable digest, and the Agent also
+In `strict`, the reference must be an immutable digest. The catalog supplies
+it; with the catalog `off`, the caller must. The Agent also
 checks the CycloneDX and SLSA evidence against the files it executes.
 Cosign and SLSA Verifier must be installed in the Agent's environment; the Agent
 does not download them at runtime. `warn` reports failed checks and
