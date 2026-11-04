@@ -259,6 +259,7 @@ def test_parallel_rules_have_separate_stdout_and_stderr(
     monkeypatch.setattr(main, "RUNNER", SubprocessRunner())
     bundle = json.loads(convert.client.bundle_bytes)
     bundle["io"]["outputs"][0]["mode"] = "file"
+    bundle["io"]["outputs"][0]["flag"] = ""
     convert.client.bundle_bytes = json.dumps(bundle).encode()
     convert.client.binary_bytes = (
         b'#!/bin/sh\ncat "$1" >&2\nexit 3\n' if failing else
