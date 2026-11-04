@@ -355,6 +355,17 @@ def _with_parameters(param_values):
     }
 
 
+def test_a_tool_node_with_no_param_values_takes_the_recipe_defaults(monkeypatch):
+    monkeypatch.setattr(convert, "fetch_tool", lambda tool_id, repo: PARAMETER_BUNDLE)
+    convert.tools.clear()
+    document = _with_parameters({})
+    del document["nodes"][1]["data"]["paramValues"]
+
+    workflow = convert.parse_biochef_workflow(document)
+
+    assert workflow.nodes[0].parameters["needed"].value == "fallback"
+
+
 def test_an_enabled_optional_parameter_with_no_value_is_refused(monkeypatch):
     monkeypatch.setattr(convert, "fetch_tool", lambda tool_id, repo: PARAMETER_BUNDLE)
     convert.tools.clear()

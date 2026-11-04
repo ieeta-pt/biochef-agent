@@ -832,7 +832,7 @@ def parse_biochef_workflow(biochef_workflow):
         # raising StopIteration from inside the parse. It cannot be emitted --
         # there is no flag or type for it -- and a request carrying one is not a
         # reason to fail with an exception that names nothing.
-        supplied = node["data"]["paramValues"]
+        supplied = node["data"].get("paramValues", {})
         for param_info in tool_info["parameters"]:
             param_key = param_info["name"]
             param = supplied.get(param_key)
