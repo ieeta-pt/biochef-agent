@@ -61,6 +61,15 @@ def client(tmp_path, monkeypatch):
     return TestClient(main.app, raise_server_exceptions=False)
 
 
+# Parses, and then fails: no node claims the upload, so the run is refused from
+# inside perform_run with a workspace already made. The tests below that watch
+# make_workspace need exactly that, and used to use b"not json" -- which worked
+# only while the document was parsed after the directory was created. It is
+# refused before one exists now (#86), so those tests were asserting the old
+# order rather than what they are about.
+FAILS_AFTER_SETUP = b'{"nodes": [], "edges": []}'
+
+
 def post(client, workflow=b"{}", filename="input-1-out"):
     return client.post(
         "/convert",
@@ -94,7 +103,7 @@ def test_a_failed_run_leaves_no_workspace_behind(client, tmp_path, monkeypatch):
     monkeypatch.setattr(main, "make_workspace",
                         lambda root=None: made.append(real(root)) or made[-1])
 
-    post(client, workflow=b"not json")
+    post(client, workflow=FAILS_AFTER_SETUP)
 
     assert made, "the handler should have made a workspace"
     assert not os.path.exists(made[0].path), "and removed it on the way out"
@@ -106,8 +115,8 @@ def test_two_runs_get_different_directories(client, tmp_path, monkeypatch):
     monkeypatch.setattr(main, "make_workspace",
                         lambda root=None: made.append(real(root)) or made[-1])
 
-    post(client, workflow=b"not json")
-    post(client, workflow=b"not json")
+    post(client, workflow=FAILS_AFTER_SETUP)
+    post(client, workflow=FAILS_AFTER_SETUP)
 
     assert len(made) == 2
     assert made[0].path != made[1].path, "each run needs a directory of its own"
