@@ -13,8 +13,10 @@ Two modes:
     off       references go to the registry as written, as before this
               existed. For a development registry that has no catalog.
 
-This is independent of BIOCHEF_SIGNING_MODE. The catalog fixes WHICH manifest
-runs; signing then decides whether that manifest must also verify again here.
+The catalog fixes WHICH manifest runs; BIOCHEF_SIGNING_MODE then decides whether
+that manifest must also verify again here. They meet in one place: under strict,
+an exact digest the catalog no longer lists may still run, because signing,
+rather than the catalog, vouches for it (#4).
 """
 
 import base64
@@ -244,9 +246,12 @@ class Catalog:
         """`repository@digest` for what the node names, decided by the catalog.
 
         A bare repository, `latest` and the catalog's version tag all resolve
-        to the catalog's digest. Any other tag, or a digest the catalog does not
-        list for that package, is refused: either would run a manifest nobody
-        vouched for as current.
+        to the catalog's digest. Any other tag is refused, and so is any other
+        digest unless signing is strict: the catalog lists only the current
+        version, so a workflow that names an older one by digest could never be
+        run twice (#4). Strict has to verify that exact manifest's signature,
+        SBOM and provenance before anything runs. Under any other mode nothing
+        would vouch for it.
         """
         repository, tag, digest = _split(repo)
         catalog = self.current()
@@ -258,6 +263,8 @@ class Catalog:
                 f"{entry['version']}, not {tag}"
             )
         if digest is not None and digest != expected:
+            if signing.mode() == signing.STRICT and _DIGEST.fullmatch(digest):
+                return f"{repository}@{digest}"
             raise CatalogError(
                 f"{repo}: the signed catalog lists {repository} as {expected}"
             )

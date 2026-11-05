@@ -261,6 +261,14 @@ def test_a_digest_other_than_the_catalogs_is_refused(world):
     assert f"{PACKAGE}@{world['moved']}" not in world["registry"].asked
 
 
+@pytest.mark.parametrize("signing_mode", ["off", "warn"])
+def test_an_older_digest_is_refused_unless_signing_is_strict(world, monkeypatch, signing_mode):
+    monkeypatch.setenv("BIOCHEF_SIGNING_MODE", signing_mode)
+    with pytest.raises(catalog.CatalogError, match="lists biochef-plugins-jq.query as"):
+        convert.fetch_tool("jq.query-1", f"{PACKAGE}@{world['moved']}")
+    assert f"{PACKAGE}@{world['moved']}" not in world["registry"].asked
+
+
 def test_a_refusal_is_the_same_403_as_any_artifact_not_admitted():
     assert issubclass(catalog.CatalogError, signing.SignatureError)
     assert signing.SignatureError in main.app.exception_handlers
@@ -377,3 +385,50 @@ def test_strict_accepts_a_bare_name_once_the_catalog_has_pinned_it(world, monkey
     with pytest.raises(_Stop):
         convert.fetch_tool("jq.query-1", PACKAGE)
     assert checked == [(f"{REGISTRY}/{PACKAGE}@{world['genuine']}", world["genuine"])]
+
+
+def _stop_at_the_signature_check(monkeypatch):
+    checked = []
+
+    def stop(reference, digest, log=None):
+        checked.append((reference, digest))
+        raise _Stop
+
+    monkeypatch.setattr(convert.signing, "check", stop)
+    return checked
+
+
+def test_strict_verifies_an_older_digest_instead_of_refusing_it(world, monkeypatch):
+    """The catalog lists only the current version, so without this a workflow
+    pinned to a digest stops running as soon as the tool is republished (#4)."""
+    monkeypatch.setenv("BIOCHEF_SIGNING_MODE", "strict")
+    checked = _stop_at_the_signature_check(monkeypatch)
+    with pytest.raises(_Stop):
+        convert.fetch_tool("jq.query-1", f"{PACKAGE}@{world['moved']}")
+    assert checked == [(f"{REGISTRY}/{PACKAGE}@{world['moved']}", world["moved"])]
+
+
+def test_strict_runs_nothing_from_an_older_digest_that_does_not_verify(world, monkeypatch):
+    monkeypatch.setenv("BIOCHEF_SIGNING_MODE", "strict")
+
+    def refuse(reference, digest, log=None):
+        raise convert.signing.SignatureError("not signed")
+
+    monkeypatch.setattr(convert.signing, "check", refuse)
+    monkeypatch.setattr(convert.client, "pull", lambda **kwargs: pytest.fail("pulled"))
+    with pytest.raises(convert.signing.SignatureError, match="not signed"):
+        convert.fetch_tool("jq.query-1", f"{PACKAGE}@{world['moved']}")
+
+
+@pytest.mark.parametrize("repo", [
+    "biochef-plugins-unlisted@sha256:" + "a" * 64,
+    f"{PACKAGE}:0.0.1",
+    f"{PACKAGE}@sha256:short",
+], ids=["unlisted-package", "older-tag", "malformed-digest"])
+def test_strict_still_refuses_anything_but_an_exact_digest_of_a_listed_package(
+        world, monkeypatch, repo):
+    monkeypatch.setenv("BIOCHEF_SIGNING_MODE", "strict")
+    checked = _stop_at_the_signature_check(monkeypatch)
+    with pytest.raises(catalog.CatalogError):
+        convert.fetch_tool("jq.query-1", repo)
+    assert checked == []

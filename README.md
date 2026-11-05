@@ -305,8 +305,12 @@ from the registry, its ES256 signature checked against the same key the web app
 pins, and every reference resolved to the catalog's digest before anything is
 fetched. A bare package name, `latest` or the catalog's version all resolve to
 it. Any other tag, a digest the catalog does not list, or a package it does not
-contain is refused. So is a catalog older than one this service has already
-accepted, which is recorded next to the tool cache. A tag is a name anyone who
+contain is refused. The exception is `strict` signing: an exact digest of a
+package the catalog lists runs if its own signature, SBOM and provenance verify,
+so that a workflow pinned to an older version survives a republish. A version
+dropped from the catalog stays runnable that way while its signature is valid.
+A catalog older than one this service has already accepted is refused too, and
+the newest sequence is recorded next to the tool cache. A tag is a name anyone who
 can write to the registry can move; the catalog is not. `off` sends references
 to the registry as written, for a development registry that has no catalog.
 
