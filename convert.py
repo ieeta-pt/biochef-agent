@@ -34,8 +34,8 @@ app = FastAPI()
 class _Registry:
     """The registry client, logged in the first time something needs it.
 
-    Not at import, because the page reads a generated Snakefile through this
-    module and the page has no network to reach a registry with.
+    Not at import: a process that only reads a workflow has no reason to reach a
+    registry, and may have no network to reach one with.
     """
 
     def __init__(self):
@@ -626,8 +626,12 @@ class WorkflowInputError(ValueError):
 
 
 def parse_biochef_workflow(biochef_workflow, resolve=None):
-    """The intermediate workflow. `resolve` finds a tool, by default in the registry."""
-    resolve = resolve or fetch_tool
+    """The intermediate workflow. `resolve` finds a tool, by default in the registry.
+
+    The module's fetch_tool is looked up here rather than bound as a default, so
+    that replacing it, as the tests and the catalogue sweep do, keeps working.
+    """
+    fetch_tool = resolve or globals()["fetch_tool"]
     node_list, edge_list = biochef_workflow["nodes"], biochef_workflow["edges"]
     new_workflow: Workflow = Workflow()
 
@@ -636,7 +640,8 @@ def parse_biochef_workflow(biochef_workflow, resolve=None):
         if node_type != "workflowNode":
             continue
 
-        tool_info = resolve(node_id, node["data"]["repo"])
+        repo = node["data"]["repo"]
+        tool_info = fetch_tool(node_id, repo)
 
         new_node: Node = Node(
             id=node_id, bin=tool_info["bin"],
