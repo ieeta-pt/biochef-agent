@@ -36,8 +36,11 @@ def add_version(session, version=1, *, study="st-01", members=("m-01",),
                             binding_token="token")
     session.flush()
     for name in members:
-        repo.set_identity(session, row.id, name, verified,
-                          None if verified else "no match")
+        if verified:
+            repo.mark_identity_verified(session, row.id, name,
+                                        {"sub": f"{name}@example.org"})
+        else:
+            repo.mark_identity_failed(session, row.id, name, "no match")
     return row
 
 

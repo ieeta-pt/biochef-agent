@@ -92,6 +92,7 @@ def upgrade():
 
     op.create_table('study',
     sa.Column('id', sqlmodel.sql.sqltypes.AutoString(), nullable=False),
+    sa.Column('title', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
     sa.Column('created_at', store.models.UtcDateTime(), nullable=False),
     sa.PrimaryKeyConstraint('id', name=op.f('pk_study'))
     )
@@ -154,6 +155,7 @@ def upgrade():
     sa.Column('binding_token', sa.Text(), nullable=False),
     sa.Column('identity_verified', sa.Boolean(), nullable=False),
     sa.Column('identity_error', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
+    sa.Column('display_name', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
     sa.ForeignKeyConstraint(['study_version_id'], ['study_version.id'], name=op.f('fk_member_key_study_version_id_study_version')),
     sa.PrimaryKeyConstraint('study_version_id', 'member', name=op.f('pk_member_key'))
     )

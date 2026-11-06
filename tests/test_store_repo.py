@@ -15,7 +15,7 @@ from store import db, repo
 from store.errors import (AlreadyPosted, Conflict, IdentityNotVerified,
                           IllegalTransition, ImmutableField, NotFound,
                           StaleList)
-from store.models import Decision, MemberKey, Request, StudyVersion
+from store.models import Decision, MemberKey, Request, Study, StudyVersion
 from store.states import (Action, BindingSource, EgressState, RefusalCode,
                           SubjectType, VersionState, Verdict)
 
@@ -225,11 +225,78 @@ def test_concurrent_approvals_leave_exactly_one_approved(engine):
 def test_a_member_who_failed_verification_blocks_approval(engine):
     with db.writing(engine) as session:
         version = add_version(session, members=("m-01", "m-02")).id
-        repo.set_identity(session, version, "m-02", False, "keys do not match")
+        repo.mark_identity_failed(session, version, "m-02", "keys do not match")
     with pytest.raises(IdentityNotVerified, match="m-02"):
         with db.writing(engine) as session:
             repo.approve_study_version(session, version, now=NOW)
     assert state_of(engine, version) == "pending"
+
+
+def key_of(session, version, member="m-01"):
+    return next(row for row in repo.member_keys(session, version)
+                if row.member == member)
+
+
+def test_a_verified_name_comes_from_the_token(engine):
+    with db.writing(engine) as session:
+        version = add_version(session).id
+        repo.mark_identity_verified(session, version, "m-01",
+                                    {"sub": "m-01@example.org", "name": " Ana Costa "})
+        row = key_of(session, version)
+        assert row.display_name == "Ana Costa"
+        assert repo.member_label(row) == "Ana Costa"
+
+
+def test_a_token_for_someone_else_gives_no_name_and_no_identity(engine):
+    with db.writing(engine) as session:
+        version = add_version(session, verified=False).id
+    with pytest.raises(Conflict):
+        with db.writing(engine) as session:
+            repo.mark_identity_verified(session, version, "m-01",
+                                        {"sub": "other@example.org", "name": "Eve"})
+    with db.reading(engine) as session:
+        row = key_of(session, version)
+    assert row.display_name is None and row.identity_verified is False
+
+
+def test_a_member_key_cannot_be_added_with_a_name(engine):
+    """The one door is mark_identity_verified."""
+    with db.writing(engine) as session:
+        version = add_version(session).id
+        with pytest.raises(TypeError):
+            repo.add_member_key(session, study_version_id=version, member="m-09",
+                                ls_aai_id="x", signing_key={}, result_key="k",
+                                binding_token="t", display_name="Eve")
+
+
+def test_a_later_failure_removes_the_name(engine):
+    with db.writing(engine) as session:
+        version = add_version(session).id
+        repo.mark_identity_verified(session, version, "m-01",
+                                    {"sub": "m-01@example.org", "name": "Ana"})
+        repo.mark_identity_failed(session, version, "m-01", "key replaced")
+        assert key_of(session, version).display_name is None
+
+
+@pytest.mark.parametrize("name", [None, "", "   ", 42, "Ana\nCosta"])
+def test_an_unusable_name_is_no_name(engine, name):
+    with db.writing(engine) as session:
+        version = add_version(session).id
+        repo.mark_identity_verified(session, version, "m-01",
+                                    {"sub": "m-01@example.org", "name": name})
+        assert key_of(session, version).display_name is None
+
+
+@pytest.mark.parametrize("ls_aai_id,label", [
+    ("a3f1c09e7b2d4e58@lifescience-ri.eu", "a3f1c09e…@lifescience-ri.eu"),
+    ("short@example.org", "short@example.org"),
+    ("a3f1c09e7b2d4e58", "a3f1c09e…"),
+])
+def test_with_no_name_the_label_is_the_shortened_id(ls_aai_id, label):
+    row = MemberKey(study_version_id=1, member="m-02", ls_aai_id=ls_aai_id,
+                    signing_key={}, result_key="k", binding_token="t")
+    assert repo.member_label(row) == label
+    assert "m-02" not in repo.member_label(row)
 
 
 def test_a_failed_member_can_still_be_refused(engine):
@@ -340,6 +407,28 @@ def test_a_workflow_approval_belongs_to_one_study_version(engine):
         repo.approve_study_version(session, v2, now=NOW)
         add_workflow(session, v2, "sha256:same")
         assert repo.approved_workflow(session, v2, "sha256:same") is None
+
+
+@pytest.mark.parametrize("goal,heading", [
+    ("First line\nSecond line", "st · First line"),
+    ("  \n Padded \n", "st · Padded"),
+    ("", "st"),
+])
+def test_a_study_with_no_title_shows_its_id_and_goal(engine, goal, heading):
+    with db.writing(engine) as session:
+        version = repo.add_study_version(
+            session, study_id="st", version=1, digest="sha256:x", raw=b"x",
+            goal=goal, proposer="m", members=[], nodes=[], datasets=[],
+            output_rules={}, now=NOW)
+        assert session.get(Study, "st").title is None
+        assert repo.study_heading(session, version) == heading
+
+
+def test_a_title_wins_when_there_is_one(engine):
+    with db.writing(engine) as session:
+        version = add_version(session)
+        session.get(Study, "st-01").title = "CARDIO-PT cohort"
+        assert repo.study_heading(session, version) == "CARDIO-PT cohort"
 
 
 def test_pending_lists_are_newest_first(engine):

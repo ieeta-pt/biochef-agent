@@ -81,6 +81,7 @@ class Study(SQLModel, table=True):
     __tablename__ = "study"
 
     id: str = Field(primary_key=True)
+    title: Optional[str] = None
     created_at: datetime = _moment(nullable=False)
 
 
@@ -129,6 +130,9 @@ class MemberKey(SQLModel, table=True):
     binding_token: str = Field(sa_column=Column(Text, nullable=False))
     identity_verified: bool = False
     identity_error: Optional[str] = None
+    # Only ever the name claim of a verified binding_token. See
+    # repo.mark_identity_verified, the one place that writes it.
+    display_name: Optional[str] = None
 
 
 class WorkflowVersion(SQLModel, table=True):

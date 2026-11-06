@@ -6,12 +6,14 @@ import sys
 from datetime import timedelta
 
 import pytest
+from sqlmodel import select
 
 from tests.store_support import NOW, REPO_ROOT, fresh_database
 
 from store import db, migrate, repo, seed
 from store.errors import StoreError
 from store.fixtures import mock
+from store.models import Decision, MemberKey, Request, Study, StudyVersion
 from store.states import SubjectType, Verdict
 
 
@@ -32,8 +34,9 @@ def test_the_screens_show_what_the_mockups_show(engine):
 
         pending = repo.pending_study_versions(session)
         workflows = repo.pending_workflow_versions(session)
-        assert [row.goal for row in pending] == ["CARDIO-PT cohort",
-                                                 "Rare variants pilot"]
+        assert [repo.study_heading(session, row) for row in pending] == [
+            "cardio-pt · CARDIO-PT cohort",
+            "rare-variants-pilot · Rare variants pilot"]
         assert [(row.name, row.version) for row in workflows] == [("gwas-qc", "1.4.0")]
 
 
@@ -41,12 +44,44 @@ def test_the_failed_identity_blocks_rare_variants(engine):
     with db.reading(engine) as session:
         version = repo.study_versions(session, mock.RARE)[0]
         keys = {row.member: row for row in repo.member_keys(session, version.id)}
-    assert keys["Marta Reis"].identity_verified
-    assert not keys["Paulo Neves"].identity_verified
-    assert keys["Paulo Neves"].identity_error
-    with pytest.raises(Exception, match="Paulo Neves"):
+    marta, paulo = keys["m-04"], keys["m-05"]
+    assert marta.identity_verified and marta.display_name == "Marta Reis"
+    assert not paulo.identity_verified and paulo.identity_error
+    assert paulo.display_name is None
+    assert repo.member_label(paulo) == "c2e86f10…@lifescience-ri.eu"
+    with pytest.raises(Exception, match="m-05"):
         with db.writing(engine) as session:
             repo.approve_study_version(session, version.id)
+
+
+def test_every_seeded_name_is_the_claim_of_its_token(engine):
+    with db.reading(engine) as session:
+        rows = session.exec(select(MemberKey)).all()
+    named = [row for row in rows if row.display_name]
+    assert len(named) == len(rows) - 1
+    for row in named:
+        claims = seed._token_claims(row.binding_token)
+        assert (claims["sub"], claims["name"]) == (row.ls_aai_id, row.display_name)
+
+
+def test_names_appear_in_no_signed_document(engine):
+    """A name comes from the token, so nothing else may carry one."""
+    with db.reading(engine) as session:
+        versions = session.exec(select(StudyVersion)).all()
+        requests = session.exec(select(Request)).all()
+    documents = [row.raw for row in [*versions, *requests]]
+    assert documents
+    for name in mock.MEMBERS:
+        assert not any(name.encode() in raw for raw in documents)
+    assert all(row.proposer.startswith("m-") for row in versions)
+    assert all(row.member.startswith("m-") for row in requests)
+
+
+def test_the_study_heading_is_the_id_and_the_first_line_of_the_goal(engine):
+    with db.reading(engine) as session:
+        version = repo.approved_version(session, mock.CARDIO)
+        assert session.get(Study, mock.CARDIO).title is None
+        assert repo.study_heading(session, version) == "cardio-pt · CARDIO-PT cohort"
 
 
 def test_v2_replaced_v1_with_two_decisions(engine):
@@ -132,8 +167,6 @@ def test_the_node_of_mock_07(engine):
 
 
 def test_nothing_claims_a_real_signature(engine):
-    from sqlmodel import select
-    from store.models import Decision
     with db.reading(engine) as session:
         rows = session.exec(select(Decision)).all()
     assert rows and {row.signature for row in rows} == {seed.UNSIGNED}

@@ -25,6 +25,10 @@ from store.states import (BUSY_RUN_STATES, CANCELLABLE_RUN_STATES,
                           RefusalCode, VersionState, Verdict)
 
 
+SHORT_ID_LENGTH = 8
+"""How much of an ls_aai_id the page shows when a member has no verified name."""
+
+
 def utcnow():
     return datetime.now(timezone.utc)
 
@@ -103,6 +107,15 @@ def approved_version(session, study_id):
         StudyVersion.state == VersionState.APPROVED.value)).first()
 
 
+def study_heading(session, version):
+    """How the page names a study until study versions carry a title."""
+    title = _get(session, Study, version.study_id).title
+    if title:
+        return title
+    lines = version.goal.strip().splitlines()
+    return f"{version.study_id} · {lines[0]}" if lines else version.study_id
+
+
 def pending_study_versions(session):
     return list(session.exec(
         select(StudyVersion)
@@ -125,11 +138,49 @@ def member_keys(session, study_version_id):
         .order_by(MemberKey.member)))
 
 
-def set_identity(session, study_version_id, member, verified, error=None):
+def _usable_name(claims):
+    name = claims.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if any(ord(character) < 32 for character in name):
+        return None
+    return name.strip()
+
+
+def mark_identity_verified(session, study_version_id, member, claims):
+    """Record a member's verified identity, from the claims of their token.
+
+    The only way a name enters the store. `member` is an opaque id and the study
+    document is written by whoever proposed the study, so a name from either
+    would be a claim nobody checked. `claims` come from the binding_token after
+    the checks of section 7.3 passed, and they must be about this member.
+    """
     row = _get(session, MemberKey, (study_version_id, member))
-    row.identity_verified = verified
-    row.identity_error = None if verified else error
+    if claims.get("sub") != row.ls_aai_id:
+        raise Conflict(f"the token of {member} names someone else")
+    row.identity_verified = True
+    row.identity_error = None
+    row.display_name = _usable_name(claims)
     return row
+
+
+def mark_identity_failed(session, study_version_id, member, error):
+    """A failed check leaves no name: nothing vouches for one any more."""
+    row = _get(session, MemberKey, (study_version_id, member))
+    row.identity_verified = False
+    row.identity_error = error
+    row.display_name = None
+    return row
+
+
+def member_label(row):
+    """How the page names a member: never by the opaque `member` id."""
+    if row.display_name:
+        return row.display_name
+    local, at, domain = row.ls_aai_id.partition("@")
+    if len(local) <= SHORT_ID_LENGTH:
+        return row.ls_aai_id
+    return f"{local[:SHORT_ID_LENGTH]}…{at}{domain}"
 
 
 def _require_verified_members(session, version):

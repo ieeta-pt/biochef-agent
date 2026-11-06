@@ -15,13 +15,26 @@ RARE = "rare-variants-pilot"
 SEPSIS = "sepsis-biomarkers"
 MICROBIOME = "microbiome-pilot"
 
-NODE = "IST TRE (test)"
-NODES = (NODE, "IEETA Aveiro", "Karolinska")
+# Name, as the token's name claim carries it: (member id, ls_aai_id). The ids are
+# opaque, as they are in a real study. A name reaches the store only through a
+# token's claims, so it appears in no study document and no request.
+MEMBERS = {
+    "Ana Costa": ("m-01", "a3f1c09e7b2d4e58@lifescience-ri.eu"),
+    "Rui Matos": ("m-02", "7c44b1d09ea2f613@lifescience-ri.eu"),
+    "Sofia Lima": ("m-03", "e90d25c871ab3f46@lifescience-ri.eu"),
+    "Marta Reis": ("m-04", "15bf7ae3c06d9248@lifescience-ri.eu"),
+    "Paulo Neves": ("m-05", "c2e86f10d7b34a95@lifescience-ri.eu"),
+}
+
+NODE = "Example TRE (test)"
+NODES = (NODE, "Second TRE", "Third TRE")
 
 CARDIO_DATASET = "EGAD00001009912"
 SEPSIS_DATASET = "EGAD00001008830"
 MICROBIOME_DATASET = "EGAD00001007115"
 RARE_DATASET = "EGAD00001010247"
+
+CARDIO_GOAL = "CARDIO-PT cohort\nAssociation of variants with cardiac outcomes."
 
 RULES_V2 = {"aggregates_only": True, "min_count": 10,
             "types": ["tsv", "png"], "max_bytes": 10_000_000}
@@ -39,11 +52,11 @@ def hours(count):
 # (study, version, goal, proposer, members, dataset, nodes, rules, received,
 #  state). Listed oldest first: a version's previous digest is the one above it.
 STUDY_VERSIONS = (
-    (CARDIO, 1, "CARDIO-PT cohort", "Ana Costa", ("Ana Costa",),
+    (CARDIO, 1, CARDIO_GOAL, "Ana Costa", ("Ana Costa",),
      CARDIO_DATASET, NODES, RULES_V2, days(30), "superseded"),
-    (CARDIO, 2, "CARDIO-PT cohort", "Ana Costa", ("Ana Costa", "Rui Matos"),
+    (CARDIO, 2, CARDIO_GOAL, "Ana Costa", ("Ana Costa", "Rui Matos"),
      CARDIO_DATASET, NODES, RULES_V2, days(26), "approved"),
-    (CARDIO, 3, "CARDIO-PT cohort", "Ana Costa",
+    (CARDIO, 3, CARDIO_GOAL, "Ana Costa",
      ("Ana Costa", "Rui Matos", "Sofia Lima"),
      CARDIO_DATASET, NODES, RULES_V3, hours(2), "pending"),
     (RARE, 1, "Rare variants pilot", "Marta Reis", ("Marta Reis", "Paulo Neves"),
@@ -119,4 +132,4 @@ OUTPUT_FILES = (
 STEP_MINUTES = {"qc_samples": 9, "qc_variants": 31, "assoc": 47, "summarise": 4}
 
 FEDERATION_VERSION = 14
-FEDERATION_NODES = NODES + ("Barcelona TRE", "Lisbon TRE")
+FEDERATION_NODES = NODES + ("Fourth TRE", "Fifth TRE")

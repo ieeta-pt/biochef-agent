@@ -6,6 +6,9 @@ BIOCHEF_DB_URL cannot mix invented approvals into a node's record.
 
 Decisions carry the signature `unsigned-fixture` until node signing exists.
 Nothing could verify them as a real signature, which is the point.
+
+Display names come out of the fixture tokens, and tokens are not really signed
+either. Member ids stay opaque everywhere else.
 """
 
 import argparse
@@ -71,38 +74,61 @@ def _decide(session, subject_type, subject_id, action, user, at, *, subject_hash
         subject_hash=subject_hash, reason=reason, dac_confirmed=dac_confirmed)
 
 
+def _fixture_token(name, ls_aai_id):
+    """Shaped like an ID token, and signed by nobody."""
+    claims = json.dumps({"sub": ls_aai_id, "name": name}).encode()
+    payload = base64.urlsafe_b64encode(claims).rstrip(b"=").decode()
+    return f"fixture.{payload}.unsigned"
+
+
+def _token_claims(token):
+    """What the verifier of section 7.3 will hand over, for a fixture token.
+
+    The display name in a seeded database comes from here, so that it takes the
+    same road as a real one: out of the token, and from nowhere else.
+    """
+    payload = token.split(".")[1]
+    return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+
+
 def _seed_studies(session, now):
     versions = {}
     previous = {}
-    for (study, number, goal, proposer, members, dataset, nodes, rules, age,
+    for (study, number, goal, proposer, names, dataset, nodes, rules, age,
          state) in mock.STUDY_VERSIONS:
         at = now - age
-        entries = [{"member": name, "ls_aai_id": f"{_slug(name)}@lifescience-ri.eu"}
-                   for name in members]
+        members = [mock.MEMBERS[name] for name in names]
+        entries = [{"member": member, "ls_aai_id": ls_aai_id}
+                   for member, ls_aai_id in members]
         node_entries = [{"node": node, "datasets": [dataset]} for node in nodes]
+        proposer_id = mock.MEMBERS[proposer][0]
         document = {"study_id": study, "version": number, "goal": goal,
-                    "proposer": proposer, "members": entries,
+                    "proposer": proposer_id, "members": entries,
                     "nodes": node_entries, "output_rules": rules,
                     "previous_digest": previous.get(study)}
         raw = _bytes(document)
         digest = _digest(raw)
         row = repo.add_study_version(
             session, study_id=study, version=number, digest=digest, raw=raw,
-            goal=goal, proposer=proposer, members=entries, nodes=node_entries,
+            goal=goal, proposer=proposer_id, members=entries, nodes=node_entries,
             datasets=[dataset], output_rules=rules,
             previous_digest=previous.get(study), now=at)
         previous[study] = digest
         versions[(study, number)] = row
 
-        for name in members:
+        for name, (member, ls_aai_id) in zip(names, members):
+            token = _fixture_token(name, ls_aai_id)
             repo.add_member_key(
-                session, study_version_id=row.id, member=name,
-                ls_aai_id=f"{_slug(name)}@lifescience-ri.eu",
-                signing_key=_public_jwk(),
-                result_key=f"age1fixture{_slug(name)}",
-                binding_token=f"fixture.{_slug(name)}.token")
+                session, study_version_id=row.id, member=member,
+                ls_aai_id=ls_aai_id, signing_key=_public_jwk(),
+                result_key=f"age1fixture{member}", binding_token=token)
+            session.flush()
             error = mock.UNVERIFIED.get((study, number, name))
-            repo.set_identity(session, row.id, name, error is None, error)
+            if error is None:
+                repo.mark_identity_verified(session, row.id, member,
+                                            _token_claims(token))
+            else:
+                repo.mark_identity_failed(session, row.id, member, error)
         session.flush()
         _apply_study_state(session, row, state, at)
     return versions
@@ -125,10 +151,6 @@ def _apply_study_state(session, row, state, at):
         repo.withdraw_study_version(session, row.id, now=withdrawn)
         _decide(session, subject, row.id, Action.WITHDRAW, "j.silva", withdrawn,
                 subject_hash=row.digest)
-
-
-def _slug(name):
-    return name.lower().replace(" ", ".")
 
 
 def _seed_workflows(session, versions, now):
@@ -160,6 +182,7 @@ def _seed_workflows(session, versions, now):
 def _add_request(session, versions, workflows, now, *, request_id, study, number,
                  key, member, age, joined=None):
     at = now - age
+    member = mock.MEMBERS[member][0]
     version = versions[(study, number)]
     # A repeated request carries the same payload as the one it joined.
     payload = _digest((joined or request_id).encode())
