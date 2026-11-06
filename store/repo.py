@@ -580,6 +580,16 @@ def count_busy_runs(session):
 # Dataset bindings
 
 
+def open_versions(session):
+    """Study versions that still count: pending or approved, newest first."""
+    return list(session.exec(
+        select(StudyVersion)
+        .where(StudyVersion.state.in_([VersionState.PENDING.value,
+                                       VersionState.APPROVED.value]))
+        .order_by(StudyVersion.received_at.desc())))
+
+
+
 def bind_dataset(session, *, dataset_id, source, type, location, bound_by,
                  now=None):
     """Bind a dataset. The config file always wins over the page."""
@@ -600,6 +610,11 @@ def bind_dataset(session, *, dataset_id, source, type, location, bound_by,
         row.bound_at = now or utcnow()
     session.flush()
     return row
+
+
+def drop_config_binding(session, dataset_id):
+    """Only the config sync does this: page rows go through unbind_dataset."""
+    session.delete(_get(session, DatasetBinding, dataset_id))
 
 
 def unbind_dataset(session, dataset_id):

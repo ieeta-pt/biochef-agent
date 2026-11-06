@@ -493,6 +493,39 @@ def request_rows(session, study_id, offset=0):
             "study_id": study_id}
 
 
+# Datasets
+
+
+def _used_by(session, dataset_id, versions):
+    names = []
+    for version in versions:
+        if dataset_id in version.datasets:
+            title = version_title(session, version)
+            pending = version.state == VersionState.PENDING.value
+            names.append(f"{title} (in Inbox)" if pending else title)
+    return ", ".join(names) or "no approved study"
+
+
+def dataset_page(session):
+    versions = repo.open_versions(session)
+    bound = repo.dataset_bindings(session)
+    rows = [{"id": row.dataset_id, "type": row.type, "location": row.location,
+             "used_by": _used_by(session, row.dataset_id, versions),
+             "locked": row.source == "config", "bound_by": row.bound_by}
+            for row in bound]
+    known = {row.dataset_id for row in bound}
+    waiting, seen = [], set()
+    for version in versions:
+        for dataset_id in version.datasets:
+            if dataset_id not in known and dataset_id not in seen:
+                seen.add(dataset_id)
+                state = (", in the Inbox"
+                         if version.state == VersionState.PENDING.value else "")
+                waiting.append({"id": dataset_id, "named_by":
+                                f"{version_title(session, version)}{state}"})
+    return {"rows": rows, "waiting": waiting}
+
+
 # Workflow version
 
 

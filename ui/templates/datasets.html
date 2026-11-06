@@ -1,4 +1,52 @@
 {% extends "base.html" %}
+{% from "partials/macros.html" import pill %}
 {% block title %}Datasets{% endblock %}
 {% block heading %}Datasets{% endblock %}
-{% block intro %}A study names datasets by id. A binding tells the agent where that dataset lives on this node.{% endblock %}
+{% block intro %}A study names datasets by id. A binding tells the agent where that dataset lives on this node. Bindings from the agent's config file are locked here{% if settings.bindings_from_ui %}; this node also allows bindings made on this page{% endif %}.{% endblock %}
+{% block content %}
+{% for conflict in conflicts %}
+<div role="alert" class="rounded-control bg-warn-soft p-4 text-sm text-warn">{{ conflict.dataset_id }} was bound on this page to {{ conflict.page }} by {{ conflict.bound_by }}. The config file binds it to {{ conflict.config }}, and the config file wins.</div>
+{% endfor %}
+<div id="decision-error"></div>
+<section aria-label="Bindings" class="card table-box">
+  <table>
+    <thead><tr><th>Dataset id</th><th>Source type</th><th>Location on this node</th><th>Used by</th><th>Bound by</th></tr></thead>
+    <tbody>
+      {% for row in data.rows %}
+      <tr>
+        <td class="mono">{{ row.id }}</td>
+        <td>{{ row.type }}</td>
+        <td class="mono">{{ row.location }}</td>
+        <td {% if row.used_by == 'no approved study' %}class="text-muted"{% endif %}>{{ row.used_by }}</td>
+        <td>
+          {% if row.locked %}{{ pill('mute', 'config file, locked') }}{% else %}
+          {{ pill('info', 'this page · ' ~ row.bound_by) }}
+          {% if settings.bindings_from_ui %}
+          <span id="row-{{ loop.index }}" class="ml-2 inline-flex gap-3">
+            <button type="button" class="btn-link" hx-get="/ui/_/datasets/{{ row.id }}/edit" hx-target="#row-{{ loop.index }}" hx-swap="innerHTML">Edit</button>
+            <button type="button" class="btn-link text-bad" hx-post="/ui/_/datasets/{{ row.id }}/unbind" hx-target="#decision-error" hx-swap="innerHTML">Remove</button>
+          </span>
+          {% endif %}{% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5">No dataset is bound on this node.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% if not settings.bindings_from_ui %}
+<p class="m-0 text-sm text-muted">Bindings on this node come only from the config file.</p>
+{% else %}
+{% for dataset in data.waiting %}
+<section aria-label="Unbound" class="card flex flex-col gap-4 px-6 py-5">
+  <div class="flex flex-col gap-1">
+    <h2 class="m-0 text-base font-medium">Waiting for a binding</h2>
+    <span class="text-sm text-muted">{{ dataset.id }} is named by {{ dataset.named_by }}. Requests that need it are refused until it is bound.</span>
+  </div>
+  {% with dataset_id=dataset.id, location='', button='Bind and sign', field='bind-' ~ loop.index %}{% include "partials/dataset_form.html" %}{% endwith %}
+  <span class="text-[13px] text-muted">Paths are resolved under the data root on the Node page. The agent refuses anything outside it.</span>
+</section>
+{% endfor %}
+{% endif %}
+{% endblock %}
