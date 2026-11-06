@@ -1,12 +1,18 @@
 """Shared by the UI tests: a configured app and clients at chosen addresses."""
 
+import atexit
 import ipaddress
+import shutil
+import tempfile
 from pathlib import Path
 
 from fastapi import Request
 from fastapi.testclient import TestClient
 from starlette.responses import PlainTextResponse
 
+from node.keys import generate
+from node.policy import FakePolicyEngine
+from store import db, migrate
 from ui.app import create_app
 from ui.settings import DEV, HEADER, Settings
 
@@ -18,6 +24,19 @@ PAGES = ("/ui/inbox", "/ui/studies", "/ui/requests", "/ui/datasets", "/ui/node")
 PROXY = "10.0.0.5"
 USER_HEADER = "X-Forwarded-User"
 LOOPBACK = "127.0.0.1"
+
+
+KEYS = generate()
+
+_shared = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, _shared, ignore_errors=True)
+migrate.upgrade(f"sqlite:///{_shared}/agent.db")
+EMPTY = db.make_engine(f"sqlite:///{_shared}/agent.db")
+"""A migrated database nobody writes to, for the tests of the shell."""
+
+
+def app_for(settings, bind=EMPTY, policy=None):
+    return create_app(settings, bind=bind, keys=KEYS, policy=policy)
 
 
 def dev_settings(**overrides):
@@ -33,9 +52,9 @@ def header_settings(**overrides):
     return Settings(**{**fields, **overrides})
 
 
-def client_for(settings, address=LOOPBACK, **options):
+def client_for(settings, address=LOOPBACK, *, bind=EMPTY, policy=None, **options):
     # https, because a Secure cookie does not come back over http.
-    return TestClient(create_app(settings), client=(address, 50000),
+    return TestClient(app_for(settings, bind, policy), client=(address, 50000),
                       base_url="https://ui.tre.test", follow_redirects=False,
                       **options)
 
@@ -55,7 +74,7 @@ def with_routes(settings, address=LOOPBACK, **options):
 
     The shell has neither yet, and both are what the middleware is for.
     """
-    app = create_app(settings)
+    app = app_for(settings)
 
     @app.post("/ui/_/echo")
     async def echo(request: Request):

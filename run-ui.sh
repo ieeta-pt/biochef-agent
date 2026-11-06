@@ -20,12 +20,22 @@ python -c 'import sys; sys.exit(0 if (3, 11) <= sys.version_info[:2] <= (3, 13) 
 pip install -r requirements.txt
 
 if [ "${1:-}" = "--dev" ]; then
-    mkdir -p tmp
+    # Outside the repository, because keys are refused inside it. Delete this
+    # directory for a fresh seed; the times in the data count from the seeding.
+    DEV_HOME="${BIOCHEF_UI_DEV_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/biochef-agent-dev}"
+    mkdir -p "$DEV_HOME"
     export BIOCHEF_UI_IDENTITY=dev
     export BIOCHEF_UI_HOST="${BIOCHEF_UI_HOST:-127.0.0.1}"
-    export BIOCHEF_UI_DEV_USER="${BIOCHEF_UI_DEV_USER:-dev.user}"
-    export BIOCHEF_NODE_NAME="${BIOCHEF_NODE_NAME:-Development node}"
-    export BIOCHEF_AUDIT_LOG="${BIOCHEF_AUDIT_LOG:-$PWD/tmp/dev-audit.jsonl}"
+    export BIOCHEF_UI_DEV_USER="${BIOCHEF_UI_DEV_USER:-j.silva}"
+    export BIOCHEF_NODE_NAME="${BIOCHEF_NODE_NAME:-Example TRE (test)}"
+    export BIOCHEF_PASSPORT_REQUIRE_VISA="${BIOCHEF_PASSPORT_REQUIRE_VISA:-ControlledAccessGrants}"
+    export BIOCHEF_AUDIT_LOG="${BIOCHEF_AUDIT_LOG:-$DEV_HOME/audit.jsonl}"
+    export BIOCHEF_DB_URL="${BIOCHEF_DB_URL:-sqlite:///$DEV_HOME/agent.db}"
+    export BIOCHEF_NODE_SIGNING_KEY="$DEV_HOME/keys/node-signing.pem"
+    export BIOCHEF_NODE_ENCRYPTION_KEY="$DEV_HOME/keys/node-encryption.pem"
+    [ -f "$BIOCHEF_NODE_SIGNING_KEY" ] || python -m node.keys init --out "$DEV_HOME/keys" >/dev/null
+    python -m store migrate
+    [ -f "$DEV_HOME/.seeded" ] || { python -m store.seed --fixture mock; touch "$DEV_HOME/.seeded"; }
 elif [ -n "${1:-}" ]; then
     echo "usage: ./run-ui.sh [--dev]" >&2
     exit 2

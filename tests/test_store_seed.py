@@ -93,7 +93,7 @@ def test_v2_replaced_v1_with_two_decisions(engine):
         about_v2 = repo.decisions_about(session, SubjectType.STUDY_VERSION, v2.id)
     assert about_v1[0].action == "withdraw"
     assert about_v1[0].reason == "superseded"
-    assert about_v1[0].user == seed.SYSTEM_USER
+    assert about_v1[0].user == "j.silva"
     assert [row.action for row in about_v2] == ["approve"]
     assert about_v2[0].dac_confirmed is True
 

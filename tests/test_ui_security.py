@@ -101,7 +101,7 @@ def test_no_inline_style_or_script_in_templates(template):
 
 
 def test_the_templates_were_found():
-    assert len(TEMPLATES) == 6
+    assert len(TEMPLATES) >= 15
 
 
 def references(text):
