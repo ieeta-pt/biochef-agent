@@ -36,6 +36,8 @@ The images and sources in `mockups/` were not redrawn after this document was co
 | All | A fixed node name | Whatever `BIOCHEF_NODE_NAME` says. Node names depend on the deployment |
 | 07 | "steps run without network" | "Network isolation: off" in warn colours, until part 9b (8.7) |
 | 07 | No check of the audit log against the decisions | Add the check of 8.7 |
+| 01, 03 | "✓ Signed by <person>" | "Proposed by <proposer>" on a study and nothing on a workflow, until a signature is really verified (section 13) |
+| 02 | "automatic, when v2 was approved" | "automatic, when v3 was approved by <user>", naming the version and who approved it |
 
 ## 1. What the page is for
 
@@ -159,6 +161,8 @@ store/
 node/
   keys.py           # node signing and encryption keys (section 7)
   decisions.py      # build, sign and record decisions
+  review.py         # a decision's state change and signed decision, and undo
+  policy.py         # PolicyEngine protocol and a fake (section 6.5)
   identity.py       # member identity check (section 7.3)
   verify.py         # request checks (section 6.3)
   egress.py         # egress pipeline (section 6.5)
@@ -245,7 +249,7 @@ workflow_version: pending ──approve──► approved ──withdraw──�
 
 Rules:
 
-1. **Only one approved version of a study at a time.** Approving v3 moves the approved v2 to `superseded` in the **same transaction**, and writes two decisions: `approve v3` and `withdraw v2` (reason `superseded`), both signed and both posted. A database constraint enforces the rule. Runs, logs and decisions of v2 stay readable in the study's history. A version moved this way is shown as "Superseded".
+1. **Only one approved version of a study at a time.** Approving v3 moves the approved v2 to `superseded` in the **same transaction**, and writes two decisions: `approve v3` and `withdraw v2` (reason `superseded`), both signed and both posted. Both name the user who approved v3. A database constraint enforces the rule. Runs, logs and decisions of v2 stay readable in the study's history. A version moved this way is shown as "Superseded".
 2. While v3 is `pending`, v2 stays `approved` and keeps serving requests. If v3 is refused, v2 is untouched.
 3. A study version can be approved only if **every** member has `identity_verified = true` (section 7.3). Otherwise the Approve button is disabled and the page says which member failed and why (mock: "Rare variants pilot v1").
 4. Before approving a study version the data manager ticks "The data access committee has granted access for this study". Store it in the decision (`dac_confirmed: true`). The tick stays even with the visa check: visas arrive only inside each request, so at approval there is nothing to check.
@@ -348,7 +352,7 @@ For each member listed in a study version the agent checks `binding_token`, the 
 1. Signed by LS Login (issuer `BIOCHEF_LS_LOGIN_ISSUER`, keys from its JWKS; reuse the fetching and retry pattern of `passports.py`).
 2. Audience is the editor's LS Login client (`BIOCHEF_EDITOR_CLIENT_ID`).
 3. The token names the member.
-4. The token's `nonce` equals the hash of the member's two public keys (`signing_key` and `result_key`; exact construction from the editor; **blocked** on biochef-app, fixture until then).
+4. The token's `nonce` equals the hash of the member's two public keys (`signing_key` and `result_key`; exact construction from the editor; **blocked** on biochef-app). This check stays closed: until the construction is defined, a member whose token passes every other check still counts as not verified, with that reason in `identity_error`, and no name is stored.
 5. Expired tokens are accepted only if signed with a past LS Login key in the federation's signed key list. Until that list exists, accept only unexpired tokens and say so on the page.
 
 **Member names.** A name comes only from the `name` claim of `binding_token`, read after the checks above pass, and is stored as `member_key.display_name`. The token's `sub` must equal the member's `ls_aai_id`. If the claim is missing, show the shortened `ls_aai_id`. A failed check leaves no name. No other source is accepted, including anything in the study document.
@@ -367,7 +371,7 @@ Each screen below lists its route, what it reads, what it can do, and its states
 
 - Left: cards for every `pending` study version and workflow version, newest first. Card shows kind label, received time, name and version, one line summary of what changed, and a pill: "Re-approval needed" (new version of an approved study), "New" (new study), "New workflow version", or "Check failed · cannot be approved".
 - Clicking a study card loads its detail on the right (`hx-get="/ui/_/inbox/study/{id}"`, `hx-target="#detail"`, `hx-push-url`). A workflow card goes to the Workflow screen.
-- Study detail: compared with the approved version (link), "✓ Signed by <proposer>" pill, Members (name, role, "+" for new, identity status, "Show keys" toggle), Datasets on this node (binding status, required visa), Nodes (all on the signed node list), Result recipients, Output rules (diff against approved version in mono, red removed, green added, plus the Policy Engine verdict line with link), the DAC tick, optional comment, buttons **Approve and sign** and **Refuse and sign**, and the line "Approving v3 supersedes v2. Only one version of a study is valid at a time."
+- Study detail: compared with the approved version (link), "Proposed by <proposer>" pill (no tick: nothing verifies the signature yet, section 13), Members (name, role, "+" for new, identity status, "Show keys" toggle), Datasets on this node (binding status, required visa), Nodes (all on the signed node list), Result recipients, Output rules (diff against approved version in mono, red removed, green added, plus the Policy Engine verdict line with link), the DAC tick, optional comment, buttons **Approve and sign** and **Refuse and sign**, and the line "Approving v3 supersedes v2. Only one version of a study is valid at a time."
 - After a decision: the detail is replaced by a status line ("v3 approved and signed. v2 was superseded at the same time; its runs and logs stay in the study history.") with **Undo before the next poll**, which is allowed only while the decision has not been posted (`posted_to_coordinator_at` is null). Undo deletes the unsent decision and writes an audit event.
 - Failed identity: red alert naming the member, Approve disabled (`disabled` attribute, not hidden), Refuse available.
 - Empty state: "Nothing is waiting for this node."
@@ -376,14 +380,14 @@ Each screen below lists its route, what it reads, what it can do, and its states
 
 - Left list: approved studies, then superseded and withdrawn ones. Each card: name and version, state pill, counts of workflows and requests, a "v3 in Inbox" pill when a newer version waits.
 - Right: header with version, "Approved <date> by <user>", **Withdraw approval** (confirmation step in the page, never a browser `confirm()`).
-- Tabs (htmx, `role="tablist"`): **Overview** (members with identity status, dataset and visa, recipients, output rules with Policy Engine link, versions table with state, date and who decided, including "automatic, when v2 was approved"), **Workflows** (table: workflow, parameter values, hash short, state, request count, action Review or Withdraw), **Requests** (every request of this study, newest first, 20 per page with "Show N older").
+- Tabs (htmx, `role="tablist"`): **Overview** (members with identity status, dataset and visa, recipients, output rules with Policy Engine link, versions table with state, date and who decided, including "automatic, when v3 was approved by <user>"), **Workflows** (table: workflow, parameter values, hash short, state, request count, action Review or Withdraw), **Requests** (every request of this study, newest first, 20 per page with "Show N older").
 
 ### 8.3 Workflow version (`/ui/workflows/{id}`, mock 03)
 
-- Breadcrumb back to the study. Header: name and version, "hash over tools and parameter values" with short hash, "✓ Signed by <member>".
-- **Steps graph**: dataset node, one box per step, arrows, then an "Output rules, then egress" box. Boxes are buttons; selecting one shows step description, `repo@digest`, signature status from the hub (`signing.py`), parameter values. Render the graph as plain HTML boxes in a horizontal scroll box; it does not need to be draggable. Colour step boxes by run step state when shown inside a run (8.5).
+- Breadcrumb back to the study. Header: name and version, "hash over tools and parameter values" with short hash, and the state. No signature pill: `ieeta-pt/biochef-coordinator#6` has no signer for a workflow.
+- **Steps graph**: dataset node, one box per step, arrows, then an "Output rules, then egress" box. Boxes are buttons; selecting one shows the step description if the step carries one (#6 has no such field, so today only the fixtures do), `repo@digest`, signature status from the hub (`signing.py`), parameter values. Render the graph as plain HTML boxes in a horizontal scroll box; it does not need to be draggable. Colour step boxes by run step state when shown inside a run (8.5).
 - **What changed**: diff against the approved version of the same workflow (tool digests, parameter values).
-- Link "See recipe.json and the generated Snakefile" opens both read only: the workflow JSON as received, and the Snakefile from `convert.py`, without running anything. The UI cannot call it today: `convert.py` logs in to the registry on import and `parse_biochef_workflow` fetches tool bundles. Part 4 separates both from the conversion, and checks the whole catalogue converts as before.
+- Link "See recipe.json and the generated Snakefile" opens both read only: the workflow JSON as received, and the Snakefile from `convert.py`, without running anything. `convert.py` logs in on first use and `parse_biochef_workflow` takes a `resolve` function, so the page reads tools from the local cache and never reaches the registry. Nothing in the cache proves it is the bundle a step pins, so the page says so above the Snakefile.
 - Approve and sign, Refuse and sign, with the line "1.3.2 stays approved. Requests name the hash they want, so each runs only the version it asked for."
 
 ### 8.4 Requests (`/ui/requests`, mock 04)
@@ -443,12 +447,12 @@ All read with `os.getenv`, all in `README.md` and `example.env` (test enforced).
 | `BIOCHEF_UI_DEV_USER` | none, required with `dev` | 3 | Fixed user for development |
 | `BIOCHEF_NODE_NAME` | none, required | 3 | Shown in the sidebar and in decisions |
 | `BIOCHEF_POLICY_ENGINE_URL` | none | 3 | Where "Open Policy Engine" points |
-| `BIOCHEF_LS_LOGIN_ISSUER` | none, required | 4 | LS Login issuer URL |
-| `BIOCHEF_EDITOR_CLIENT_ID` | none, required | 4 | Editor's LS Login client id |
+| `BIOCHEF_LS_LOGIN_ISSUER` | none, required | 4b | LS Login issuer URL |
+| `BIOCHEF_EDITOR_CLIENT_ID` | none, required | 4b | Editor's LS Login client id |
 | `BIOCHEF_DATASET_BINDINGS_FILE` | none | 5 | YAML bindings from config |
 | `BIOCHEF_DATASET_BINDINGS_FROM_UI` | `false` | 5 | Allow bindings from the page |
 | `BIOCHEF_EGRESS_MODE` | none, required | 7 | `airlock` or `manual` |
-| `BIOCHEF_FEDERATION_KEY` | none, required | 8 | Public key that signs the node list |
+| `BIOCHEF_FEDERATION_KEY` | none, required | 7.4 | Public key that signs the node list |
 | `BIOCHEF_COORDINATOR_URL` | none, required | 8 | Coordinator base URL |
 | `BIOCHEF_COORDINATOR_POLL_SECONDS` | `30` | 8 | Poll interval |
 | `BIOCHEF_COORDINATOR_CLIENT_CERT`, `BIOCHEF_COORDINATOR_CLIENT_KEY`, `BIOCHEF_COORDINATOR_CA` | none, required | 8 | mTLS material |
@@ -473,10 +477,12 @@ Each part is one PR. Do them in this order unless `jorgeMFS` says otherwise. Par
 | 2 | **Node keys and decisions**: `node/keys.py` with `init` CLI, JCS canonical form, `node/decisions.py` (build, sign, store, audit) | 1 | Signing and verification round trip tested; refuses world readable keys; every decision writes one audit event with the user |
 | 3 | **UI shell** (**parallel**): `ui/app.py`, identity (header and dev), CSRF, security headers, base template with sidebar, Tailwind build with pinned CLI and checksum, vendored htmx and fonts, empty pages. The sidebar counts stay empty until part 4 | nothing | Each page returns 200 for a trusted user and 401 otherwise, and `/` redirects; refuses to start without `BIOCHEF_AUDIT_LOG`; CSP header present; no external request when loading any page |
 | 4 | **Inbox, Studies, Workflow version** with seeded data: approve, refuse, withdraw, undo, one valid version rule, identity check from fixtures, DAC tick | 1, 2, 3 | Every state of mock screens 01 to 03 reachable; rule 6.2.1 tested (approve v3 supersedes v2 in one transaction); Approve disabled on failed identity |
+| 4b | **Member identity**: `node/identity.py`, the ID token checks of 7.3 (signature through LS Login's JWKS, audience, expiry, `sub`), with the nonce check closed | 1, 4 | One test per check; a token that passes everything still counts as not verified, with the reason recorded and no name stored; a failed check leaves no name |
 | 5 | **Datasets**: config file loading, page bindings, resolution through `LocalPathSource` | 1, 2, 3 | Outside root refused; config wins over page; switch `FROM_UI=false` hides the form |
 | 6 | **Request checks** (`node/verify.py`) and Requests screen | 1, 2, 5, fixtures of the request format | One test per check row of 6.3 and for the join; screen 04 matches section 0.1 |
 | 7 | **Run screen and egress**: `run_summary` written from run state changes, with step times and log tails, `cancel_requested` read by the API process, logs and manifest tabs, egress pipeline both modes with fakes, cancel, retention change | 4, 6 | Retention starts at `sent` or `withheld`, and survives a restart of the API process (tested); a run waiting for egress is never evicted (tested); manual Release and Withhold are signed; airlock mode shows the airlock state; optional Playwright test of the approve and release flow |
 | 7b | **Node screen**: the cards, settings, audit log and audit check of 8.7 | 1, 2, 3 | Screen 07 matches section 0.1; audit export works; the API app gains no audit route; the audit check is tested for a failed commit, an undone decision and an id reused after a rollback |
+| 7.4 | **Federation node list** (7.4): check the list's signature with `BIOCHEF_FEDERATION_KEY`, refuse older versions | 1, 7b | Bad signature and older version refused; the Node card shows "Up to date · N nodes" |
 | 8 | **Coordinator client**: poll over mTLS in the API process, fetch study versions, workflow versions, requests and the federation node list; post decisions and results | The agent API in `biochef-coordinator` | Integration test against the coordinator running locally with `docker compose` |
 | 9 | **Podman runner** (**parallel**) in `runner.py`, same seam as `apptainer`, steps with `--network=none` | nothing | `ci/runner_parity.py` extended to `podman` and passing (same result, step not on the host, neighbours hidden, environment not inherited); documented in README |
 | 9b | **Network isolation for apptainer** (**parallel**) | nothing | `ci/runner_parity.py` proves a step cannot reach the network; the Node card shows it on |
@@ -500,9 +506,10 @@ Taken:
 Still open. Ask `jorgeMFS` before building anything that depends on these.
 
 1. The agent API of the coordinator, including the decision format (7.2).
-2. The editor's exact nonce construction for member keys (7.3.4).
+2. The editor's exact nonce construction for member keys (7.3.4). Until it is defined the check stays closed, so no real member counts as verified and no real study version can be approved.
 3. The TRE airlock interface (6.5).
 4. Who holds the signed list of past LS Login keys, and how nodes get it (7.3.5).
 5. `all_members` as a recipients mode in `ieeta-pt/biochef-coordinator#6` (6.5).
 6. A `title` field on `StudyVersion` in `ieeta-pt/biochef-coordinator#6`. Until then the page shows `study_id` and the first line of `goal`, and `study.title` stays empty (6.7).
-7. Member names from the `name` claim (7.3). This depends on `ieeta-pt/biochef-coordinator#6` carrying `binding_token` as it does now, and on the test with the mock AAI: the editor has to request the `profile` scope for the token to carry `name`.
+7. A signer for workflows in `ieeta-pt/biochef-coordinator#6`, and verification of the proposer's signature on a study version. Until both exist the page shows "Proposed by" and no tick.
+8. Member names from the `name` claim (7.3). This depends on `ieeta-pt/biochef-coordinator#6` carrying `binding_token` as it does now, and on the test with the mock AAI: the editor has to request the `profile` scope for the token to carry `name`.
