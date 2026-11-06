@@ -221,6 +221,8 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_NODE_SIGNING_KEY` | | path of the node's Ed25519 private key, see [The node's keys](#the-nodes-keys) |
 | `BIOCHEF_NODE_ENCRYPTION_KEY` | | path of the node's X25519 private key |
 | `BIOCHEF_NODE_NAME` | | this node's name, required by the UI |
+| `BIOCHEF_LS_LOGIN_ISSUER` | | LS Login issuer URL, for checking members' ID tokens |
+| `BIOCHEF_EDITOR_CLIENT_ID` | | the editor's LS Login client id, the audience of those tokens |
 | `BIOCHEF_UI_HOST` | `127.0.0.1` | interface the UI binds to |
 | `BIOCHEF_UI_PORT` | `8081` | UI port |
 | `BIOCHEF_UI_IDENTITY` | | `header` or `dev`, no default, see [The page for a node's data manager](#the-page-for-a-nodes-data-manager) |
@@ -527,6 +529,12 @@ The agent has no accounts. The TRE decides who may open the page, and `BIOCHEF_U
 The page refuses to start without `BIOCHEF_AUDIT_LOG`, because every decision made there has to reach the trail, and without the node's signing key or a migrated database. `run-ui.sh` starts `python -m ui`, which keeps uvicorn's proxy headers off. If you run `uvicorn ui.app:app` yourself, pass `--no-proxy-headers`, because otherwise uvicorn rewrites the client address that the identity check depends on.
 
 Everything the page loads is served by the agent: htmx, the fonts and the stylesheet are in `ui/static/`, and `ui/static.sha256` records the vendored files. `ui/static/app.css` is built and committed, so nothing else is needed at runtime. After changing a template or `ui/tailwind/input.css`, run `make css`, which downloads the pinned Tailwind CLI, checks it against `ui/tailwind/SHA256SUMS` and rebuilds the file. CI fails if the committed file differs.
+
+## Member identity
+
+A study version lists each member's keys next to an LS Login ID token. `node/identity.py` checks the token: signed by LS Login, through the keys at `BIOCHEF_LS_LOGIN_ISSUER`, made for `BIOCHEF_EDITOR_CLIENT_ID`, unexpired, and with a `sub` equal to the member's `ls_aai_id`. A member's name comes only from a token that passed.
+
+The nonce that ties the token to the member's keys cannot be checked yet, because how the editor builds it is not defined. Until it is, a member whose token passes everything else still counts as not verified, with that reason shown on the page, so no real study version can be approved.
 
 ## Before deploying this
 
