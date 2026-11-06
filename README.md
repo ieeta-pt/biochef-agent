@@ -532,6 +532,14 @@ The page refuses to start without `BIOCHEF_AUDIT_LOG`, because every decision ma
 
 Everything the page loads is served by the agent: htmx, the fonts and the stylesheet are in `ui/static/`, and `ui/static.sha256` records the vendored files. `ui/static/app.css` is built and committed, so nothing else is needed at runtime. After changing a template or `ui/tailwind/input.css`, run `make css`, which downloads the pinned Tailwind CLI, checks it against `ui/tailwind/SHA256SUMS` and rebuilds the file. CI fails if the committed file differs.
 
+## Requests
+
+A request is checked in the ten steps of the specification (section 6.3), and the first failure stops the rest. Every verdict writes an audit event, and a refusal is also a signed decision. A repeat of an accepted request joins its run instead of running again, and a repeat of a refused one is refused as a replay. `BIOCHEF_PASSPORT_REQUIRE_VISA` names the visa type required for each dataset, and the visa's value must be the dataset id, its subject the member, and its issuer one of `BIOCHEF_PASSPORT_VISA_ISSUERS`.
+
+The payload is decrypted with `pyrage`, and an accepted payload is kept in memory only.
+
+The coordinator's agent API does not exist yet, so `node/verify.py` lists three details of the format that are assumptions until it does.
+
 ## Dataset bindings
 
 A study names datasets by id, and a binding says which folder under `BIOCHEF_LOCAL_ROOT` holds one. Both ways of binding need `localpath` in `BIOCHEF_DATA_SOURCES` and an existing `BIOCHEF_LOCAL_ROOT`.

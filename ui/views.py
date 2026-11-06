@@ -493,6 +493,104 @@ def request_rows(session, study_id, offset=0):
             "study_id": study_id}
 
 
+# Requests
+
+REQUEST_CHECKS = (
+    ("bad_signature", "Request signed by a study member"),
+    ("wrong_node", "Addressed to this node"),
+    ("study_not_approved", "Study version approved here"),
+    ("workflow_not_approved", "Workflow hash approved for this study"),
+    ("expired", "Not expired"),
+    ("replay", "Not seen before"),
+    ("cannot_decrypt", "Payload decrypts with this node key"),
+    ("hash_mismatch", "Workflow hash recomputed from tools and values"),
+    ("visa_missing", "Member visas allow the datasets"),
+    ("dataset_not_bound", "Datasets bound to local data"),
+)
+
+
+def _check_marks(request):
+    """Each check as passed, failed or not reached, from what the request recorded."""
+    if request.verdict is None:
+        return [("waiting", text) for _, text in REQUEST_CHECKS]
+    stop = None
+    if request.verdict == Verdict.REFUSED.value:
+        stop = request.failed_check
+    elif request.verdict == Verdict.JOINED.value:
+        stop = "replay"
+    marks, reached = [], True
+    for code, text in REQUEST_CHECKS:
+        if not reached:
+            marks.append(("not_reached", text))
+        elif code == stop:
+            joined = request.verdict == Verdict.JOINED.value
+            marks.append(("joined" if joined else "failed", text))
+            reached = False
+        else:
+            marks.append(("passed", text))
+    return marks
+
+
+def _request_pill(session, request):
+    if request.verdict == Verdict.ACCEPTED.value and request.run_id:
+        run = repo.get_run(session, request.run_id)
+        if run.egress_state == "sent":
+            return "ok", "Accepted · result sent"
+        return "ok", f"Accepted · run {run.state}"
+    return _check_pill(request)
+
+
+def _titles_of_study(session, request):
+    version = repo.study_version_named(session, request.study_id,
+                                       request.study_version)
+    if version is None:
+        return f"{request.study_id} · v{request.study_version}", {}, {}
+    titles = {row.digest: workflow_title(row)
+              for row in repo.workflow_versions(session, version.id)}
+    labels, _ = _labels(session, version)
+    return version_title(session, version), titles, labels
+
+
+def _request_row(session, request):
+    study, titles, labels = _titles_of_study(session, request)
+    pill = _request_pill(session, request)
+    return {"id": request.request_id, "study": study,
+            "workflow": titles.get(request.workflow_digest,
+                                   fmt.short_digest(request.workflow_digest)),
+            "member": labels.get(request.member, UNKNOWN_MEMBER),
+            "when": fmt.minute(request.received_at), "pill": pill}
+
+
+def _request_panel(session, request):
+    has_run = (request.verdict in (Verdict.ACCEPTED.value, Verdict.JOINED.value)
+               and request.run_id is not None)
+    return {"id": request.request_id, "expires": fmt.minute(request.not_after),
+            "marks": _check_marks(request), "run_id": request.run_id if has_run else None,
+            "refused": request.verdict == Verdict.REFUSED.value,
+            "joined": request.joined_request_id}
+
+
+FILTERS = {"all": None, "accepted": (Verdict.ACCEPTED, Verdict.JOINED),
+           "refused": (Verdict.REFUSED,)}
+
+
+def requests_page(session, now, shown="all", selected=None):
+    since = now - timedelta(hours=24)
+    everything = repo.requests_since(session, since)
+    counts = {"all": len(everything),
+              "accepted": len(repo.requests_since(session, since, FILTERS["accepted"])),
+              "refused": len(repo.requests_since(session, since, FILTERS["refused"]))}
+    rows = repo.requests_since(session, since, FILTERS[shown])
+    chosen = next((row for row in rows if row.request_id == selected),
+                  rows[0] if rows else None)
+    return {"filter": shown, "selected": chosen.request_id if chosen else None,
+            "tabs": [("all", f'All {counts["all"]}'),
+                     ("accepted", f'Accepted {counts["accepted"]}'),
+                     ("refused", f'Refused {counts["refused"]}')],
+            "rows": [_request_row(session, row) for row in rows],
+            "panel": _request_panel(session, chosen) if chosen else None}
+
+
 # Datasets
 
 
