@@ -200,7 +200,8 @@ request.
 
 which creates a virtualenv, installs `requirements.txt`, and starts the service
 on the FastAPI default port. `snakemake` is one of the pinned requirements, so
-nothing else needs installing.
+nothing else needs installing. It needs Python 3.11, 3.12 or 3.13, the versions
+CI tests, and refuses to start on any other.
 
 Configuration is by environment variable, and `example.env` lists them:
 
