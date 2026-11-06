@@ -33,6 +33,7 @@ The images and sources in `mockups/` were not redrawn after this document was co
 | 01 | "Paulo Neves" named in the failed identity alert | A member whose identity failed has no verified name: show the shortened `ls_aai_id` (7.3) |
 | 04 | `req_7c03` from 28 Oct under "last 24 hours", rows out of order | Everything listed is inside 24 hours, newest first |
 | 06 | Edit only | Edit and Remove (8.6) |
+| All | "IST TRE (test)", a node name | Whatever `BIOCHEF_NODE_NAME` says. Node names depend on the deployment |
 | 07 | "steps run without network" | "Network isolation: off" in warn colours, until part 9b (8.7) |
 
 ## 1. What the page is for
@@ -49,7 +50,7 @@ LS Login ──ID token──► Editor (member's browser, biochef-app)
  │  data manager ──► agent UI (this spec) ──► Policy Engine (own repo, own UI)
  │                        │ launches steps with no network
  │                        ▼
- │                   runner (apptainer today, Podman needed for a partner TRE)
+ │                   runner (apptainer today, Podman where a TRE needs it)
  │                        │ outputs
  │                        ▼
  │   output rules ──► egress: TRE airlock OR manual review here ──► agent encrypts for recipients, signs ──► coordinator
@@ -166,7 +167,7 @@ Names can change if the repo's flat layout argues against packages; say so in th
 
 ## 4. Who is using the page
 
-- The agent has **no user accounts and no passwords**. The TRE decides who may open the page. In a partner TRE that is most likely a reverse proxy with Keycloak in front of the UI port.
+- The agent has **no user accounts and no passwords**. The TRE decides who may open the page. How depends on the deployment; a reverse proxy with Keycloak in front of the UI port is one way.
 - `BIOCHEF_UI_IDENTITY=header|dev`. No default: refuse to start without it. Also refuse to start without `BIOCHEF_AUDIT_LOG`: unset, `audit.record` writes nothing and reports nothing, and every decision must be in the trail.
   - `header`: the proxy passes the user name in the header named by `BIOCHEF_UI_IDENTITY_HEADER` (for example `X-Forwarded-User`). The UI accepts that header **only** from the addresses in `BIOCHEF_UI_TRUSTED_PROXIES` (comma separated CIDRs). From any other address, or without the header, or with the header repeated, empty or holding control characters, answer 401 and do not render any page.
   - `dev`: a fixed user from `BIOCHEF_UI_DEV_USER`. Refuse to start in `dev` unless `BIOCHEF_UI_HOST` is `127.0.0.1` or `::1`. Also check the client address of each request, because a `--host` given on the command line bypasses the variable. Show a red "development identity" bar on every page.
