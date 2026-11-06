@@ -114,10 +114,10 @@ So the UI is a **second ASGI app** in a new package `ui/`, served on its own por
 
 ```
 fastapi run main.py                       # existing API, unchanged
-uvicorn ui.app:app --host $BIOCHEF_UI_HOST --port $BIOCHEF_UI_PORT   # new
+python -m ui                              # new, started by run-ui.sh
 ```
 
-Both processes share the same database and the same audit file. Add a `run-ui.sh` next to `run.sh`. The UI never mounts the API routes and the API never serves the UI or the audit trail. `run-ui.sh` passes `--no-proxy-headers`, because uvicorn otherwise rewrites the client address from `X-Forwarded-For` for a local proxy, and section 4 decides trust on that address.
+Both processes share the same database and the same audit file. Add a `run-ui.sh` next to `run.sh`. The UI never mounts the API routes and the API never serves the UI or the audit trail. `python -m ui` takes the host and port from the same settings the app checks, `.env` included, and keeps uvicorn's proxy headers off, because uvicorn otherwise rewrites the client address from `X-Forwarded-For` for a local proxy, and section 4 decides trust on that address. `uvicorn ui.app:app` still works, with `--no-proxy-headers`.
 
 **The database is the only channel between the two processes.** Runs, logs, slots and retained workspaces live in the memory of the API process (`runs.py`, `main.py`), where a second process cannot reach them. So:
 
