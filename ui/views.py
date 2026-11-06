@@ -378,8 +378,8 @@ def _version_row(session, version, versions):
                 (row for row in reversed(versions)
                  if row.version > version.version and row.state_changed_at
                  == version.state_changed_at), None)
-            by = (f"automatic, when v{newer.version} was approved" if newer
-                  else "automatic, when a newer version was approved")
+            by = (f"automatic, when v{newer.version} was approved by {decision.user}"
+                  if newer else f"automatic, by {decision.user}")
     return {"version": version.version, "href": href,
             "state": STATE_LABELS[version.state], "pill": STATE_PILLS[version.state],
             "decided": fmt.minute(decision.at) if decision else "n/a", "by": by}

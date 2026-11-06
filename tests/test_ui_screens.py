@@ -489,7 +489,7 @@ def test_versions_show_superseded_and_who_decided(client):
     text = client.get(f"/ui/studies/{mock.CARDIO}").text
     assert "Waiting in Inbox" in text
     assert "Superseded" in text
-    assert "automatic, when v2 was approved" in text
+    assert "automatic, when v2 was approved by j.silva" in text
 
 
 def test_the_tabs_load_in_place(client):
