@@ -1,0 +1,32 @@
+<div id="steps" class="flex flex-col gap-4">
+  <div class="overflow-x-auto rounded-card border border-line-soft bg-head p-6">
+    <div class="flex min-w-max items-center">
+      <div class="graph-box border-dashed border-muted"><span class="font-medium">Dataset</span>{% for dataset in detail.datasets %}<span class="mono text-[11px] text-muted">{{ dataset }}</span>{% endfor %}</div>
+      {% for step in detail.steps %}
+      <svg aria-hidden="true" width="40" height="12" viewBox="0 0 40 12"><line x1="2" y1="6" x2="32" y2="6" stroke="#5B6472" stroke-width="1.5"></line><polygon points="32,2 38,6 32,10" fill="#5B6472"></polygon></svg>
+      <button type="button" class="graph-box graph-step {{ 'graph-selected' if detail.selected and step.index == detail.selected.index }}" hx-get="/ui/_/workflows/{{ detail.id }}/step/{{ step.index }}" hx-target="#steps" hx-swap="outerHTML" aria-pressed="{{ 'true' if detail.selected and step.index == detail.selected.index else 'false' }}">
+        <span class="font-medium">{{ step.id }}</span>
+        <span class="mono text-[11px] text-muted">{{ step.repo }}</span>
+        {% if step.tag %}<span class="pill {{ 'pill-mute' if step.tag == 'unchanged' else 'pill-warn' }}">{{ step.tag }}</span>{% endif %}
+      </button>
+      {% endfor %}
+      <svg aria-hidden="true" width="40" height="12" viewBox="0 0 40 12"><line x1="2" y1="6" x2="32" y2="6" stroke="#5B6472" stroke-width="1.5"></line><polygon points="32,2 38,6 32,10" fill="#5B6472"></polygon></svg>
+      <div class="graph-box border-dashed border-warn"><span class="font-medium text-warn">Output rules</span><span class="text-muted">then egress</span></div>
+    </div>
+  </div>
+  {% if detail.selected %}
+  {% set step = detail.selected %}
+  <div class="grid grid-cols-[repeat(auto-fit,minmax(200px,1fr))] gap-5">
+    <div class="flex flex-col gap-1.5"><h3 class="lbl">Step · {{ step.id }}</h3><span class="text-sm">{{ step.description or 'No description came with this step.' }}</span></div>
+    <div class="flex flex-col gap-1.5">
+      <h3 class="lbl">Tool</h3>
+      <span class="mono text-xs">{{ step.reference }}</span>
+      {% if step.signature %}<span class="text-[13px] text-ok">✓ {{ step.signature }} signature from the hub</span>{% else %}<span class="text-[13px] text-warn">No signature recorded</span>{% endif %}
+    </div>
+    <div class="flex flex-col gap-1.5">
+      <h3 class="lbl">Parameter values</h3>
+      {% for name, value in step.params %}<span class="mono text-xs">{{ name }} {{ value }}</span>{% else %}<span class="text-[13px] text-muted">None set</span>{% endfor %}
+    </div>
+  </div>
+  {% endif %}
+</div>

@@ -1,0 +1,91 @@
+{% from "partials/macros.html" import pill, status_line %}
+<div id="study-tabs">
+  <div class="px-6">
+    <div role="tablist" aria-label="Study sections" class="mt-2 flex gap-1 border-b border-line">
+      {% for name, label in [('overview', 'Overview'), ('workflows', 'Workflows ' ~ detail.workflow_count), ('requests', 'Requests ' ~ detail.request_count)] %}
+      <button type="button" role="tab" aria-selected="{{ 'true' if detail.tab == name else 'false' }}" class="tab-button {{ 'tab-on' if detail.tab == name }}"
+              hx-get="/ui/_/studies/{{ detail.study_id }}/tab/{{ name }}" hx-target="#study-tabs" hx-swap="outerHTML">{{ label }}</button>
+      {% endfor %}
+    </div>
+  </div>
+  <div role="tabpanel" class="flex flex-col gap-5 px-6 py-5">
+  {% if detail.tab == 'overview' %}
+    <div class="grid grid-cols-[repeat(auto-fit,minmax(200px,1fr))] gap-5">
+      <div class="flex flex-col gap-2">
+        <h3 class="lbl">Members</h3>
+        <span class="text-sm">{% for member in detail.members %}{{ member.label }}{% if member.proposer %} (proposer){% endif %}{% if not loop.last %}, {% endif %}{% endfor %}</span>
+        {% if detail.verified %}<span class="text-[13px] text-ok">✓ identities verified</span>{% else %}<span class="text-[13px] text-bad">✗ not every identity is verified</span>{% endif %}
+      </div>
+      <div class="flex flex-col gap-2">
+        <h3 class="lbl">Dataset on this node</h3>
+        {% for dataset in detail.datasets %}<span class="text-sm">{{ dataset.id }}</span>{% endfor %}
+        <span class="text-[13px] text-label">{% if detail.required_visa %}Visa required · {{ detail.required_visa }}{% else %}No visa required by this node{% endif %}</span>
+      </div>
+      <div class="flex flex-col gap-2">
+        <h3 class="lbl">Result recipients</h3>
+        <span class="text-sm">{{ detail.recipients }}</span>
+      </div>
+      <div class="flex flex-col gap-2">
+        <h3 class="lbl">Output rules</h3>
+        {% for line in detail.rule_lines %}<span class="mono text-[13px]">{{ line }}</span>{% endfor %}
+        {% if settings.policy_engine_url %}<a href="{{ settings.policy_engine_url }}" target="_blank" rel="noopener noreferrer" class="text-[13px]">Policy Engine ↗</a>{% endif %}
+      </div>
+    </div>
+    <div class="flex flex-col gap-2.5">
+      <h3 class="lbl">Versions</h3>
+      <div class="table-box">
+        <table>
+          <thead><tr><th>Version</th><th>State on this node</th><th>Decided</th><th>By</th></tr></thead>
+          <tbody>
+            {% for row in detail.versions %}
+            <tr>
+              <td>{% if row.href %}<a href="{{ row.href }}">v{{ row.version }}</a>{% else %}v{{ row.version }}{% endif %}</td>
+              <td>{{ pill(row.pill, row.state) }}</td>
+              <td>{{ row.decided }}</td>
+              <td>{{ row.by }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  {% elif detail.tab == 'workflows' %}
+    <p class="m-0 text-[13px] text-muted">The hash covers the tools and the parameter values, so a change in any parameter is a new workflow to approve. Withdrawing a workflow is signed like an approval and does not need a new study version.</p>
+    <div id="decision-error"></div>
+    <div class="table-box">
+      <table>
+        <thead><tr><th>Workflow</th><th>Parameter values</th><th>Hash</th><th>State</th><th>Requests</th><th><span class="sr-only">Action</span></th></tr></thead>
+        <tbody>
+          {% for row in detail.workflows %}
+          <tr>
+            <td><a href="/ui/workflows/{{ row.id }}">{{ row.title }}</a></td>
+            <td class="mono">{{ row.params }}</td>
+            <td class="mono whitespace-nowrap">{{ row.digest }}</td>
+            <td>{{ pill(row.pill, row.state) }}</td>
+            <td>{{ row.requests }}</td>
+            <td>
+              {% if row.pending %}<a href="/ui/workflows/{{ row.id }}">Review</a>{% endif %}
+              {% if row.status and row.status.can_undo %}
+              <button type="button" class="btn-link" hx-post="/ui/_/decisions/{{ row.status.decision_id }}/undo" hx-target="#decision-error" hx-swap="innerHTML">Undo before the next poll</button>
+              {% elif row.can_withdraw %}
+              <button type="button" class="btn-link text-bad" hx-post="/ui/_/workflows/{{ row.id }}/withdraw" hx-target="#decision-error" hx-swap="innerHTML">Withdraw</button>
+              {% endif %}
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6">No workflow has been received for this version.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% else %}
+    {% set requests = detail.requests %}
+    <div class="table-box">
+      <table>
+        <thead><tr><th>Request</th><th>From</th><th>Workflow</th><th>Agent check</th><th>Run</th></tr></thead>
+        <tbody id="request-rows">{% include "partials/request_rows.html" %}</tbody>
+      </table>
+    </div>
+  {% endif %}
+  </div>
+</div>

@@ -1,0 +1,21 @@
+{% macro pill(kind, text) -%}
+<span class="pill pill-{{ kind }}">{{ text }}</span>
+{%- endmacro %}
+
+{% macro status_line(status) -%}
+<div role="status" class="flex flex-wrap items-center justify-between gap-3 rounded-control p-4 text-sm {{ 'bg-ok-soft text-ok' if status.kind == 'ok' else 'bg-bad-soft text-bad' }}">
+  <span>{{ status.message }}</span>
+  {% if status.can_undo %}
+  <button type="button" class="btn-link" hx-post="/ui/_/decisions/{{ status.decision_id }}/undo" hx-target="#decision-error" hx-swap="innerHTML">Undo before the next poll</button>
+  {% endif %}
+</div>
+<div id="decision-error"></div>
+{%- endmacro %}
+
+{% macro diff(lines) -%}
+<div class="mono overflow-x-auto rounded-control border border-line-soft text-[13px]">
+  {% for kind, text in lines %}
+  <div class="diff-{{ kind }} px-3 py-1.5">{{ {'removed': '− ', 'added': '+ ', 'same': '  '}[kind] }}{{ text }}</div>
+  {% endfor %}
+</div>
+{%- endmacro %}

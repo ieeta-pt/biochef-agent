@@ -236,6 +236,32 @@ def withdraw_study_version(session, version_id, now=None):
     return version
 
 
+def studies_with_versions(session):
+    """Every study id with at least one version, oldest first."""
+    return list(session.exec(select(Study.id).order_by(Study.created_at, Study.id)))
+
+
+def restore_version(session, row, state, now=None):
+    """Put a version back where an undone decision found it.
+
+    Outside the state tables on purpose: those say what may happen next, and
+    this says that something did not happen after all. Only node/review.py calls
+    it, after checking that nothing has been built on the decision.
+    """
+    row.state = state.value
+    row.state_changed_at = now or utcnow()
+    session.flush()
+    return row
+
+
+def versions_replaced_at(session, version):
+    """The version this one superseded when it was approved, if any."""
+    return session.exec(select(StudyVersion).where(
+        StudyVersion.study_id == version.study_id,
+        StudyVersion.state == VersionState.SUPERSEDED.value,
+        StudyVersion.state_changed_at == version.state_changed_at)).first()
+
+
 # Workflow versions
 
 
@@ -332,6 +358,10 @@ def decisions_about(session, subject_type, subject_id):
         .where(Decision.subject_type == subject_type.value,
                Decision.subject_id == str(subject_id))
         .order_by(Decision.at.desc(), Decision.id.desc())))
+
+
+def get_decision(session, decision_id):
+    return _get(session, Decision, decision_id)
 
 
 def unposted_decisions(session):
@@ -442,6 +472,28 @@ def requests_of_study(session, study_id, *, limit=20, offset=0):
 def count_requests_of_study(session, study_id):
     return session.exec(select(func.count()).select_from(Request).where(
         Request.study_id == study_id)).one()
+
+
+def count_requests_of_workflow(session, study_id, study_version, digest):
+    return session.exec(select(func.count()).select_from(Request).where(
+        Request.study_id == study_id, Request.study_version == study_version,
+        Request.workflow_digest == digest)).one()
+
+
+def count_requests_run_under(session, study_id, study_version, digest=None):
+    """Requests already accepted or joined under a version, or under a workflow."""
+    query = select(func.count()).select_from(Request).where(
+        Request.study_id == study_id, Request.study_version == study_version,
+        Request.verdict.in_([Verdict.ACCEPTED.value, Verdict.JOINED.value]))
+    if digest is not None:
+        query = query.where(Request.workflow_digest == digest)
+    return session.exec(query).one()
+
+
+def count_refused_since(session, since):
+    return session.exec(select(func.count()).select_from(Request).where(
+        Request.received_at >= since,
+        Request.verdict == Verdict.REFUSED.value)).one()
 
 
 # Runs

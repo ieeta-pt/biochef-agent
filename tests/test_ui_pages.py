@@ -19,12 +19,9 @@ def test_every_page_opens_for_a_trusted_user(path):
     assert f">{TITLES[path]}</h1>" in response.text
 
 
-@pytest.mark.parametrize("path", PAGES)
-def test_no_page_pretends_to_have_read_anything(path):
-    """"Nothing is waiting" would be a claim about a store it has not opened."""
-    text = proxy_client().get(path).text
-    assert "not built yet" in text
-    assert "Nothing is waiting" not in text
+@pytest.mark.parametrize("path", ["/ui/requests", "/ui/datasets", "/ui/node"])
+def test_a_screen_still_to_come_says_so(path):
+    assert "not built yet" in proxy_client().get(path).text
 
 
 def test_the_root_goes_to_the_inbox():

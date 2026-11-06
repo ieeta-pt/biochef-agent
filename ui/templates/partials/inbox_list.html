@@ -1,0 +1,16 @@
+{% from "partials/macros.html" import pill %}
+<section id="inbox-list" aria-label="Waiting" class="flex w-full flex-col gap-2.5 wide:w-[380px] wide:shrink-0"{% if oob is defined and oob %} hx-swap-oob="true"{% endif %}>
+  {% for item in inbox_items %}
+  <a href="{{ item.href }}"
+     {% if item.study_id %}hx-get="/ui/_/inbox/study/{{ item.study_id }}" hx-target="#detail" hx-swap="innerHTML" hx-push-url="{{ item.href }}"{% endif %}
+     class="card flex flex-col gap-2 p-4 text-text no-underline {{ 'card-selected' if item.selected }}"
+     {% if item.selected %}aria-current="true"{% endif %}>
+    <span class="flex justify-between gap-2"><span class="lbl">{{ item.kind }}</span><span class="text-xs text-muted">{{ item.when }}</span></span>
+    <span class="text-base font-medium">{{ item.title }}</span>
+    <span class="text-[13px] text-label">{{ item.summary }}</span>
+    <span class="self-start">{{ pill(item.pill[0], item.pill[1]) }}</span>
+  </a>
+  {% else %}
+  <p class="m-0 card p-4 text-sm text-muted">Nothing is waiting for this node.</p>
+  {% endfor %}
+</section>

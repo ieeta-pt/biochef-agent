@@ -6,7 +6,7 @@
   <meta name="csrf-token" content="{{ csrf_token }}">
   {# historyCacheSize 0: htmx would otherwise keep whole pages in localStorage,
      which is not a place for study details. #}
-  <meta name="htmx-config" content='{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false,"historyCacheSize":0,"selfRequestsOnly":true}'>
+  <meta name="htmx-config" content='{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false,"historyCacheSize":0,"refreshOnHistoryMiss":true,"selfRequestsOnly":true,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"409","swap":true},{"code":"503","swap":true},{"code":"[45]..","swap":false,"error":true}]}'>
   <title>{% block title %}{% endblock %} · BioChef Agent</title>
   <link rel="icon" href="/ui/static/img/biochef-white.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/ui/static/app.css">
@@ -34,7 +34,7 @@
         {% endfor %}
       </div>
       <div class="mt-auto flex flex-col gap-1.5 px-3 text-xs text-brand-soft">
-        <span class="flex items-center gap-2"><span aria-hidden="true" class="size-2 rounded-full bg-brand-soft"></span>Coordinator not connected yet</span>
+        <span class="flex items-center gap-2"><span aria-hidden="true" class="size-2 rounded-full bg-brand-soft"></span>{% if polled %}Coordinator polled {{ polled }}{% else %}Coordinator not connected yet{% endif %}</span>
         {% if settings.policy_engine_url %}
         <a href="{{ settings.policy_engine_url }}" target="_blank" rel="noopener noreferrer" class="text-white">Open Policy Engine ↗</a>
         {% endif %}
@@ -42,10 +42,12 @@
       </div>
     </nav>
     <main class="box-border flex min-w-0 flex-1 flex-col gap-6 p-8">
+      {% block header %}
       <header class="flex flex-col gap-1.5">
         <h1 class="m-0 text-[26px] font-medium">{% block heading %}{% endblock %}</h1>
         <p class="m-0 max-w-[760px] text-sm text-muted">{% block intro %}{% endblock %}</p>
       </header>
+      {% endblock %}
       {% block content %}
       <p class="m-0 rounded-card border border-line bg-surface p-4 text-sm text-muted">This screen is not built yet.</p>
       {% endblock %}

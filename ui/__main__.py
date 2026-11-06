@@ -9,18 +9,19 @@ import sys
 
 import uvicorn
 
-from ui import settings
-from ui.app import create_app
+from node.keys import NodeKeyError
+from store.errors import StoreError
+from ui import app, settings
 
 
 def main():
     try:
-        configured = settings.load()
-    except settings.SettingsError as refused:
+        configured = app.configured_app()
+    except (settings.SettingsError, NodeKeyError, StoreError) as refused:
         print(refused, file=sys.stderr)
         return 1
-    uvicorn.run(create_app(configured), host=configured.host, port=configured.port,
-                proxy_headers=False)
+    current = configured.state.settings
+    uvicorn.run(configured, host=current.host, port=current.port, proxy_headers=False)
     return 0
 
 
