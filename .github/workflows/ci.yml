@@ -17,6 +17,20 @@ env:
   FLOOR: "3.11"
 
 jobs:
+  stylesheet:
+    name: stylesheet matches its sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rebuild it with the pinned Tailwind CLI
+        run: make css
+
+      - name: The committed file is the one that was just built
+        # The agent serves the committed file and never runs the CLI, so a
+        # template change that forgot `make css` would ship without its styles.
+        run: git diff --exit-code ui/static/app.css
+
   suite:
     name: tests (py${{ matrix.python }})
     runs-on: ubuntu-latest

@@ -25,3 +25,6 @@ intermediate.json
 # Test and CI artifacts.
 .coverage
 results-*.xml
+
+# Downloaded by ui/tailwind/build.sh.
+.cache/
