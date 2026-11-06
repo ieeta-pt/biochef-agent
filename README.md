@@ -515,6 +515,8 @@ A second process, on its own port, for the people who run a node inside a TRE. I
 ./run-ui.sh --dev    # a fixed user on 127.0.0.1, marked in red on every page
 ```
 
+It needs Python 3.11, 3.12 or 3.13 and refuses to start on any other.
+
 The agent has no accounts. The TRE decides who may open the page, and `BIOCHEF_UI_IDENTITY` says how the agent hears about it:
 
 - `header`: a reverse proxy passes the user name in `BIOCHEF_UI_IDENTITY_HEADER`. The header counts only from an address in `BIOCHEF_UI_TRUSTED_PROXIES`. Anything else is a 401, static files included.
