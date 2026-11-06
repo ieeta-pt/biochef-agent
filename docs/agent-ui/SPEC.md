@@ -33,8 +33,9 @@ The images and sources in `mockups/` were not redrawn after this document was co
 | 01 | "Paulo Neves" named in the failed identity alert | A member whose identity failed has no verified name: show the shortened `ls_aai_id` (7.3) |
 | 04 | `req_7c03` from 28 Oct under "last 24 hours", rows out of order | Everything listed is inside 24 hours, newest first |
 | 06 | Edit only | Edit and Remove (8.6) |
-| All | "IST TRE (test)", a node name | Whatever `BIOCHEF_NODE_NAME` says. Node names depend on the deployment |
+| All | A fixed node name | Whatever `BIOCHEF_NODE_NAME` says. Node names depend on the deployment |
 | 07 | "steps run without network" | "Network isolation: off" in warn colours, until part 9b (8.7) |
+| 07 | No check of the audit log against the decisions | Add the check of 8.7 |
 
 ## 1. What the page is for
 
@@ -412,6 +413,7 @@ Each screen below lists its route, what it reads, what it can do, and its states
 - Four cards: Node keys ("Ready", "Show fingerprints"), Federation ("Up to date · N nodes"), Coordinator ("Online", last poll; "Offline since …" in bad colours when the last successful poll is older than 3 × the poll interval), Runner (name, busy slots of `BIOCHEF_MAX_CONCURRENT_RUNS` counted from `run_summary`, and "Network isolation: off" in warn colours for `subprocess` and for `apptainer` until part 9b).
 - Settings, read only: egress mode (and the other option), dataset bindings mode, data root, retention, tool signature mode (`BIOCHEF_SIGNING_MODE`).
 - Audit log: newest 50 events from the JSONL trail (time, event, subject, user, whether signed), "Export (JSON lines)" downloads the file. Read the file with `audit.read`; never add an audit endpoint to the API app.
+- Audit check: `decisions.decide` writes the audit event before the caller commits, so a failed commit leaves a `node.decision` event for a decision that does not exist. That order stays, because the opposite one loses events. The Node screen crosses the trail with the `decision` table and lists the events with no decision (time, subject, action, user, `decision_id`) in warn colours; with none it says so. The list is read only and nothing repairs the trail. An event counts as matched only when a row has the same `decision_id`, `subject_type`, `subject_id`, `action` and `user`, because SQLite can give the id of a rolled back row to a later decision, so the id alone would hide the event. An event followed by a `node.decision.undone` event for the same `decision_id` is accounted for: its decision was deleted on purpose (8.1).
 
 ## 9. Security
 
@@ -474,7 +476,7 @@ Each part is one PR. Do them in this order unless `jorgeMFS` says otherwise. Par
 | 5 | **Datasets**: config file loading, page bindings, resolution through `LocalPathSource` | 1, 2, 3 | Outside root refused; config wins over page; switch `FROM_UI=false` hides the form |
 | 6 | **Request checks** (`node/verify.py`) and Requests screen | 1, 2, 5, fixtures of the request format | One test per check row of 6.3 and for the join; screen 04 matches section 0.1 |
 | 7 | **Run screen and egress**: `run_summary` written from run state changes, with step times and log tails, `cancel_requested` read by the API process, logs and manifest tabs, egress pipeline both modes with fakes, cancel, retention change | 4, 6 | Retention starts at `sent` or `withheld`, and survives a restart of the API process (tested); a run waiting for egress is never evicted (tested); manual Release and Withhold are signed; airlock mode shows the airlock state; optional Playwright test of the approve and release flow |
-| 7b | **Node screen**: the cards, settings and audit log of 8.7 | 1, 3 | Screen 07 matches section 0.1; audit export works; the API app gains no audit route |
+| 7b | **Node screen**: the cards, settings, audit log and audit check of 8.7 | 1, 2, 3 | Screen 07 matches section 0.1; audit export works; the API app gains no audit route; the audit check is tested for a failed commit, an undone decision and an id reused after a rollback |
 | 8 | **Coordinator client**: poll over mTLS in the API process, fetch study versions, workflow versions, requests and the federation node list; post decisions and results | The agent API in `biochef-coordinator` | Integration test against the coordinator running locally with `docker compose` |
 | 9 | **Podman runner** (**parallel**) in `runner.py`, same seam as `apptainer`, steps with `--network=none` | nothing | `ci/runner_parity.py` extended to `podman` and passing (same result, step not on the host, neighbours hidden, environment not inherited); documented in README |
 | 9b | **Network isolation for apptainer** (**parallel**) | nothing | `ci/runner_parity.py` proves a step cannot reach the network; the Node card shows it on |
