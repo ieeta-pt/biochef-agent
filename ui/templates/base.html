@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  {# historyCacheSize 0: htmx would otherwise keep whole pages in localStorage,
+     which is not a place for study details. #}
+  <meta name="htmx-config" content='{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false,"historyCacheSize":0,"selfRequestsOnly":true}'>
+  <title>{% block title %}{% endblock %} · BioChef Agent</title>
+  <link rel="icon" href="/ui/static/img/biochef-white.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/ui/static/app.css">
+  <script src="/ui/static/vendor/htmx-2.0.11.min.js" defer></script>
+  <script src="/ui/static/app.js" defer></script>
+</head>
+<body class="flex min-h-screen flex-col bg-bg font-sans text-text">
+  {% if settings.identity == "dev" %}
+  <p role="status" class="m-0 bg-bad px-3 py-2 text-center text-sm font-medium text-white">Development identity. Anyone on this machine is {{ user }}.</p>
+  {% endif %}
+  <div class="flex flex-1 flex-col wide:flex-row">
+    <nav aria-label="Agent" class="box-border flex shrink-0 flex-col gap-6 bg-brand-strong px-3 py-5 text-white wide:w-[232px]">
+      <div class="flex flex-col gap-2.5 px-3">
+        <img src="/ui/static/img/biochef-white.svg" alt="BioChef" width="96" height="48" class="h-auto w-24">
+        <span class="self-start rounded-full border border-white/45 bg-white/12 px-2.5 py-0.5 text-[13px] font-medium">Agent · {{ settings.node_name }}</span>
+      </div>
+      <div class="flex flex-col gap-0.5">
+        {% for item in items %}
+        <a href="{{ item.href }}"
+           class="flex min-h-11 items-center justify-between gap-2 rounded-control border-l-3 px-3 text-[15px] text-white no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white {{ 'border-white bg-brand-deep font-medium' if item.label == active else 'border-transparent hover:bg-brand-hover' }}"
+           {% if item.label == active %}aria-current="page"{% endif %}>
+          {{ item.label }}
+          {% if item.count %}<span class="rounded-[10px] bg-white px-2 text-xs font-bold text-brand-strong">{{ item.count }}</span>{% endif %}
+        </a>
+        {% endfor %}
+      </div>
+      <div class="mt-auto flex flex-col gap-1.5 px-3 text-xs text-brand-soft">
+        <span class="flex items-center gap-2"><span aria-hidden="true" class="size-2 rounded-full bg-brand-soft"></span>Coordinator not connected yet</span>
+        {% if settings.policy_engine_url %}
+        <a href="{{ settings.policy_engine_url }}" target="_blank" rel="noopener noreferrer" class="text-white">Open Policy Engine ↗</a>
+        {% endif %}
+        <span>Signed in through the TRE · {{ user }}</span>
+      </div>
+    </nav>
+    <main class="box-border flex min-w-0 flex-1 flex-col gap-6 p-8">
+      <header class="flex flex-col gap-1.5">
+        <h1 class="m-0 text-[26px] font-medium">{% block heading %}{% endblock %}</h1>
+        <p class="m-0 max-w-[760px] text-sm text-muted">{% block intro %}{% endblock %}</p>
+      </header>
+      {% block content %}
+      <p class="m-0 rounded-card border border-line bg-surface p-4 text-sm text-muted">This screen is not built yet.</p>
+      {% endblock %}
+    </main>
+  </div>
+</body>
+</html>
