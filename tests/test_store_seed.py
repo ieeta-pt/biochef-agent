@@ -10,6 +10,8 @@ from sqlmodel import select
 
 from tests.store_support import NOW, REPO_ROOT, fresh_database
 
+from node import decisions
+from node.keys import generate
 from store import db, migrate, repo, seed
 from store.errors import StoreError
 from store.fixtures import mock
@@ -166,10 +168,33 @@ def test_the_node_of_mock_07(engine):
     assert latest.version == 14 and len(latest.nodes) == 5
 
 
-def test_nothing_claims_a_real_signature(engine):
+def test_every_seeded_decision_verifies_under_the_seeds_own_key(tmp_path):
+    engine = fresh_database(tmp_path)[1]
+    keys = generate()
+    seed.seed(engine, now=NOW, keys=keys)
     with db.reading(engine) as session:
         rows = session.exec(select(Decision)).all()
-    assert rows and {row.signature for row in rows} == {seed.UNSIGNED}
+    assert rows
+    for row in rows:
+        document = decisions.verify(row.object_raw, row.signature,
+                                    keys.signing.public_key())
+        assert (document["action"], document["user"]) == (row.action, row.user)
+
+
+def test_a_seed_key_is_thrown_away(engine):
+    """Nothing in the database can sign for a node."""
+    with db.reading(engine) as session:
+        row = session.exec(select(Decision)).first()
+    with pytest.raises(decisions.DecisionError):
+        decisions.verify(row.object_raw, row.signature,
+                         generate().signing.public_key())
+
+
+def test_the_seed_writes_nothing_to_the_audit_trail(tmp_path, monkeypatch):
+    trail = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("BIOCHEF_AUDIT_LOG", str(trail))
+    seed.seed(fresh_database(tmp_path)[1], now=NOW)
+    assert not trail.exists()
 
 
 def test_no_private_key_is_stored(engine):
