@@ -30,6 +30,7 @@ The images and sources in `mockups/` were not redrawn after this document was co
 | 03 | `bcftools:1.21`, an image per step | `repo@digest` per step (6.1). There is no image per step |
 | 03, 04 | `gwas-qc 1.4.0` as a workflow name | Name and version exist only for library workflows (6.7). Otherwise show the short digest |
 | 04 | Nine checks | Ten checks (6.3) |
+| 01 | "Paulo Neves" named in the failed identity alert | A member whose identity failed has no verified name: show the shortened `ls_aai_id` (7.3) |
 | 04 | `req_7c03` from 28 Oct under "last 24 hours", rows out of order | Everything listed is inside 24 hours, newest first |
 | 06 | Edit only | Edit and Remove (8.6) |
 | 07 | "steps run without network" | "Network isolation: off" in warn colours, until part 9b (8.7) |
@@ -214,9 +215,9 @@ Field names follow `ieeta-pt/biochef-coordinator#6` wherever a field comes from 
 
 | Table | Key fields |
 |---|---|
-| `study` | `id` (`study_id` from the document), `created_at` |
+| `study` | `id` (`study_id` from the document), `title` (empty until the document carries one, section 13), `created_at` |
 | `study_version` | `id`, `study_id`, `version` (int), `digest`, `previous_digest`, `raw`, `goal`, `proposer`, `members` (json), `nodes` (json, `StudyNode`), `datasets` (json, this node's dataset ids), `output_rules` (json: `aggregates_only`, `min_count`, `types`, `max_bytes`), `recipients_mode`, `received_at`, `state` (6.2), `state_changed_at` |
-| `member_key` | `study_version_id`, `member`, `ls_aai_id`, `signing_key` (P-256 JWK as json), `result_key` (age public key), `binding_token`, `identity_verified` (bool), `identity_error` |
+| `member_key` | `study_version_id`, `member`, `ls_aai_id`, `signing_key` (P-256 JWK as json), `result_key` (age public key), `binding_token`, `identity_verified` (bool), `identity_error`, `display_name` (the `name` claim of the verified token, section 7.3) |
 | `workflow_version` | `id`, `study_id`, `study_version_id`, `digest`, `raw`, `name`, `version` and `workflowhub_id` (null unless a library workflow), `steps` (json: id, `repo`, digest, signature status, `paramValues`), `received_at`, `state`, `state_changed_at` |
 | `decision` | `id`, `subject_type` (`study_version`, `workflow_version`, `request`, `run`, `egress`, `dataset_binding`), `subject_id`, `subject_hash`, `action` (`approve`, `refuse`, `withdraw`, `release`, `withhold`, `bind`, `unbind`, `cancel`), `user`, `comment`, `dac_confirmed`, `reason`, `at`, `object_raw`, `signature`, `posted_to_coordinator_at` |
 | `request` | `request_id`, `study_id`, `study_version` (int, as named, because it may not exist here), `study_digest`, `workflow_digest`, `member`, `node`, `datasets` (json), `not_after`, `payload_digest`, `raw`, `received_at`, `verdict` (`accepted`, `refused`, `joined`; null until checked), `failed_check` (6.3 code), `joined_request_id`, `run_id` |
@@ -317,8 +318,8 @@ That PR is the contract, and this document follows it. Where it has no field for
 
 | Mock shows | #6 has | Do this |
 |---|---|---|
-| Study name | `goal` | Show `goal` |
-| Member name | `member`, `ls_aai_id` | Show `member` |
+| Study name | `goal` | Show `study.title` if set, otherwise `study_id` and the first line of `goal` |
+| Member name | `member`, `ls_aai_id` | Show `display_name` if set, otherwise `ls_aai_id` shortened. Never `member` alone, which is an opaque id such as `m-02` |
 | Workflow name and version | Only on `LibraryWorkflow` | Show the short digest otherwise |
 | Visa required per dataset | Nothing | Show the node's `BIOCHEF_PASSPORT_REQUIRE_VISA` |
 
@@ -347,6 +348,8 @@ For each member listed in a study version the agent checks `binding_token`, the 
 3. The token names the member.
 4. The token's `nonce` equals the hash of the member's two public keys (`signing_key` and `result_key`; exact construction from the editor; **blocked** on biochef-app, fixture until then).
 5. Expired tokens are accepted only if signed with a past LS Login key in the federation's signed key list. Until that list exists, accept only unexpired tokens and say so on the page.
+
+**Member names.** A name comes only from the `name` claim of `binding_token`, read after the checks above pass, and is stored as `member_key.display_name`. The token's `sub` must equal the member's `ls_aai_id`. If the claim is missing, show the shortened `ls_aai_id`. A failed check leaves no name. No other source is accepted, including anything in the study document.
 
 The page shows only "✓ identity verified" or "✗ identity not verified" per member, with keys behind "Show keys". Keys stay reachable because a data manager needs to see which key was there when an identity check fails.
 
@@ -498,3 +501,5 @@ Still open. Ask `jorgeMFS` before building anything that depends on these.
 3. The TRE airlock interface (6.5).
 4. Who holds the signed list of past LS Login keys, and how nodes get it (7.3.5).
 5. `all_members` as a recipients mode in `ieeta-pt/biochef-coordinator#6` (6.5).
+6. A `title` field on `StudyVersion` in `ieeta-pt/biochef-coordinator#6`. Until then the page shows `study_id` and the first line of `goal`, and `study.title` stays empty (6.7).
+7. Member names from the `name` claim (7.3). This depends on `ieeta-pt/biochef-coordinator#6` carrying `binding_token` as it does now, and on the test with the mock AAI: the editor has to request the `profile` scope for the token to carry `name`.
