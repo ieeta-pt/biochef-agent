@@ -31,7 +31,7 @@ import types
 
 
 def stub_registry():
-    """convert.py builds an ORAS client and logs in at import.
+    """No sweep may reach the registry, and the oras package need not be installed.
 
     Inline rather than importing the test conftest, because this runs as a
     script in CI and must not depend on the test package's layout.

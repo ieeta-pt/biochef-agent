@@ -29,15 +29,39 @@ REGISTRY_INSECURE = os.getenv("REGISTRY_INSECURE", "false").lower() == "true"
 ORAS_AUTH_BACKEND = os.getenv("ORAS_AUTH_BACKEND", "token")
 
 app = FastAPI()
-client = oras.client.OrasClient(
-    hostname=REGISTRY_URL,
-    insecure=REGISTRY_INSECURE,
-    auth_backend=ORAS_AUTH_BACKEND
-)
-client.login(
-    username=REGISTRY_USERNAME,
-    password=REGISTRY_PASSWORD
-)
+
+
+class _Registry:
+    """The registry client, logged in the first time something needs it.
+
+    Not at import: a process that only reads a workflow has no reason to reach a
+    registry, and may have no network to reach one with.
+    """
+
+    def __init__(self):
+        self._client = None
+        self._lock = threading.Lock()
+
+    def _connected(self):
+        with self._lock:
+            if self._client is None:
+                connected = oras.client.OrasClient(
+                    hostname=REGISTRY_URL,
+                    insecure=REGISTRY_INSECURE,
+                    auth_backend=ORAS_AUTH_BACKEND
+                )
+                connected.login(
+                    username=REGISTRY_USERNAME,
+                    password=REGISTRY_PASSWORD
+                )
+                self._client = connected
+            return self._client
+
+    def __getattr__(self, name):
+        return getattr(self._connected(), name)
+
+
+client = _Registry()
 
 WRITE_INTERMEDIATE = os.getenv("BIOCHEF_WRITE_INTERMEDIATE", "false").lower() == "true"
 """Feature flag for the intermediate artifact (#2).
@@ -398,6 +422,25 @@ def fetch_tool(tool_id, repo):
         provenance[tool_id] = evidence
         return ToolBundle(bundle, evidence)
 
+class ToolNotCached(Exception):
+    """A tool's bundle is not on this machine."""
+
+
+def cached_tool(tool_id, repo):
+    """A bundle already in the cache, read without touching the registry.
+
+    For showing what a workflow would become, never for running it: without the
+    registry's manifest nothing proves this is the bundle `repo` pins, which is
+    what fetch_tool establishes before a run.
+    """
+    tool_id = check_name(tool_id.split("-")[0])
+    try:
+        with open(os.path.join(TOOL_CACHE, tool_id, "bundle.json"), "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise ToolNotCached(f"{tool_id} ({repo})") from None
+
+
 def _bundle_evidence(directory, manifest, target):
     """What this bundle is, in the terms the registry stated it.
 
@@ -582,7 +625,13 @@ class WorkflowInputError(ValueError):
     pass
 
 
-def parse_biochef_workflow(biochef_workflow):
+def parse_biochef_workflow(biochef_workflow, resolve=None):
+    """The intermediate workflow. `resolve` finds a tool, by default in the registry.
+
+    The module's fetch_tool is looked up here rather than bound as a default, so
+    that replacing it, as the tests and the catalogue sweep do, keeps working.
+    """
+    fetch_tool = resolve or globals()["fetch_tool"]
     node_list, edge_list = biochef_workflow["nodes"], biochef_workflow["edges"]
     new_workflow: Workflow = Workflow()
 
@@ -591,7 +640,8 @@ def parse_biochef_workflow(biochef_workflow):
         if node_type != "workflowNode":
             continue
 
-        tool_info = fetch_tool(node_id, node["data"]["repo"])
+        repo = node["data"]["repo"]
+        tool_info = fetch_tool(node_id, repo)
 
         new_node: Node = Node(
             id=node_id, bin=tool_info["bin"],
