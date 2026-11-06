@@ -20,9 +20,19 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 
+NOT_THE_SERVICE = {"tests", "ci", "venv", ".venv"}
+"""Directories whose settings are not the service's to document."""
+
+
+def _modules():
+    for module in REPO_ROOT.rglob("*.py"):
+        if not NOT_THE_SERVICE & set(module.relative_to(REPO_ROOT).parts):
+            yield module
+
+
 def _variables_the_code_reads():
     found = set()
-    for module in REPO_ROOT.glob("*.py"):
+    for module in _modules():
         found |= set(re.findall(r'getenv\(\s*"([A-Z][A-Z0-9_]*)"',
                                 module.read_text()))
     return found
@@ -39,6 +49,11 @@ def test_the_code_reads_some_settings():
     assert len(found) >= 10, found
     assert "BIOCHEF_RUNNER" in found
     assert "REGISTRY_URL" in found
+
+
+def test_the_scan_reaches_into_packages():
+    """A setting read inside a package is as undocumented as one at the root."""
+    assert "BIOCHEF_DB_URL" in _variables_the_code_reads()
 
 
 def test_every_setting_appears_in_the_readme():
