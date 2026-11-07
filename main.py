@@ -3,6 +3,7 @@ from convert import rule_name_for
 from convert import provenance as bundle_provenance
 import asyncio
 import provenance
+import threading
 import wes
 import tempfile
 import weakref
@@ -20,12 +21,17 @@ import base64
 import logging
 
 import audit
-from workspace import UnsafeName, check_name, make_workspace
+from workspace import UnsafeName, Workspace, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
 from runs import (IllegalTransition, RunCapacityError, RunState, RunStore,
                   TERMINAL, UnknownRun)
+from contextlib import asynccontextmanager
 from datasource import DataSourceError, get_sources
+import retention
+from node import keys as node_keys
+from node import runtime as node_runtime
 from retention import Retained
+from store import db
 from steplogs import (LiveLog, Progress, clamp, failing_steps,
                       make_step_log_names, read_node_logs)
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
@@ -33,7 +39,18 @@ from evidence_verification import EvidenceVerificationError
 from runner import SubprocessRunner, get_runner
 from signing import SignatureError
 
-app = FastAPI()
+
+
+@asynccontextmanager
+async def _node_lifespan(_app):
+    """On a node, the API process also serves the database channel (section 3.1)."""
+    worker = start_node_worker()
+    yield
+    if worker is not None:
+        worker.stop()
+
+
+app = FastAPI(lifespan=_node_lifespan)
 logger = logging.getLogger(__name__)
 
 # Before anything reads the body. starlette spools the whole multipart payload
@@ -519,6 +536,11 @@ disk. Disabled by setting either bound to zero, which restores the old behaviour
 of removing a workspace the moment its run ends.
 """
 
+MIRROR = None
+"""On a node, what copies runs into the database."""
+
+NODE_TICK_SECONDS = 5
+
 RUNS = RunStore()
 """Runs this process is aware of.
 
@@ -561,7 +583,11 @@ async def _execute(run_id: str, biochef_workflow: str, inputs):
         RUNS.record_manifest(run_id, document)
 
     def retain(ws):
-        return RETAINED.keep(run_id, ws)
+        run = RUNS.get(run_id)
+        kept = RETAINED.keep(run_id, ws, hold=run.request_id is not None)
+        if kept and MIRROR is not None:
+            MIRROR.workspace_kept(run_id, ws, run.manifest, run.output_files)
+        return kept
 
     def logs(exit_code, stdout, stderr, node_ids, node_logs):
         # Attributed here, where the emitter is already imported, so the run
@@ -570,7 +596,8 @@ async def _execute(run_id: str, biochef_workflow: str, inputs):
         # parse a failed workflow, and only from the retained stderr tail.
         steps = (failing_steps(clamp(stderr), node_ids, rule_name_for)
                  if exit_code != 0 else {})
-        RUNS.record_logs(run_id, stdout, stderr, steps, node_logs)
+        RUNS.record_logs(run_id, stdout, stderr, steps, node_logs,
+                         exit_code=exit_code)
 
     try:
         # Waits here while the service is busy, and the run stays QUEUED until a
@@ -669,6 +696,10 @@ def _admit_run(request):
     # refusal so a submission the agent is about to turn away is never read, and
     # a test pins it -- spooling first would write every byte of it to disk.
     try:
+        if RETAINED.full:
+            # Every slot holds outputs that are waiting for egress, and those
+            # are never evicted, so another run would have nowhere to keep its own.
+            raise RunCapacityError("every retained slot is waiting for egress")
         return RUNS.create(caller=state.get("caller"),
                            authenticated_by=state.get("authenticated_by"))
     except RunCapacityError:
@@ -746,6 +777,70 @@ async def get_run(run_id: str):
             detail=f"no run {run_id!r}; it never existed, or it finished long "
                    f"enough ago to have been forgotten",
         )
+
+
+def cancel_from_store(run_id):
+    """A cancellation asked for on the page. Only this process can carry it out."""
+    try:
+        run = RUNS.get(run_id)
+    except UnknownRun:
+        return
+    if run.state in TERMINAL:
+        return
+    try:
+        RUNS.advance(run_id, RunState.CANCELING)
+    except IllegalTransition:
+        return
+    pgid = run.pgid
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+class _NodeLoop:
+    """Runs NodeWorker.tick every few seconds on a thread of its own."""
+
+    def __init__(self, worker, interval=NODE_TICK_SECONDS):
+        self._worker = worker
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop.wait(self._interval):
+            try:
+                self._worker.tick()
+            except Exception:                        # noqa: BLE001
+                logger.exception("the node worker failed; trying again")
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=self._interval + 1)
+
+
+def retention_keep_seconds():
+    return retention.KEEP_OUTPUTS_SECONDS
+
+
+def start_node_worker():
+    """Everything a node adds. An agent that is not a node starts none of it."""
+    global MIRROR
+    if node_runtime.mode() is None:
+        return None
+    bind = db.engine()
+    MIRROR = node_runtime.RunMirror(bind)
+    RUNS.observer = MIRROR
+    with db.writing(bind) as session:
+        node_runtime.settle_lost_runs(session)
+        node_runtime.rebuild_retention(session, RETAINED, Workspace,
+                                       retention_keep_seconds())
+    worker = node_runtime.NodeWorker(
+        bind, cancel=cancel_from_store, retained=RETAINED, keys=node_keys.load(),
+        node=os.getenv("BIOCHEF_NODE_NAME") or "")
+    return _NodeLoop(worker)
 
 
 @app.post("/runs/{run_id}/cancel")

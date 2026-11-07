@@ -41,6 +41,12 @@ not care that each was individually reasonable.
 class Retained:
     """Workspaces being kept for their outputs, with both bounds enforced.
 
+    A workspace can also be held: its run is waiting for egress, so its clock has
+    not started and neither bound applies. A review can take longer than any
+    retention setting, and deleting outputs a person is about to release would be
+    the worst thing this module could do. Held entries count against the limit,
+    and when they fill it `full` says so and no new run is admitted.
+
     Every method takes the lock. Runs finish on worker threads and are fetched
     from the event loop, so entries are added and removed concurrently by
     construction.
@@ -57,20 +63,41 @@ class Retained:
     def enabled(self):
         return self._keep > 0 and self._max > 0
 
-    def keep(self, run_id, ws, now=None):
+    @property
+    def full(self):
+        """Every slot is held for egress, so a new run has nowhere to keep outputs."""
+        with self._lock:
+            return (self.enabled and sum(kept_at is None for _, kept_at
+                                         in self._entries.values()) >= self._max)
+
+    def keep(self, run_id, ws, now=None, hold=False):
         """Hold a workspace for this run, evicting whatever is over the bounds.
 
         Returns True if it was kept. When retention is disabled the caller is
         told so and cleans up itself, rather than this quietly holding nothing
         and leaving the directory behind.
+
+        `hold` keeps it with no clock, until `start_clock`.
         """
         if not self.enabled:
             return False
         now = time.time() if now is None else now
         with self._lock:
-            self._entries[run_id] = (ws, now)
+            self._entries[run_id] = (ws, None if hold else now)
             self._evict(now)
         return True
+
+    def adopt(self, run_id, ws, kept_at):
+        """Take back a workspace after a restart. `kept_at` None means held."""
+        with self._lock:
+            self._entries[run_id] = (ws, kept_at)
+
+    def start_clock(self, run_id, kept_at):
+        """Egress is over, so a held workspace starts to age. Idempotent."""
+        with self._lock:
+            entry = self._entries.get(run_id)
+            if entry is not None and entry[1] is None:
+                self._entries[run_id] = (entry[0], kept_at)
 
     def workspace(self, run_id, now=None):
         """The workspace for a run, or None if it is gone or expired.
@@ -110,15 +137,18 @@ class Retained:
             _remove(ws)
 
     def _evict(self, now):
-        """Called with the lock held. Time first, then count."""
+        """Called with the lock held. Time first, then count. Held entries stay."""
         expired = [run_id for run_id, (_, kept_at) in self._entries.items()
-                   if now - kept_at >= self._keep]
+                   if kept_at is not None and now - kept_at >= self._keep]
         for run_id in expired:
             _remove(self._entries.pop(run_id)[0])
 
         while len(self._entries) > self._max:
-            oldest = min(self._entries,
-                         key=lambda run_id: self._entries[run_id][1])
+            aging = [run_id for run_id, (_, kept_at) in self._entries.items()
+                     if kept_at is not None]
+            if not aging:
+                break
+            oldest = min(aging, key=lambda run_id: self._entries[run_id][1])
             _remove(self._entries.pop(oldest)[0])
 
 

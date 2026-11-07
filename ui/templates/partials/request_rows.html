@@ -5,7 +5,7 @@
   <td>{{ row.member }}</td>
   <td>{{ row.workflow }}</td>
   <td>{{ pill(row.check[0], row.check[1]) }}</td>
-  <td>{{ row.run }}</td>
+  <td>{% if row.run_id %}<a href="/ui/runs/{{ row.run_id }}">{{ row.run }}</a>{% else %}{{ row.run }}{% endif %}</td>
 </tr>
 {% else %}
 <tr><td colspan="5">No request has reached this node for this study.</td></tr>

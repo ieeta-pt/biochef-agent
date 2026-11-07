@@ -27,6 +27,7 @@ def env(monkeypatch, tmp_path):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("BIOCHEF_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
     monkeypatch.setenv("BIOCHEF_NODE_NAME", "Example TRE (test)")
+    monkeypatch.setenv("BIOCHEF_EGRESS_MODE", "manual")
     return monkeypatch
 
 
@@ -162,6 +163,16 @@ def test_cookies_are_secure_behind_the_proxy_only(dev):
     assert settings.load().secure_cookies is True
 
 
+@pytest.mark.parametrize("value", [None, "", "both"])
+def test_there_is_no_default_egress_mode(dev, value):
+    if value is None:
+        dev.delenv("BIOCHEF_EGRESS_MODE")
+    else:
+        dev.setenv("BIOCHEF_EGRESS_MODE", value)
+    with pytest.raises(SettingsError, match="BIOCHEF_EGRESS_MODE"):
+        settings.load()
+
+
 def test_the_visa_comes_from_the_passport_setting(dev):
     assert settings.load().required_visa is None
     dev.setenv("BIOCHEF_PASSPORT_REQUIRE_VISA", "ControlledAccessGrants")
@@ -205,7 +216,7 @@ def test_the_fake_policy_engine_is_for_development_only(ready, dev):
     dev.setenv("BIOCHEF_UI_IDENTITY", "header")
     dev.setenv("BIOCHEF_UI_IDENTITY_HEADER", USER_HEADER)
     dev.setenv("BIOCHEF_UI_TRUSTED_PROXIES", "10.0.0.0/24")
-    assert ui_app.configured_app().state.policy is None
+    assert ui_app.configured_app().state.policy.name == "The agent's own check"
 
 
 # The processes, as started

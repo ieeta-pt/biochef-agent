@@ -23,8 +23,9 @@ from sqlalchemy.types import TypeDecorator
 from sqlmodel import Field, Session, SQLModel
 
 from store.errors import ImmutableField
-from store.states import (Action, BindingSource, EgressState, RecipientsMode,
-                          RefusalCode, SubjectType, VersionState, Verdict)
+from store.states import (Action, BindingSource, EgressState, MessageKind,
+                          RecipientsMode, RefusalCode, SubjectType, VersionState,
+                          Verdict)
 
 # Named constraints, because SQLite can only alter a table by rebuilding it and
 # Alembic needs the names to do that.
@@ -250,6 +251,25 @@ class DatasetBinding(SQLModel, table=True):
     bound_at: datetime = _moment(nullable=False)
 
 
+class OutgoingMessage(SQLModel, table=True):
+    """A signed document for the coordinator, kept until something sends it.
+
+    Signed when the decision is made, so what goes out is what was decided then,
+    whenever the sending happens.
+    """
+
+    __tablename__ = "outgoing_message"
+    __table_args__ = (_one_of("kind", MessageKind),
+                      UniqueConstraint("run_id", "kind", name="one_message_per_kind"))
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    run_id: str = Field(foreign_key="run_summary.run_id")
+    kind: str
+    document: bytes = _raw()
+    created_at: datetime = _moment(nullable=False)
+    sent_at: Optional[datetime] = _moment(nullable=True)
+
+
 class FederationList(SQLModel, table=True):
     __tablename__ = "federation_list"
 
@@ -277,6 +297,7 @@ IMMUTABLE = {
     WorkflowVersion: ("study_id", "study_version_id", "digest", "raw"),
     Request: ("study_id", "study_version", "study_digest", "workflow_digest",
               "payload_digest", "raw"),
+    OutgoingMessage: ("run_id", "kind", "document", "created_at"),
     Decision: ("subject_type", "subject_id", "subject_hash", "action", "user",
                "comment", "dac_confirmed", "reason", "at", "object_raw",
                "signature"),

@@ -107,6 +107,9 @@ class Run:
         path -- it names a node and a handle, and this says what that means."""
         self.step_status = {}
         self.node_logs = {}
+        self.exit_code = None
+        self.request_id = None
+        """The node request behind this run, on a node. None for the plain API."""
         self.pgid = None
         """The process group executing this run, once there is one.
 
@@ -167,6 +170,14 @@ class RunStore:
         self._max = MAX_RUNS if max_runs is None else max_runs
         if self._max < 1:
             raise ValueError("max_runs must be positive")
+        self.observer = None
+        """Called with a run after it changes. On a node, this is the mirror."""
+
+    def _notify(self, run):
+        # Outside the lock: an observer that writes to a database must not hold
+        # up every other run behind it.
+        if self.observer is not None and run is not None:
+            self.observer(run)
 
     def create(self, caller=None, authenticated_by=None) -> Run:
         with self._lock:
@@ -180,6 +191,7 @@ class RunStore:
             run.authenticated_by = authenticated_by
             self._record_state(run, RunState.QUEUED)
             self._runs[run.run_id] = run
+        self._notify(run)
         return run
 
     @staticmethod
@@ -288,7 +300,8 @@ class RunStore:
                 run.outputs = outputs
             if error is not None:
                 run.error = error
-            return run
+        self._notify(run)
+        return run
 
     def attach(self, run_id: str, pgid: int) -> bool:
         """Record the group and report if cancellation arrived before it did."""
@@ -323,9 +336,10 @@ class RunStore:
             run = self._runs.get(run_id)
             if run is not None:
                 run.step_status = dict(step_status)
+        self._notify(run)
 
     def record_logs(self, run_id: str, stdout, stderr, steps,
-                    node_logs=None) -> None:
+                    node_logs=None, exit_code=None) -> None:
         """Keep bounded stream tails, node logs, and diagnostic blocks.
 
         The attribution arrives finished rather than being worked out here.
@@ -341,6 +355,9 @@ class RunStore:
             run.stderr = clamp(stderr)
             run.failed_steps = steps
             run.node_logs = node_logs or {}
+            if exit_code is not None:
+                run.exit_code = exit_code
+        self._notify(run)
 
     def detach(self, run_id: str) -> None:
         """Forget the process group, because it no longer exists.
