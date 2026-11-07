@@ -347,39 +347,40 @@ def test_the_default_isolates_the_network():
 # podman
 
 
-def test_podman_is_selectable():
+def test_podman_is_selectable(monkeypatch):
+    monkeypatch.setenv("BIOCHEF_PODMAN_SELINUX", "keep")
     assert isinstance(get_runner("podman"), PodmanRunner)
     assert "podman" in PROVIDERS
 
 
 def test_podman_says_it_isolates_the_network():
-    assert PodmanRunner().isolates_network is True
+    assert PodmanRunner(selinux="disable").isolates_network is True
 
 
 def test_podman_steps_run_through_the_wrapper():
-    preamble = PodmanRunner(image="docker://debian:stable-slim").snakefile_preamble()
+    preamble = PodmanRunner(image="docker://debian:stable-slim", selinux="disable").snakefile_preamble()
     assert 'shell.executable("' in preamble and 'podman-step"' in preamble
     assert '"docker://debian:stable-slim"' in preamble
     assert 'shell.prefix("set -euo pipefail; ")' in preamble
 
 
 def test_the_preamble_is_valid_python():
-    compile(PodmanRunner().snakefile_preamble().replace("shell.", "print."), "s", "exec")
+    compile(PodmanRunner(selinux="disable").snakefile_preamble().replace("shell.", "print."), "s", "exec")
 
 
 def test_the_image_cannot_inject_code():
     with pytest.raises(ValueError):
-        PodmanRunner(image='docker://x"; import os #')
+        PodmanRunner(image='docker://x"; import os #', selinux="disable")
 
 
 @pytest.mark.parametrize("image", ["/images/tool.sif", "oras://x/y", "library://a/b"])
 def test_podman_needs_a_docker_reference(image):
     with pytest.raises(ValueError, match="docker://"):
-        PodmanRunner(image=image)
+        PodmanRunner(image=image, selinux="disable")
 
 
 def test_podman_runs_snakemake_on_the_host():
-    argv = PodmanRunner().command(_Workspace("/ws"))
+    argv = PodmanRunner(selinux="disable").command(_Workspace("/ws"))
     assert argv[0] == "snakemake" and "apptainer" not in " ".join(argv)
 
 
@@ -416,7 +417,8 @@ def test_a_step_gets_the_workspace_and_the_command(tmp_path, monkeypatch):
     step = Path(__file__).resolve().parent.parent / "podman-step"
     ws = tmp_path / "run-1"
     ws.mkdir()
-    env = {**__import__("os").environ, "BIOCHEF_PODMAN_IMAGE": "docker://debian:x"}
+    env = {**__import__("os").environ, "BIOCHEF_PODMAN_IMAGE": "docker://debian:x",
+           "BIOCHEF_PODMAN_SELINUX": "disable"}
     subprocess.run([str(step), "-c", "echo hello"], cwd=ws, env=env, check=True)
     line = calls.read_text()
     assert "--network=none" in line and "biochef.run=run-1" in line
@@ -431,13 +433,68 @@ def test_a_step_with_no_image_refuses(tmp_path, monkeypatch):
     step = Path(__file__).resolve().parent.parent / "podman-step"
     env = {key: value for key, value in __import__("os").environ.items()
            if key != "BIOCHEF_PODMAN_IMAGE"}
+    env["BIOCHEF_PODMAN_SELINUX"] = "disable"
     assert subprocess.run([str(step), "-c", "true"], cwd=tmp_path, env=env,
                           capture_output=True).returncode != 0
 
 
+@pytest.mark.parametrize("value", [None, "", "  ", "permissive", "Disable", "off"])
+def test_podman_needs_the_selinux_setting(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("BIOCHEF_PODMAN_SELINUX", raising=False)
+    else:
+        monkeypatch.setenv("BIOCHEF_PODMAN_SELINUX", value)
+    with pytest.raises(ValueError, match="BIOCHEF_PODMAN_SELINUX.*no default"):
+        get_runner("podman")
+
+
+@pytest.mark.parametrize("value", ["disable", "keep", " keep "])
+def test_either_selinux_setting_starts(monkeypatch, value):
+    monkeypatch.setenv("BIOCHEF_PODMAN_SELINUX", value)
+    assert get_runner("podman").selinux == value.strip()
+
+
+def test_the_setting_reaches_the_steps():
+    preamble = PodmanRunner(selinux="keep").snakefile_preamble()
+    assert '_os.environ["BIOCHEF_PODMAN_SELINUX"] = "keep"' in preamble
+
+
+def step_line(tmp_path, monkeypatch, selinux):
+    import os
+    import subprocess
+    from pathlib import Path
+    calls = fake_podman(tmp_path, monkeypatch)
+    step = Path(__file__).resolve().parent.parent / "podman-step"
+    env = {**os.environ, "BIOCHEF_PODMAN_IMAGE": "docker://debian:x"}
+    env.pop("BIOCHEF_PODMAN_SELINUX", None)
+    if selinux is not None:
+        env["BIOCHEF_PODMAN_SELINUX"] = selinux
+    done = subprocess.run([str(step), "-c", "true"], cwd=tmp_path, env=env,
+                          capture_output=True, text=True)
+    return done, (calls.read_text() if calls.exists() else "")
+
+
+def test_disable_turns_labels_off_for_the_step(tmp_path, monkeypatch):
+    done, line = step_line(tmp_path, monkeypatch, "disable")
+    assert done.returncode == 0 and "--security-opt=label=disable" in line
+
+
+def test_keep_leaves_the_labels_on(tmp_path, monkeypatch):
+    done, line = step_line(tmp_path, monkeypatch, "keep")
+    assert done.returncode == 0 and "label=disable" not in line
+    assert "--network=none" in line and "--security-opt=no-new-privileges" in line
+
+
+@pytest.mark.parametrize("value", [None, "", "permissive"])
+def test_the_step_refuses_without_a_setting(tmp_path, monkeypatch, value):
+    done, line = step_line(tmp_path, monkeypatch, value)
+    assert done.returncode == 2 and line == ""
+    assert "BIOCHEF_PODMAN_SELINUX must be disable or keep" in done.stderr
+
+
 def test_leftover_containers_are_removed(tmp_path, monkeypatch):
     calls = fake_podman(tmp_path, monkeypatch, listed="abc123")
-    PodmanRunner().after_run(_Workspace("/runs/run-1"))
+    PodmanRunner(selinux="disable").after_run(_Workspace("/runs/run-1"))
     text = calls.read_text()
     assert "--filter label=biochef.run=run-1" in text
     assert "rm --force abc123" in text
@@ -445,13 +502,13 @@ def test_leftover_containers_are_removed(tmp_path, monkeypatch):
 
 def test_nothing_is_removed_when_nothing_is_left(tmp_path, monkeypatch):
     calls = fake_podman(tmp_path, monkeypatch, listed="")
-    PodmanRunner().after_run(_Workspace("/runs/run-1"))
+    PodmanRunner(selinux="disable").after_run(_Workspace("/runs/run-1"))
     assert "rm --force" not in calls.read_text()
 
 
 def test_a_missing_podman_does_not_hide_the_result(monkeypatch, tmp_path):
     monkeypatch.setenv("PATH", str(tmp_path))
-    PodmanRunner().after_run(_Workspace("/runs/run-1"))
+    PodmanRunner(selinux="disable").after_run(_Workspace("/runs/run-1"))
 
 
 def test_every_run_ends_with_after_run(tmp_path):

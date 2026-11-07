@@ -8,6 +8,9 @@
 # workspace is mounted, so a step sees neither credentials nor another run.
 #
 # The label is how PodmanRunner finds a container that outlives a killed run.
+#
+# BIOCHEF_PODMAN_SELINUX is disable or keep, and PodmanRunner refuses to start
+# without one; this refuses too, so a step never runs on a guess.
 set -euo pipefail
 
 if [ "$#" -ne 2 ] || [ "$1" != "-c" ]; then
@@ -15,12 +18,21 @@ if [ "$#" -ne 2 ] || [ "$1" != "-c" ]; then
     exit 2
 fi
 
+case "${BIOCHEF_PODMAN_SELINUX:-}" in
+    disable) selinux=(--security-opt=label=disable) ;;
+    keep) selinux=() ;;
+    *)
+        echo "podman-step: BIOCHEF_PODMAN_SELINUX must be disable or keep" >&2
+        exit 2
+        ;;
+esac
+
 exec podman run --rm --init --pull=missing \
     --network=none \
     --userns=keep-id \
     --cap-drop=all \
     --security-opt=no-new-privileges \
-    --security-opt=label=disable \
+    ${selinux[@]+"${selinux[@]}"} \
     --label "biochef.run=$(basename "$PWD")" \
     --volume "$PWD:$PWD" \
     --workdir "$PWD" \

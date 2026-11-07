@@ -409,6 +409,9 @@ class ApptainerRunner(Runner):
         return argv
 
 
+PODMAN_SELINUX = ("disable", "keep")
+
+
 class PodmanRunner(Runner):
     """Every step in a podman container, with no network.
 
@@ -419,12 +422,28 @@ class PodmanRunner(Runner):
 
     The group kill reaches the podman client and not the container, which belongs
     to podman's own monitor, so `after_run` removes whatever a killed run left.
+
+    BIOCHEF_PODMAN_SELINUX has no default. `disable` runs steps without SELinux
+    separation, so the workspace mount works on any host without relabelling it;
+    `keep` leaves podman's labelling on, and on an enforcing host the workspace
+    must already carry a label containers may use. Which is right depends on the
+    host, so the agent refuses to start until someone has said.
     """
 
     name = "podman"
 
-    def __init__(self, image: str = None):
+    def __init__(self, image: str = None, selinux: str = None):
         self.image = CONTAINER_IMAGE if image is None else image
+        self.selinux = (os.getenv("BIOCHEF_PODMAN_SELINUX", "") if selinux is None
+                        else selinux).strip()
+        if self.selinux not in PODMAN_SELINUX:
+            raise ValueError(
+                f"BIOCHEF_PODMAN_SELINUX={self.selinux!r}: it must be one of "
+                f"{', '.join(PODMAN_SELINUX)}, and has no default. disable runs "
+                f"steps without SELinux separation and mounts the workspace as it "
+                f"is; keep leaves podman's labelling on, which on an SELinux host "
+                f"needs the workspace labelled for containers (container_file_t)"
+            )
         self._literal = _image_literal(self.image)
         if not self.image.startswith("docker://"):
             raise ValueError(
@@ -445,6 +464,7 @@ class PodmanRunner(Runner):
         # only for an executable named bash.
         return (f"import os as _os\n"
                 f"_os.environ[\"BIOCHEF_PODMAN_IMAGE\"] = {self._literal}\n"
+                f"_os.environ[\"BIOCHEF_PODMAN_SELINUX\"] = {json.dumps(self.selinux)}\n"
                 f"shell.executable({json.dumps(step)})\n"
                 f"shell.prefix(\"set -euo pipefail; \")\n")
 

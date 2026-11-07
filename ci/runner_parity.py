@@ -198,7 +198,11 @@ def main():
     runners = [
         ("subprocess", SubprocessRunner()),
         ("apptainer", ApptainerRunner(image=IMAGE, cache_dir=cache)),
-        ("podman", PodmanRunner(image=IMAGE)),
+        # Both settings, so that neither stops a step from working. The runner
+        # has no SELinux, so this proves the flags and the isolation, not what
+        # an enforcing host does with the labels.
+        ("podman", PodmanRunner(image=IMAGE, selinux="disable")),
+        ("podman-keep", PodmanRunner(image=IMAGE, selinux="keep")),
     ]
 
     outcomes = {}
@@ -296,28 +300,31 @@ def main():
             f"see only loopback"
         )
 
-    # The same promises from the second container runner. The workflow is the
-    # same, so a difference here is a difference between the runners.
-    (pod_result, pod_where, pod_neighbour, pod_exec, pod_env, pod_log_out,
-     pod_log_err, pod_network) = outcomes["podman"]
-    if pod_result != plain_result:
-        failures.append(f"podman's outputs differ: {pod_result[:200]!r}")
-    if pod_where.strip() == plain_where.strip():
-        failures.append("podman's steps ran on the host's operating system, so the "
-                        "container was never entered")
-    if pod_neighbour.strip() != b"hidden":
-        failures.append("a podman step could read another run's data on the host")
-    if pod_exec.strip() != b"executed-from-workspace":
-        failures.append(f"a file in the workspace did not execute under podman "
-                        f"({pod_exec.strip()!r})")
-    if pod_log_out or pod_log_err.strip() != b"step-stderr-marker":
-        failures.append(f"podman: per-rule log capture failed "
-                        f"(stdout={pod_log_out!r}, stderr={pod_log_err!r})")
-    if pod_env.strip() != b"absent":
-        failures.append("a podman step inherited the test environment variable")
-    pod_reach, pod_interfaces = pod_network.split()
-    if pod_reach != b"unreachable" or int(pod_interfaces) != 0:
-        failures.append(f"a podman step had the network ({pod_network!r})")
+    # The same promises from the second container runner, under both SELinux
+    # settings. The workflow is the same, so a difference here is a difference
+    # between the runners.
+    for label in ("podman", "podman-keep"):
+        (pod_result, pod_where, pod_neighbour, pod_exec, pod_env, pod_log_out,
+         pod_log_err, pod_network) = outcomes[label]
+        if pod_result != plain_result:
+            failures.append(f"{label}: outputs differ: {pod_result[:200]!r}")
+        if pod_where.strip() == plain_where.strip():
+            failures.append(f"{label}: steps ran on the host's operating system, so "
+                            f"the container was never entered")
+        if pod_neighbour.strip() != b"hidden":
+            failures.append(f"{label}: a step could read another run's data on the "
+                            f"host")
+        if pod_exec.strip() != b"executed-from-workspace":
+            failures.append(f"{label}: a file in the workspace did not execute "
+                            f"({pod_exec.strip()!r})")
+        if pod_log_out or pod_log_err.strip() != b"step-stderr-marker":
+            failures.append(f"{label}: per-rule log capture failed "
+                            f"(stdout={pod_log_out!r}, stderr={pod_log_err!r})")
+        if pod_env.strip() != b"absent":
+            failures.append(f"{label}: a step inherited the test environment variable")
+        pod_reach, pod_interfaces = pod_network.split()
+        if pod_reach != b"unreachable" or int(pod_interfaces) != 0:
+            failures.append(f"{label}: a step had the network ({pod_network!r})")
 
     if failures:
         for f in failures:
@@ -331,7 +338,8 @@ def main():
           f"run's data was readable on the host but hidden inside it; "
           f"the test environment variable was not inherited; and a step could "
           f"reach the network on the host but only loopback inside; and podman "
-          f"kept every one of those promises too")
+          f"kept every one of those promises too, with SELinux labels disabled "
+          f"and kept")
     return 0
 
 

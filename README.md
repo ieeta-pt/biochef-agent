@@ -252,6 +252,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_PASSPORT_REQUIRE_VISA` | *(unset)* | a visa type a caller must hold to be let in |
 | `BIOCHEF_PASSPORT_REQUIRE_VISA_VALUE` | *(unset)* | the exact value that visa must carry |
 | `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess`, `apptainer` or `podman` |
+| `BIOCHEF_PODMAN_SELINUX` | | `disable` or `keep`, required with `podman`, see [Running it](#running-it) |
 | `BIOCHEF_CONTAINER_IMAGE` | `docker://debian:stable-slim` | image each step runs in, under the `apptainer` runner |
 | `BIOCHEF_APPTAINER_CACHE` | `apptainer-cache` | where pulled container images are kept between runs |
 | `BIOCHEF_APPTAINER_ARGS` | `--contain --cleanenv --net --network none` | extra flags for apptainer itself |
@@ -350,6 +351,11 @@ which is the only way that cache invalidates. Deleting `apptainer-cache/` forces
 a re-pull in the meantime.
 
 `BIOCHEF_RUNNER=podman` runs each step with podman instead, through the `podman-step` script, which Snakemake uses as the shell for its rules. It needs a `docker://` image. Its steps have `--network=none`, a fixed choice with no setting, no capabilities and only the run's workspace mounted, and rootless podman keeps the agent's user. A container that a killed run leaves behind is removed afterwards.
+
+`BIOCHEF_PODMAN_SELINUX` must be set with this runner, and the agent refuses to start without it, because the right value depends on the host:
+
+- `disable` runs each step with `--security-opt=label=disable`: no SELinux separation for the container, and the workspace mount works without relabelling anything. The other confinements stay: no network, no capabilities, `no-new-privileges`, the user namespace and only the run's workspace mounted.
+- `keep` leaves podman's SELinux labelling on, so a step runs confined as `container_t`. The workspace is not relabelled, so on a host with SELinux enforcing, the directory runs are made in (`BIOCHEF_RUN_ROOT`) has to carry a label containers may use, such as `container_file_t`, or every step fails with permission denied. On a host without SELinux it changes nothing.
 
 `BIOCHEF_APPTAINER_ARGS` defaults to `--contain --cleanenv --net --network none`. The last two give each step a network namespace with only loopback in it, so a tool cannot send data anywhere. On a host where apptainer refuses them the run fails, because carrying on with the network would be the worse outcome. Without `--contain`, apptainer binds the host's `/tmp` into the container, and that is where a run's directory lives unless `BIOCHEF_RUN_ROOT` says otherwise. Without it, a containerised tool is walled off from `/usr` and `/etc` while still able to read **every other run's data**. Without `--cleanenv`, the tool process also inherits the Agent's environment. Emptying this variable turns both protections off deliberately.
 
