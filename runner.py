@@ -78,6 +78,9 @@ class Runner:
         """What this provider is, for an operator reading a log or an error."""
         return self.name
 
+    def after_run(self, ws) -> None:
+        """Anything the group kill cannot reach. Called on every way out of `run`."""
+
     def run(self, ws, timeout_s: int, on_start=None, on_finish=None,
             on_line=None) -> RunResult:
         """Launch the command in its own process group and bound how long it lives.
@@ -210,6 +213,7 @@ class Runner:
                 reader.join(timeout=10)
             raise
         finally:
+            self.after_run(ws)
             # Reached by every path, and by now the group is either reaped
             # normally or killed above -- including the paths that raise, which
             # is why the kill is in an except rather than only in the timeout.
@@ -405,9 +409,89 @@ class ApptainerRunner(Runner):
         return argv
 
 
+PODMAN_SELINUX = ("disable", "keep")
+
+
+class PodmanRunner(Runner):
+    """Every step in a podman container, with no network.
+
+    Snakemake has no podman deployment method, so the seam is the shell its rules
+    run under: the preamble makes podman-step that shell, and the step's command
+    goes into a container from there. Snakemake itself stays on the host, as it
+    does under apptainer, and the Snakefile does not change otherwise.
+
+    The group kill reaches the podman client and not the container, which belongs
+    to podman's own monitor, so `after_run` removes whatever a killed run left.
+
+    BIOCHEF_PODMAN_SELINUX has no default. `disable` runs steps without SELinux
+    separation, so the workspace mount works on any host without relabelling it;
+    `keep` leaves podman's labelling on, and on an enforcing host the workspace
+    must already carry a label containers may use. Which is right depends on the
+    host, so the agent refuses to start until someone has said.
+    """
+
+    name = "podman"
+
+    def __init__(self, image: str = None, selinux: str = None):
+        self.image = CONTAINER_IMAGE if image is None else image
+        self.selinux = (os.getenv("BIOCHEF_PODMAN_SELINUX", "") if selinux is None
+                        else selinux).strip()
+        if self.selinux not in PODMAN_SELINUX:
+            raise ValueError(
+                f"BIOCHEF_PODMAN_SELINUX={self.selinux!r}: it must be one of "
+                f"{', '.join(PODMAN_SELINUX)}, and has no default. disable runs "
+                f"steps without SELinux separation and mounts the workspace as it "
+                f"is; keep leaves podman's labelling on, which on an SELinux host "
+                f"needs the workspace labelled for containers (container_file_t)"
+            )
+        self._literal = _image_literal(self.image)
+        if not self.image.startswith("docker://"):
+            raise ValueError(
+                f"BIOCHEF_CONTAINER_IMAGE={self.image!r} is not one podman can pull "
+                f"under this runner; it needs a docker:// reference"
+            )
+
+    @property
+    def isolates_network(self) -> bool:
+        return True
+
+    def describe(self) -> str:
+        return f"{self.name} ({self.image})"
+
+    def snakefile_preamble(self) -> str:
+        step = os.path.join(os.path.dirname(os.path.abspath(__file__)), "podman-step")
+        # bash's strict prefix is what snakemake would have set, and it sets that
+        # only for an executable named bash.
+        return (f"import os as _os\n"
+                f"_os.environ[\"BIOCHEF_PODMAN_IMAGE\"] = {self._literal}\n"
+                f"_os.environ[\"BIOCHEF_PODMAN_SELINUX\"] = {json.dumps(self.selinux)}\n"
+                f"shell.executable({json.dumps(step)})\n"
+                f"shell.prefix(\"set -euo pipefail; \")\n")
+
+    def command(self, ws) -> List[str]:
+        return ["snakemake", "--cores", "4",
+                "-s", os.path.join(ws.path, "Snakefile"),
+                "-d", ws.path]
+
+    def after_run(self, ws) -> None:
+        label = f"label=biochef.run={os.path.basename(ws.path)}"
+        try:
+            found = subprocess.run(
+                ["podman", "ps", "--all", "--quiet", "--filter", label],
+                capture_output=True, text=True, timeout=30, check=False)
+            names = found.stdout.split()
+            if names:
+                subprocess.run(["podman", "rm", "--force", *names],
+                               capture_output=True, timeout=30, check=False)
+        except (OSError, subprocess.SubprocessError):
+            # A leftover container costs little, and the run has its result.
+            pass
+
+
 PROVIDERS = {
     SubprocessRunner.name: SubprocessRunner,
     ApptainerRunner.name: ApptainerRunner,
+    PodmanRunner.name: PodmanRunner,
 }
 
 

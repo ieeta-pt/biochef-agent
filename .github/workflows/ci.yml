@@ -206,7 +206,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends /tmp/apptainer.deb
           apptainer --version
 
-      - name: The same workflow under both runners
+      - name: Check podman
+        # Preinstalled on the runner image. The parity check fails without it.
+        run: podman --version
+
+      - name: The same workflow under every runner
         # E2's acceptance (#15), run for real rather than asserted about.
         #
         # It is not enough to compare outputs. A container runner that quietly
