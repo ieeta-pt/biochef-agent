@@ -251,7 +251,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_PASSPORT_VISA_ISSUERS` | *(unset)* | comma-separated issuers whose visas count |
 | `BIOCHEF_PASSPORT_REQUIRE_VISA` | *(unset)* | a visa type a caller must hold to be let in |
 | `BIOCHEF_PASSPORT_REQUIRE_VISA_VALUE` | *(unset)* | the exact value that visa must carry |
-| `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess`, `apptainer` or `podman` |
+| `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess`, `apptainer`, `singularity` or `podman` |
 | `BIOCHEF_REQUIRE_NETWORK_ISOLATION` | `false` | `true` refuses to start with a runner the agent does not itself keep off the network, see [What each runner guarantees](#what-each-runner-guarantees) |
 | `BIOCHEF_NETWORK_PROBE` | *(unset)* | `host:port` the agent can reach and a step must not, tried by the network check at start |
 | `BIOCHEF_PODMAN_MODE` | | `rootless` or `rootful`, required with `podman`, see [Running it](#running-it) |
@@ -260,6 +260,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_STEP_MEMORY` | | the most memory a step may use, such as `4g`, with no swap past it, required with rootless `podman` |
 | `BIOCHEF_PODMAN_HELPER` | | the absolute path of the installed `podman-step-root`, required with rootful `podman` |
 | `BIOCHEF_CONTAINER_IMAGE` | `docker://debian:stable-slim` | image each step runs in, under the `apptainer` runner |
+| `BIOCHEF_APPTAINER_BINARY` | | the absolute path of the apptainer or SingularityCE binary, required with `apptainer` and `singularity` |
 | `BIOCHEF_APPTAINER_CACHE` | `apptainer-cache` | where pulled container images are kept between runs |
 | `BIOCHEF_APPTAINER_ARGS` | `--contain --cleanenv --net --network none` | extra flags for apptainer itself |
 | `BIOCHEF_SIGNING_MODE` | `off` | `off`, `warn`, or `strict` — whether a bundle must be signed to run |
@@ -399,12 +400,16 @@ Each runner says, for every step, whether the agent keeps it off the network, wh
 | Runner | Network | Filesystem | Environment |
 |---|---|---|---|
 | `subprocess` | none | none, the host's | none, inherited |
-| `apptainer` | enforced with `--net --network none` in `BIOCHEF_APPTAINER_ARGS`, the default | enforced with `--contain` or `--containall` | enforced with `--cleanenv` or `--containall` |
+| `apptainer`, `singularity` | enforced with `--net --network none` in `BIOCHEF_APPTAINER_ARGS`, the default | enforced with `--contain` or `--containall` | enforced with `--cleanenv` or `--containall` |
 | `podman` | enforced | enforced | enforced |
 
 `BIOCHEF_REQUIRE_NETWORK_ISOLATION=true` makes the agent and the page refuse to start with a runner whose network guarantee is not `enforced`: `subprocess`, `apptainer` with the isolation flags removed, and any runner that only attests it. An attested isolation does not count, because the rule is for the case where nobody checks.
 
 At start, the API process runs one step through a runner whose network guarantee is `enforced`, the way every step runs. The step counts the IPv4 routes and IPv6 addresses on anything but loopback, read from its own network namespace, which must be none. With `BIOCHEF_NETWORK_PROBE=host:port`, the agent first connects to it itself, and the step then tries to as well, which must fail. Without the probe, only the interfaces are checked. The result goes to the audit trail as `node.runner.network_check` and, on a node, to the Node screen. If the step finds the network, the agent does not start. This catches a host where the isolation flag is accepted and has no effect.
+
+`BIOCHEF_RUNNER=singularity` is the same runner with SingularityCE, for a host that has it and not apptainer. The flags and `BIOCHEF_APPTAINER_ARGS` are the same. Both runners need `BIOCHEF_APPTAINER_BINARY`, the absolute path of the binary, with no default. Snakemake has no setting for it: it runs `apptainer` if one is on `PATH` and `singularity` otherwise, and apptainer's packages install a `singularity` that is apptainer. So the agent checks what the binary says it is (`apptainer version` or `singularity-ce version`) and refuses to start on a mismatch. It then puts a link to it, named `apptainer`, first on Snakemake's `PATH`, in a directory of its own.
+
+With `--net --network none`, SingularityCE makes the network namespace and sets nothing up in it. A user who is not root may always ask for that network, and no other one unless `singularity.conf` allows it. The `.deb` installs a setuid starter. With `allow setuid = no` in `singularity.conf`, SingularityCE uses unprivileged user namespaces instead, which on Ubuntu 24.04 its AppArmor profile allows. CI runs the parity workflow and the network check through it both ways, as a user that is not root.
 
 `BIOCHEF_APPTAINER_ARGS` defaults to `--contain --cleanenv --net --network none`. The last two give each step a network namespace with only loopback in it, so a tool cannot send data anywhere. On a host where apptainer refuses them the run fails, because carrying on with the network would be the worse outcome. Without `--contain`, apptainer binds the host's `/tmp` into the container, and that is where a run's directory lives unless `BIOCHEF_RUN_ROOT` says otherwise. Without it, a containerised tool is walled off from `/usr` and `/etc` while still able to read **every other run's data**. Without `--cleanenv`, the tool process also inherits the Agent's environment. Emptying this variable turns both protections off deliberately.
 

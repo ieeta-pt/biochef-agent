@@ -53,3 +53,25 @@ except ImportError:
     sys.modules["fastapi"] = fastapi
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(scope="session")
+def _fake_apptainer(tmp_path_factory):
+    folder = tmp_path_factory.mktemp("fake-apptainer")
+    binary = folder / "apptainer"
+    binary.write_text('#!/bin/sh\necho "apptainer version 1.3.6"\n')
+    binary.chmod(0o755)
+    return str(binary)
+
+
+@pytest.fixture(autouse=True)
+def _apptainer_binary(monkeypatch, _fake_apptainer):
+    """BIOCHEF_APPTAINER_BINARY has no default; a stand-in that only says its version.
+
+    Tests that build an apptainer runner then need no apptainer on the host, and
+    none of them can run the host's by accident.
+    """
+    monkeypatch.setenv("BIOCHEF_APPTAINER_BINARY", _fake_apptainer)

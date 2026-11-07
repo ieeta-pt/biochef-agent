@@ -107,6 +107,10 @@ class Runner:
     umask = -1
     """The umask the command starts with; -1 keeps the agent's."""
 
+    def environment(self):
+        """The command's environment, or None for the agent's own."""
+        return None
+
     def before_run(self, ws) -> None:
         """Anything the workspace needs before the command starts."""
 
@@ -132,6 +136,7 @@ class Runner:
         process = subprocess.Popen(
             self.command(ws),
             cwd=ws.path, start_new_session=True, umask=self.umask,
+            env=self.environment(),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             encoding="utf-8", errors="replace",
         )
@@ -387,6 +392,38 @@ def _image_literal(image: str) -> str:
     return json.dumps(image)
 
 
+def _container_binary(value, runner_name, expected):
+    """BIOCHEF_APPTAINER_BINARY, checked to be what the runner says it is.
+
+    Snakemake has no setting for the binary: it takes `apptainer` if one is on
+    PATH and `singularity` otherwise, and apptainer's packages install a
+    `singularity` that is apptainer. So the binary is named, absolutely, and its
+    own --version decides whether it is the one the runner was asked for.
+    """
+    path = (os.getenv("BIOCHEF_APPTAINER_BINARY", "") if value is None
+            else value).strip()
+    if not os.path.isabs(path):
+        raise ValueError(
+            f"BIOCHEF_APPTAINER_BINARY={path!r}: BIOCHEF_RUNNER={runner_name} needs "
+            f"the absolute path of the {runner_name} binary, and it has no default"
+        )
+    if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+        raise ValueError(f"BIOCHEF_APPTAINER_BINARY={path!r} is not an executable file")
+    try:
+        said = subprocess.run([path, "--version"], capture_output=True, text=True,
+                              timeout=30, check=False).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError(f"BIOCHEF_APPTAINER_BINARY={path!r} did not run: "
+                         f"{error}") from None
+    if not said.startswith(expected):
+        raise ValueError(
+            f"BIOCHEF_APPTAINER_BINARY={path!r} says {said[:80]!r}, which is not "
+            f"{runner_name}: BIOCHEF_RUNNER={runner_name} expects "
+            f"{expected.strip()!r}"
+        )
+    return path, said
+
+
 class ApptainerRunner(Runner):
     """Every step in a container, via snakemake's own deployment mechanism.
 
@@ -403,9 +440,10 @@ class ApptainerRunner(Runner):
     """
 
     name = "apptainer"
+    version_prefix = "apptainer version "
 
     def __init__(self, image: str = None, cache_dir: str = None,
-                 apptainer_args: str = None):
+                 apptainer_args: str = None, binary: str = None):
         self.image = CONTAINER_IMAGE if image is None else image
         self.cache_dir = APPTAINER_CACHE if cache_dir is None else cache_dir
         self.apptainer_args = (APPTAINER_ARGS if apptainer_args is None
@@ -413,9 +451,27 @@ class ApptainerRunner(Runner):
         # Fail here rather than when the Snakefile is written, so a bad image
         # stops the process from starting instead of failing every submission.
         self._literal = _image_literal(self.image)
+        self.binary, self.version = _container_binary(binary, self.name,
+                                                      self.version_prefix)
+        self._bin_dir = None
 
     def describe(self) -> str:
-        return f"{self.name} ({self.image})"
+        return f"{self.name} ({self.image}, {self.version})"
+
+    def environment(self):
+        """PATH with the configured binary first, as the only `apptainer` found.
+
+        Snakemake looks for `apptainer` before `singularity`, so a link of that
+        name, first on PATH, is what it runs, whichever binary it points to.
+        SingularityCE says "singularity-ce version", which snakemake accepts.
+        The directory is the agent's own, made once, 0700.
+        """
+        if self._bin_dir is None:
+            made = tempfile.mkdtemp(prefix="biochef-bin-")
+            os.symlink(self.binary, os.path.join(made, "apptainer"))
+            self._bin_dir = made
+        return {**os.environ,
+                "PATH": self._bin_dir + os.pathsep + os.environ.get("PATH", "")}
 
     @property
     def guarantees(self) -> dict:
@@ -449,6 +505,20 @@ class ApptainerRunner(Runner):
             # problem rather than a quoting one.
             argv.append(f"--apptainer-args={self.apptainer_args}")
         return argv
+
+
+class SingularityRunner(ApptainerRunner):
+    """The same runner with SingularityCE, for a host that has it and not apptainer.
+
+    The flags are the same. Read in SingularityCE 4.6.0: with --net --network
+    none the network namespace is made and nothing is set up in it, and a user
+    who is not root may always ask for that network and no other one unless
+    singularity.conf allows it. CI runs it as a user that is not root, with the
+    setuid starter and without it.
+    """
+
+    name = "singularity"
+    version_prefix = "singularity-ce version "
 
 
 PODMAN_SELINUX = ("disable", "keep")
@@ -756,6 +826,7 @@ class PodmanRunner(Runner):
 PROVIDERS = {
     SubprocessRunner.name: SubprocessRunner,
     ApptainerRunner.name: ApptainerRunner,
+    SingularityRunner.name: SingularityRunner,
     PodmanRunner.name: PodmanRunner,
 }
 
