@@ -541,7 +541,10 @@ A study names datasets by id, and a binding says which folder under `BIOCHEF_LOC
 EGAD00001009912:
   type: localpath
   location: cardio/2019_2024/
+  visa_value: https://dac.example.org/datasets/EGAD00001009912
 ```
+
+`visa_value` is the exact value the data access committee issues in a visa for this dataset, usually a URL. On a node with `BIOCHEF_PASSPORT_REQUIRE_VISA`, a request is compared with it and with nothing else, so a dataset with no `visa_value` refuses every request as `visa_missing`, and the Datasets page says so.
 
 The file is read when the page starts. Its bindings are locked on the page, and it wins over anything bound there: a page binding it replaces gets a signed `unbind`, and the page reports it. With `BIOCHEF_DATASET_BINDINGS_FROM_UI=true` a data manager can bind, edit and remove the others, each as a signed decision. Anything that resolves outside the root is refused, with the same check `localpath` applies to a run's inputs.
 

@@ -11,5 +11,9 @@
     <label for="location-{{ field }}" class="text-[13px] font-medium">Folder under the data root</label>
     <input id="location-{{ field }}" name="location" class="input mono" value="{{ location }}">
   </div>
+  <div class="flex flex-col gap-1">
+    <label for="visa-{{ field }}" class="text-[13px] font-medium">Visa value</label>
+    <input id="visa-{{ field }}" name="visa_value" class="input mono" value="{{ visa_value }}">
+  </div>
   <button type="button" class="btn btn-primary" hx-post="/ui/_/datasets/bind" hx-include="#fields-{{ field }}" hx-target="#decision-error" hx-swap="innerHTML">{{ button }}</button>
 </div>

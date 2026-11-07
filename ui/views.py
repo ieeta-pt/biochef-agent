@@ -510,6 +510,7 @@ def dataset_page(session):
     versions = repo.open_versions(session)
     bound = repo.dataset_bindings(session)
     rows = [{"id": row.dataset_id, "type": row.type, "location": row.location,
+             "visa_value": row.visa_value,
              "used_by": _used_by(session, row.dataset_id, versions),
              "locked": row.source == "config", "bound_by": row.bound_by}
             for row in bound]

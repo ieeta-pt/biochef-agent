@@ -10,13 +10,18 @@
 <div id="decision-error"></div>
 <section aria-label="Bindings" class="card table-box">
   <table>
-    <thead><tr><th>Dataset id</th><th>Source type</th><th>Location on this node</th><th>Used by</th><th>Bound by</th></tr></thead>
+    <thead><tr><th>Dataset id</th><th>Source type</th><th>Location on this node</th><th>Visa value</th><th>Used by</th><th>Bound by</th></tr></thead>
     <tbody>
       {% for row in data.rows %}
       <tr>
         <td class="mono">{{ row.id }}</td>
         <td>{{ row.type }}</td>
         <td class="mono">{{ row.location }}</td>
+        <td>
+          {% if row.visa_value %}<span class="mono break-all">{{ row.visa_value }}</span>
+          {% elif settings.required_visa %}{{ pill('warn', 'Not set') }}<span class="block text-[13px] text-muted">Requests for this dataset are refused as visa missing: this node requires a {{ settings.required_visa }} visa, and nothing says which value it must carry.</span>
+          {% else %}<span class="text-muted">Not set</span>{% endif %}
+        </td>
         <td {% if row.used_by == 'no approved study' %}class="text-muted"{% endif %}>{{ row.used_by }}</td>
         <td>
           {% if row.locked %}{{ pill('mute', 'config file, locked') }}{% else %}
@@ -30,7 +35,7 @@
         </td>
       </tr>
       {% else %}
-      <tr><td colspan="5">No dataset is bound on this node.</td></tr>
+      <tr><td colspan="6">No dataset is bound on this node.</td></tr>
       {% endfor %}
     </tbody>
   </table>
@@ -44,8 +49,8 @@
     <h2 class="m-0 text-base font-medium">Waiting for a binding</h2>
     <span class="text-sm text-muted">{{ dataset.id }} is named by {{ dataset.named_by }}. Requests that need it are refused until it is bound.</span>
   </div>
-  {% with dataset_id=dataset.id, location='', button='Bind and sign', field='bind-' ~ loop.index %}{% include "partials/dataset_form.html" %}{% endwith %}
-  <span class="text-[13px] text-muted">Paths are resolved under the data root on the Node page. The agent refuses anything outside it.</span>
+  {% with dataset_id=dataset.id, location='', visa_value='', button='Bind and sign', field='bind-' ~ loop.index %}{% include "partials/dataset_form.html" %}{% endwith %}
+  <span class="text-[13px] text-muted">Paths are resolved under the data root on the Node page. The agent refuses anything outside it. The visa value is the exact value the data access committee issues for this dataset, usually a URL.</span>
 </section>
 {% endfor %}
 {% endif %}

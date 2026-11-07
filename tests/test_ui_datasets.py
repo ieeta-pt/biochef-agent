@@ -39,6 +39,46 @@ def post(client, path, **data):
     return client.post(path, data=data, headers={"X-CSRF-Token": token})
 
 
+def test_the_visa_values_are_on_the_table(engine, root):
+    text = client(engine, root).get("/ui/datasets").text
+    assert "https://dac.example.org/datasets/EGAD00001009912" in text
+
+
+def test_the_page_says_why_a_missing_visa_value_refuses(engine, root):
+    settings = dev_settings(node_name=mock.NODE, local_root=root, dev_user="j.silva",
+                            required_visa="ControlledAccessGrants")
+    text = client_for(settings, bind=engine).get("/ui/datasets").text
+    assert "Requests for this dataset are refused as visa missing" in text
+
+
+def test_no_visa_required_means_no_warning(engine, root):
+    text = client(engine, root).get("/ui/datasets").text
+    assert "refused as visa missing" not in text
+
+
+def test_the_form_binds_a_visa_value(engine, root):
+    with db.writing(engine) as session:
+        version = next(row for row in repo.open_versions(session))
+        version.datasets = [*version.datasets, "EGADNEW"]
+    browser = client(engine, root)
+    assert 'name="visa_value"' in browser.get("/ui/datasets").text
+    post(browser, "/ui/_/datasets/bind", dataset_id="EGADNEW", location="rare/pilot_v1",
+         visa_value="https://dac.example.org/datasets/new")
+    with db.reading(engine) as session:
+        assert repo.dataset_binding(session, "EGADNEW").visa_value == (
+            "https://dac.example.org/datasets/new")
+
+
+def test_the_edit_form_shows_the_visa_value(engine, root):
+    browser = client(engine, root)
+    with db.writing(engine) as session:
+        repo.bind_dataset(session, dataset_id="EGADP", source=BindingSource.PAGE,
+                          type="localpath", location="rare/pilot_v1",
+                          visa_value="https://dac.example.org/p", bound_by="j.silva")
+    text = browser.get("/ui/_/datasets/EGADP/edit").text
+    assert 'value="https://dac.example.org/p"' in text
+
+
 def test_the_table_of_the_mock(engine, root):
     text = client(engine, root).get("/ui/datasets").text
     assert "EGAD00001009912" in text and "cardio/2019_2024/" in text

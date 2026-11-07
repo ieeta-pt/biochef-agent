@@ -16,6 +16,8 @@ from tests.store_support import add_version, fresh_database
 
 KEYS = generate()
 NODE = "node-a"
+VALUE = "https://dac.example.org/datasets/EGAD1"
+OTHER_VALUE = "https://dac.example.org/datasets/EGAD1/v2"
 
 
 @pytest.fixture
@@ -38,10 +40,11 @@ def engine(tmp_path, monkeypatch):
     return bind
 
 
-def page_bind(engine, root, location="cohort", dataset="EGAD1", user="j.silva"):
+def page_bind(engine, root, location="cohort", dataset="EGAD1", user="j.silva",
+              visa_value=None):
     with db.writing(engine) as session:
         return datasets.bind(session, KEYS, node=NODE, root=root, dataset_id=dataset,
-                             location=location, user=user)
+                             location=location, user=user, visa_value=visa_value)
 
 
 def binding(engine, dataset="EGAD1"):
@@ -145,7 +148,13 @@ def write(tmp_path, text):
 
 def test_a_config_file_loads(root, tmp_path):
     path = write(tmp_path, "EGAD1:\n  type: localpath\n  location: cohort/\n")
-    assert datasets.load_file(path, root) == {"EGAD1": "cohort/"}
+    assert datasets.load_file(path, root) == {"EGAD1": ("cohort/", None)}
+
+
+def test_a_config_file_carries_the_visa_value(root, tmp_path):
+    path = write(tmp_path, "EGAD1:\n  type: localpath\n  location: cohort/\n"
+                           f"  visa_value: {VALUE}\n")
+    assert datasets.load_file(path, root)["EGAD1"].visa_value == VALUE
 
 
 def test_an_empty_config_file_binds_nothing(root, tmp_path):
@@ -160,6 +169,7 @@ def test_an_empty_config_file_binds_nothing(root, tmp_path):
     ("EGAD1:\n  type: localpath\n  location: ../outside\n", "outside the data root"),
     ("'bad id':\n  type: localpath\n  location: cohort\n", "not a dataset id"),
     ("a: [\n", "cannot be read"),
+    ("EGAD1:\n  type: localpath\n  location: cohort\n  visa_value: [1]\n", "is text"),
 ])
 def test_a_bad_config_file_is_refused(root, tmp_path, text, message):
     with pytest.raises(BindingError, match=message):
@@ -173,7 +183,9 @@ def test_a_missing_config_file_is_refused(root, tmp_path):
 
 def sync(engine, entries):
     with db.writing(engine) as session:
-        return datasets.sync(session, KEYS, NODE, entries)
+        return datasets.sync(session, KEYS, NODE, {
+            dataset: datasets.Entry(entry) if isinstance(entry, str) else entry
+            for dataset, entry in entries.items()})
 
 
 def test_syncing_binds_and_locks(engine):
@@ -185,7 +197,9 @@ def test_syncing_binds_and_locks(engine):
 def test_the_config_wins_over_the_page_and_says_so(engine, root):
     page_bind(engine, root, "other")
     replaced = sync(engine, {"EGAD1": "cohort"})
-    assert replaced == [{"dataset_id": "EGAD1", "page": "other", "config": "cohort",
+    assert replaced == [{"dataset_id": "EGAD1",
+                         "page": "location other, no visa value",
+                         "config": "location cohort, no visa value",
                          "bound_by": "j.silva"}]
     assert binding(engine).source == "config"
     assert about(engine)[0].action == "unbind"
@@ -210,6 +224,30 @@ def test_syncing_twice_changes_nothing(engine):
     assert about(engine) == []
 
 
+def test_syncing_stores_the_visa_value(engine):
+    sync(engine, {"EGAD1": datasets.Entry("cohort", VALUE)})
+    assert binding(engine).visa_value == VALUE
+
+
+def test_a_visa_value_the_file_changed_is_stored(engine):
+    sync(engine, {"EGAD1": datasets.Entry("cohort", VALUE)})
+    sync(engine, {"EGAD1": datasets.Entry("cohort", OTHER_VALUE)})
+    assert binding(engine).visa_value == OTHER_VALUE
+
+
+def test_a_visa_value_alone_is_enough_for_the_config_to_replace_the_page(engine, root):
+    page_bind(engine, root, "cohort", visa_value=VALUE)
+    replaced = sync(engine, {"EGAD1": datasets.Entry("cohort", OTHER_VALUE)})
+    assert replaced[0]["page"] == f"location cohort, visa value {VALUE}"
+    assert replaced[0]["config"] == f"location cohort, visa value {OTHER_VALUE}"
+    assert binding(engine).visa_value == OTHER_VALUE
+
+
+def test_the_page_agreeing_with_the_file_loses_nothing(engine, root):
+    page_bind(engine, root, "cohort", visa_value=VALUE)
+    assert sync(engine, {"EGAD1": datasets.Entry("cohort", VALUE)}) == []
+
+
 # From the page
 
 
@@ -221,6 +259,54 @@ def test_binding_from_the_page_is_signed_and_audited(engine, root, tmp_path):
         "bind", "j.silva", "EGAD1")
     assert "cohort/" in signed["reason"]
     assert audit.read(str(tmp_path / "audit.jsonl"))[-1]["user"] == "j.silva"
+
+
+def test_the_visa_value_is_signed_with_the_binding(engine, root):
+    page_bind(engine, root, "cohort", visa_value=VALUE)
+    row = about(engine)[0]
+    signed = decisions.verify(row.object_raw, row.signature, KEYS.signing.public_key())
+    assert VALUE in signed["reason"]
+    assert binding(engine).visa_value == VALUE
+
+
+def test_changing_only_the_visa_value_signs_a_different_hash(engine, root):
+    page_bind(engine, root, "cohort", visa_value=VALUE)
+    page_bind(engine, root, "cohort", visa_value=OTHER_VALUE)
+    first, second = about(engine)[:2]
+    assert first.subject_hash != second.subject_hash
+
+
+def test_a_binding_with_no_visa_value_says_so(engine, root):
+    page_bind(engine, root, "cohort")
+    assert "no visa value" in about(engine)[0].reason
+    assert binding(engine).visa_value is None
+
+
+def test_unbinding_names_the_visa_value_that_went(engine, root):
+    page_bind(engine, root, "cohort", visa_value=VALUE)
+    with db.writing(engine) as session:
+        datasets.unbind(session, KEYS, node=NODE, dataset_id="EGAD1", user="j.silva")
+    assert any(row.action == "unbind" and VALUE in row.reason for row in about(engine))
+
+
+@pytest.mark.parametrize("value,kept", [
+    (None, None), ("", None), ("   ", None), (f"  {VALUE}\n", VALUE),
+    ("https://x/a b?c=D", "https://x/a b?c=D"),
+])
+def test_a_visa_value_is_kept_as_issued(value, kept):
+    assert datasets.check_visa_value(value) == kept
+
+
+@pytest.mark.parametrize("value,message", [
+    ("x" * 2049, "at most"), ("a\x00b", "control"), ("a\nb", "control"), (5, "is text"),
+])
+def test_a_bad_visa_value_is_refused(value, message):
+    with pytest.raises(BindingError, match=message):
+        datasets.check_visa_value(value)
+
+
+def test_the_longest_visa_value_is_accepted():
+    assert len(datasets.check_visa_value("x" * 2048)) == 2048
 
 
 def test_the_page_cannot_override_the_config(engine, root):

@@ -35,19 +35,22 @@ def edit(request: Request, dataset_id: str):
     if row is None or row.source != "page":
         raise HTTPException(status_code=404)
     return fragment(request, "partials/dataset_form.html", dataset_id=dataset_id,
-                    location=row.location, button="Save and sign", field=f"edit-{dataset_id}")
+                    location=row.location, visa_value=row.visa_value or "",
+                    button="Save and sign", field=f"edit-{dataset_id}")
 
 
 @router.post("/ui/_/datasets/bind")
 def bind(request: Request, dataset_id: str = Form(...),
-         location: Optional[str] = Form(None)):
+         location: Optional[str] = Form(None),
+         visa_value: Optional[str] = Form(None)):
     _require_page_bindings(request)
     state = request.app.state
 
     def work(session):
         datasets.bind(session, state.keys, node=state.settings.node_name,
                       root=state.settings.local_root, dataset_id=dataset_id,
-                      location=location, user=request.state.user)
+                      location=location, visa_value=visa_value,
+                      user=request.state.user)
     return act(request, work, then="/ui/datasets")
 
 

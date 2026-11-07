@@ -591,13 +591,13 @@ def open_versions(session):
 
 
 def bind_dataset(session, *, dataset_id, source, type, location, bound_by,
-                 now=None):
+                 visa_value=None, now=None):
     """Bind a dataset. The config file always wins over the page."""
     row = session.get(DatasetBinding, dataset_id)
     if row is None:
         row = DatasetBinding(dataset_id=dataset_id, source=source.value,
-                             type=type, location=location, bound_by=bound_by,
-                             bound_at=now or utcnow())
+                             type=type, location=location, visa_value=visa_value,
+                             bound_by=bound_by, bound_at=now or utcnow())
         session.add(row)
     elif (row.source == BindingSource.CONFIG.value
           and source is BindingSource.PAGE):
@@ -606,6 +606,7 @@ def bind_dataset(session, *, dataset_id, source, type, location, bound_by,
         row.source = source.value
         row.type = type
         row.location = location
+        row.visa_value = visa_value
         row.bound_by = bound_by
         row.bound_at = now or utcnow()
     session.flush()
