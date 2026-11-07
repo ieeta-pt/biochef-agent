@@ -101,7 +101,7 @@ All versions pinned. Add new Python pins to `requirements.txt` and make `pip che
 | Fonts | Roboto 400/500/700 and Roboto Mono 400/500, woff2, latin and latin-ext | from `@fontsource/roboto` 5.3.0 and `@fontsource/roboto-mono` 5.3.0, OFL 1.1 | Vendored under `ui/static/fonts/` with the licence file. Same family as the BioChef app |
 | Database | SQLModel on SQLAlchemy | sqlmodel 0.0.37, SQLAlchemy 2.0.49 (already pinned) | SQLite by default (`BIOCHEF_DB_URL=sqlite:////var/lib/biochef/agent.db`), Postgres possible later |
 | Migrations | Alembic | 1.20.1 (new pin; needs SQLAlchemy ≥ 2.0, Mako) | From the first table. No `create_all` in production paths |
-| Signatures | `cryptography` | 50.0.1 (already pinned) | Ed25519 for the node, ES256 on P-256 to check members (section 7). `cryptography` does not read `age-x25519`; part 6 chooses and pins an age implementation |
+| Signatures | `cryptography` | 50.0.1 (already pinned) | Ed25519 for the node, ES256 on P-256 to check members (section 7). `cryptography` does not read `age-x25519`, so `pyrage` 1.4.0 does |
 | Canonical JSON | `rfc8785` | 0.1.4 (new pin) | Bytes that signatures cover (section 7.2) |
 | ID tokens | PyJWT | 2.13.0 (already pinned) | Reuse the JWKS fetching pattern in `passports.py` |
 | Tests | pytest 8.4.2, httpx 0.28.1 (already pinned) | | FastAPI `TestClient` for every route. Browser tests are optional and come last (part 7), with `playwright` 1.64.1 and `pytest-playwright` 0.10.0 in a separate `requirements-dev.txt` |
@@ -126,6 +126,7 @@ Both processes share the same database and the same audit file. Add a `run-ui.sh
 - The API process writes `run_summary`, including `workspace_path`, step times and the log tails, capped at `BIOCHEF_MAX_LOG_BYTES`.
 - The UI asks for a cancellation by setting `cancel_requested`; the API process reads it and calls its existing cancel logic.
 - The coordinator poll (part 8) runs in the API process, so that an accepted request starts a run there.
+- `BIOCHEF_EGRESS_MODE` is what makes an agent a node. A plain agent leaves it unset, needs no database and runs none of this.
 - After a restart the API process rebuilds retention from the database.
 
 The agent runs on the same machine as the jobs. `os.killpg`, the local run directory and `BIOCHEF_LOCAL_ROOT` all require it.
@@ -165,7 +166,12 @@ node/
   policy.py         # PolicyEngine protocol and a fake (section 6.5)
   identity.py       # member identity check (section 7.3)
   verify.py         # request checks (section 6.3)
+  requests.py       # receive a request, check it once, record the verdict
+  age.py            # age-x25519 with the node key
+  datasets.py       # dataset bindings (section 6.6)
+  federation.py     # the signed node list (section 7.4)
   egress.py         # egress pipeline (section 6.5)
+  runtime.py        # the API process's side of the database channel (section 3.1)
 ```
 
 Names can change if the repo's flat layout argues against packages; say so in the part 1 report.
@@ -451,7 +457,7 @@ All read with `os.getenv`, all in `README.md` and `example.env` (test enforced).
 | `BIOCHEF_EDITOR_CLIENT_ID` | none, required | 4b | Editor's LS Login client id |
 | `BIOCHEF_DATASET_BINDINGS_FILE` | none | 5 | YAML bindings from config |
 | `BIOCHEF_DATASET_BINDINGS_FROM_UI` | `false` | 5 | Allow bindings from the page |
-| `BIOCHEF_EGRESS_MODE` | none, required | 7 | `airlock` or `manual` |
+| `BIOCHEF_EGRESS_MODE` | none, required by the UI | 7 | `airlock` or `manual` |
 | `BIOCHEF_FEDERATION_KEY` | none, required | 7.4 | Public key that signs the node list |
 | `BIOCHEF_COORDINATOR_URL` | none, required | 8 | Coordinator base URL |
 | `BIOCHEF_COORDINATOR_POLL_SECONDS` | `30` | 8 | Poll interval |
@@ -484,7 +490,7 @@ Each part is one PR. Do them in this order unless `jorgeMFS` says otherwise. Par
 | 7b | **Node screen**: the cards, settings, audit log and audit check of 8.7 | 1, 2, 3 | Screen 07 matches section 0.1; audit export works; the API app gains no audit route; the audit check is tested for a failed commit, an undone decision and an id reused after a rollback |
 | 7.4 | **Federation node list** (7.4): check the list's signature with `BIOCHEF_FEDERATION_KEY`, refuse older versions | 1, 7b | Bad signature and older version refused; the Node card shows "Up to date · N nodes" |
 | 8 | **Coordinator client**: poll over mTLS in the API process, fetch study versions, workflow versions, requests and the federation node list; post decisions and results | The agent API in `biochef-coordinator` | Integration test against the coordinator running locally with `docker compose` |
-| 9 | **Podman runner** (**parallel**) in `runner.py`, same seam as `apptainer`, steps with `--network=none` | nothing | `ci/runner_parity.py` extended to `podman` and passing (same result, step not on the host, neighbours hidden, environment not inherited); documented in README |
+| 9 | **Podman runner** (**parallel**) in `runner.py`, same seam as `apptainer`, steps with `--network=none`. Snakemake has no podman mode, so `podman-step` is the shell its rules run under | nothing | `ci/runner_parity.py` extended to `podman` and passing (same result, step not on the host, neighbours hidden, environment not inherited); documented in README |
 | 9b | **Network isolation for apptainer** (**parallel**) | nothing | `ci/runner_parity.py` proves a step cannot reach the network; the Node card shows it on |
 
 After each part: run the full suite (`pytest -p no:cacheprovider --strict-markers`), `pip check`, `python -m compileall -q -f $(git ls-files '*.py')`, and report.
@@ -512,4 +518,6 @@ Still open. Ask `jorgeMFS` before building anything that depends on these.
 5. `all_members` as a recipients mode in `ieeta-pt/biochef-coordinator#6` (6.5).
 6. A `title` field on `StudyVersion` in `ieeta-pt/biochef-coordinator#6`. Until then the page shows `study_id` and the first line of `goal`, and `study.title` stays empty (6.7).
 7. A signer for workflows in `ieeta-pt/biochef-coordinator#6`, and verification of the proposer's signature on a study version. Until both exist the page shows "Proposed by" and no tick.
-8. Member names from the `name` claim (7.3). This depends on `ieeta-pt/biochef-coordinator#6` carrying `binding_token` as it does now, and on the test with the mock AAI: the editor has to request the `profile` scope for the token to carry `name`.
+8. Formats the coordinator's agent API has to settle, assumed until then and listed in `node/verify.py` and `node/federation.py`: what a member's signature covers, what `payload_digest` covers, the payload's shape, the value of a visa for a dataset, and the signature and shape of the node list.
+9. Posting a withheld result. `partial` builds the document, but `EGRESS_ALLOWED` has no step after `withheld`, so part 8 has to add one.
+10. Member names from the `name` claim (7.3). This depends on `ieeta-pt/biochef-coordinator#6` carrying `binding_token` as it does now, and on the test with the mock AAI: the editor has to request the `profile` scope for the token to carry `name`.
