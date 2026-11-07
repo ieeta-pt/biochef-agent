@@ -113,7 +113,7 @@ def test_the_last_day_is_mock_04(engine):
         rows = repo.requests_since(session, since)
         refused = repo.requests_since(session, since, [Verdict.REFUSED])
     assert [row.request_id for row in rows] == [
-        "req_8e90", "req_8f40", "req_8f33", "req_8f22", "req_8f21", "req_7c03"]
+        "req_8e90", "req_8f40", "req_8f33", "req_8f21", "req_7c03"]
     assert {row.request_id for row in refused} == {"req_8f40", "req_8f33"}
 
 
@@ -125,13 +125,13 @@ def test_the_study_counts_are_mock_02(engine):
             assert repo.get_request(session, request_id).study_id == mock.CARDIO
 
 
-def test_the_joined_request_points_at_its_run(engine):
+def test_the_repeated_request_is_counted_on_its_own_row(engine):
     with db.reading(engine) as session:
-        joined = repo.get_request(session, "req_8f22")
-        original = repo.get_request(session, "req_8f21")
-    assert joined.verdict == "joined" and joined.joined_request_id == "req_8f21"
-    assert joined.run_id == original.run_id == "run_8f21"
-    assert joined.payload_digest == original.payload_digest
+        repeated = repo.get_request(session, "req_8f21")
+        assert repo.find_request(session, "req_8f22") is None
+    assert (repeated.verdict, repeated.repeats, repeated.run_id) == (
+        "accepted", 1, "run_8f21")
+    assert repeated.last_repeat_at > repeated.received_at
 
 
 def test_a_refused_request_has_its_signed_refusal(engine):
@@ -210,7 +210,7 @@ def test_seeded_times_follow_the_clock(tmp_path):
     later = NOW + timedelta(days=365)
     seed.seed(engine, now=later)
     with db.reading(engine) as session:
-        assert len(repo.requests_since(session, later - timedelta(hours=24))) == 6
+        assert len(repo.requests_since(session, later - timedelta(hours=24))) == 5
 
 
 def test_a_database_with_data_is_refused(engine):

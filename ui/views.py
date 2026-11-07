@@ -448,8 +448,6 @@ def _check_pill(request):
     if request.verdict == Verdict.REFUSED.value:
         label = CHECK_LABELS.get(request.failed_check, request.failed_check)
         return "bad", f"Refused · {label}"
-    if request.verdict == Verdict.JOINED.value:
-        return "info", f"Repeated · joined {request.joined_request_id}"
     if request.verdict == Verdict.ACCEPTED.value:
         return "ok", "Accepted"
     return "mute", "Not checked yet"
@@ -516,15 +514,12 @@ def _check_marks(request):
     stop = None
     if request.verdict == Verdict.REFUSED.value:
         stop = request.failed_check
-    elif request.verdict == Verdict.JOINED.value:
-        stop = "replay"
     marks, reached = [], True
     for code, text in REQUEST_CHECKS:
         if not reached:
             marks.append(("not_reached", text))
         elif code == stop:
-            joined = request.verdict == Verdict.JOINED.value
-            marks.append(("joined" if joined else "failed", text))
+            marks.append(("failed", text))
             reached = False
         else:
             marks.append(("passed", text))
@@ -561,20 +556,48 @@ def _request_row(session, request):
             "when": fmt.minute(request.received_at), "pill": pill}
 
 
-def _request_panel(session, request):
-    has_run = (request.verdict in (Verdict.ACCEPTED.value, Verdict.JOINED.value)
-               and request.run_id is not None)
+def _repeats(request):
+    """What the deliveries after the first got. None when there were none."""
+    if not request.repeats:
+        return None
+    times = "once" if request.repeats == 1 else f"{request.repeats} times"
+    got = ("joined this run" if request.verdict == Verdict.ACCEPTED.value
+           else "got the same refusal")
+    return (f"Delivered again {times}, last {fmt.minute(request.last_repeat_at)}. "
+            f"The same request_id {got}.")
+
+
+def _visa_reasons(session, request, required_visa):
+    """Why a visa_missing refusal can never pass as things are: a value nobody set.
+
+    This is the binding as it is now, which is what a new request would meet.
+    """
+    if request.failed_check != "visa_missing" or not required_visa:
+        return []
+    reasons = []
+    for dataset in request.datasets:
+        row = repo.dataset_binding(session, dataset)
+        if row is not None and not row.visa_value:
+            reasons.append(f"{dataset} has no visa value on this node, so no "
+                           f"{required_visa} visa can match it. Set it on the "
+                           f"Datasets page.")
+    return reasons
+
+
+def _request_panel(session, request, required_visa=None):
+    has_run = request.verdict == Verdict.ACCEPTED.value and request.run_id is not None
     return {"id": request.request_id, "expires": fmt.minute(request.not_after),
             "marks": _check_marks(request), "run_id": request.run_id if has_run else None,
             "refused": request.verdict == Verdict.REFUSED.value,
-            "joined": request.joined_request_id}
+            "repeats": _repeats(request),
+            "reasons": _visa_reasons(session, request, required_visa)}
 
 
-FILTERS = {"all": None, "accepted": (Verdict.ACCEPTED, Verdict.JOINED),
+FILTERS = {"all": None, "accepted": (Verdict.ACCEPTED,),
            "refused": (Verdict.REFUSED,)}
 
 
-def requests_page(session, now, shown="all", selected=None):
+def requests_page(session, now, shown="all", selected=None, required_visa=None):
     since = now - timedelta(hours=24)
     everything = repo.requests_since(session, since)
     counts = {"all": len(everything),
@@ -588,7 +611,8 @@ def requests_page(session, now, shown="all", selected=None):
                      ("accepted", f'Accepted {counts["accepted"]}'),
                      ("refused", f'Refused {counts["refused"]}')],
             "rows": [_request_row(session, row) for row in rows],
-            "panel": _request_panel(session, chosen) if chosen else None}
+            "panel": (_request_panel(session, chosen, required_visa) if chosen
+                      else None)}
 
 
 # Datasets

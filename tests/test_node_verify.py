@@ -1,4 +1,4 @@
-"""One test per check of section 6.3, plus the join, with real keys and signatures."""
+"""One test per check of section 6.3, plus repeats, with real keys and signatures."""
 
 import json
 import time
@@ -16,11 +16,14 @@ from node import age, decisions, requests, verify
 from node.keys import generate
 from node.requests import RequestError, VisaCheck
 from store import db, repo
+from sqlmodel import delete
+
 from store.errors import NotFound
+from store.models import Request
 from store.states import BindingSource
 from store.states import RefusalCode as Code
+from node.verify import Outcome
 from store.states import SubjectType
-from store.states import Verdict as Outcome
 from tests.fixtures.federation import (WORKFLOW, Member, signed_request,
                                        workflow_digest)
 from tests.store_support import NOW, fresh_database
@@ -30,6 +33,7 @@ MEMBER = Member()
 NODE = "node-a"
 ISSUER = "https://visas.test"
 LS_AAI = "m-01@lifescience-ri.eu"
+VALUE = "https://dac.test/datasets/EGAD1"
 RECIPIENT = age.recipient(KEYS)
 NO_VISA = VisaCheck(None)
 
@@ -43,7 +47,7 @@ class VisaIssuer:
         document = {"keys": [{**entry, "kid": "v1", "alg": "ES256", "use": "sig"}]}
         return passports.KeySet("https://visas.test/jwks", fetch=lambda url: document)
 
-    def visa(self, value="EGAD1", sub=LS_AAI, type="ControlledAccessGrants"):
+    def visa(self, value=VALUE, sub=LS_AAI, type="ControlledAccessGrants"):
         now = int(time.time())
         claims = {"iss": ISSUER, "sub": sub, "exp": now + 300, "iat": now,
                   "ga4gh_visa_v1": {"type": type, "value": value}}
@@ -76,7 +80,8 @@ def engine(tmp_path, monkeypatch):
         repo.approve_workflow_version(session, workflow.id, now=NOW)
         repo.bind_dataset(session, dataset_id="EGAD1",
                           source=BindingSource.CONFIG,
-                          type="localpath", location="x", bound_by="config", now=NOW)
+                          type="localpath", location="x", visa_value=VALUE,
+                          bound_by="config", now=NOW)
     return bind
 
 
@@ -188,43 +193,143 @@ def test_5_expiring_this_very_moment_is_expired(engine):
     assert run(engine, not_after=NOW).failed_check is Code.EXPIRED
 
 
-# 6 seen before
+# 6 seen before: the same request_id
 
 
-def again(engine, first_fields=None, **second):
-    first = run(engine, **{"request_id": "req_1", **(first_fields or {})})
-    return first, run(engine, request_id="req_2", **second)
+def deliver(engine, visas=NO_VISA, signer=MEMBER, at=NOW, **fields):
+    raw = signed_request(signer, RECIPIENT, now=NOW, **fields)
+    with db.writing(engine) as session:
+        return requests.deliver(session, KEYS, raw, node=NODE, visas=visas, now=at)
 
 
-def test_6_a_repeat_of_an_accepted_request_joins(engine):
+def stored(engine, request_id="req_1"):
+    with db.reading(engine) as session:
+        return repo.get_request(session, request_id)
+
+
+def refusals(engine, request_id="req_1"):
+    with db.reading(engine) as session:
+        return repo.decisions_about(session, SubjectType.REQUEST, request_id)
+
+
+def test_6_the_same_request_again_joins_its_run(engine):
+    deliver(engine)
+    with db.writing(engine) as session:
+        repo.get_request(session, "req_1").run_id = "run_1"
+    # Signed and encrypted again, so other bytes: the same signed request.
+    later = NOW + timedelta(minutes=5)
+    joined = deliver(engine, at=later)
+    assert joined.outcome is Outcome.JOINED
+    assert (joined.repeat_of, joined.run_id, joined.payload) == ("req_1", "run_1", None)
+    row = stored(engine)
+    assert (row.verdict, row.repeats, row.last_repeat_at) == ("accepted", 1, later)
+
+
+def test_6_every_repeat_is_counted(engine):
+    for _ in range(3):
+        deliver(engine)
+    assert stored(engine).repeats == 2
+
+
+def test_6_a_repeat_writes_no_decision(engine):
+    deliver(engine)
+    deliver(engine)
+    assert refusals(engine) == []
+
+
+def test_6_a_repeat_of_a_refusal_gets_the_same_refusal(engine):
+    deliver(engine, datasets=("EGAD2",))
+    again = deliver(engine, datasets=("EGAD2",))
+    assert (again.outcome, again.failed_check, again.repeat_of) == (
+        Outcome.REFUSED, Code.DATASET_NOT_BOUND, "req_1")
+    assert stored(engine).repeats == 1
+    assert len(refusals(engine)) == 1
+
+
+def test_6_the_refusal_stands_even_when_its_reason_has_gone(engine):
+    deliver(engine, datasets=("EGAD2",))
+    with db.writing(engine) as session:
+        repo.bind_dataset(session, dataset_id="EGAD2", source=BindingSource.CONFIG,
+                          type="localpath", location="y", bound_by="config", now=NOW)
+    again = deliver(engine, datasets=("EGAD2",))
+    assert again.failed_check is Code.DATASET_NOT_BOUND
+    assert stored(engine).verdict == "refused"
+
+
+def test_6_a_new_request_id_is_a_new_request_with_the_same_payload(engine):
+    plain = json.dumps({"visas": [], "workflow": WORKFLOW}).encode()
+    deliver(engine, plaintext=plain, datasets=("EGAD2",))
+    fresh = deliver(engine, request_id="req_2", plaintext=plain)
+    assert (fresh.outcome, fresh.repeat_of) == (Outcome.ACCEPTED, None)
+    assert stored(engine, "req_2").verdict == "accepted"
+
+
+def test_6_another_signed_request_under_the_same_id_is_a_replay(engine):
+    deliver(engine)
+    replay = deliver(engine, datasets=("EGAD1", "EGAD2"))
+    assert (replay.outcome, replay.failed_check, replay.repeat_of) == (
+        Outcome.REFUSED, Code.REPLAY, None)
+    row = stored(engine)
+    assert (row.verdict, row.datasets, row.repeats) == ("accepted", ["EGAD1"], 0)
+    signed = refusals(engine)[0]
+    assert (signed.action, signed.reason) == ("refuse", "replay")
+
+
+def test_6_a_forgery_under_the_same_id_changes_nothing_and_signs_nothing(engine):
+    deliver(engine)
+    forged = deliver(engine, signer=Member())
+    assert forged.failed_check is Code.BAD_SIGNATURE
+    assert stored(engine).repeats == 0
+    assert refusals(engine) == []
+
+
+def test_6_after_not_after_a_repeat_is_expired_not_joined(engine):
+    deliver(engine)
+    late = deliver(engine, at=NOW + timedelta(hours=2))
+    assert (late.failed_check, late.repeat_of) == (Code.EXPIRED, None)
+    row = stored(engine)
+    assert (row.verdict, row.repeats) == ("accepted", 0)
+    assert refusals(engine) == []
+
+
+def test_6_a_request_received_and_never_checked_is_checked_first(engine):
+    with db.writing(engine) as session:
+        requests.receive(session, signed_request(MEMBER, RECIPIENT, now=NOW), now=NOW)
+    again = deliver(engine)
+    assert again.outcome is Outcome.JOINED
+    assert (stored(engine).verdict, stored(engine).repeats) == ("accepted", 1)
+
+
+def test_6_every_repeat_writes_an_audit_event(engine, tmp_path):
+    deliver(engine)
+    deliver(engine)
+    deliver(engine, datasets=("EGAD9",))
+    events = [row for row in audit.read(str(tmp_path / "audit.jsonl"))
+              if row["event"] == "node.request.checked"]
+    assert [(row["verdict"], row["failed_check"], row.get("repeat_of")) for row in events
+            ] == [("accepted", None, None), ("joined", None, "req_1"),
+                  ("refused", "replay", None)]
+    assert [row.get("repeat", False) for row in events] == [False, True, True]
+
+
+def test_6_verify_on_a_repeat_before_its_first_check_is_refused(engine):
     raw = signed_request(MEMBER, RECIPIENT, now=NOW)
     with db.writing(engine) as session:
         requests.receive(session, raw, now=NOW)
-        requests.check(session, KEYS, "req_1", node=NODE, visas=NO_VISA, now=NOW)
-        session.flush()
-        repo.get_request(session, "req_1").run_id = "run_1"
-    joined = run(engine, request_id="req_2")
-    assert joined.outcome is Outcome.JOINED
-    assert (joined.joined_request_id, joined.run_id) == ("req_1", "run_1")
-    assert joined.payload is None
+        delivery = repo.request_as_delivered(**requests._fields(raw), raw=raw, now=NOW)
+        with pytest.raises(ValueError, match="checked before"):
+            verify.verify(delivery, session, KEYS, NOW, node=NODE, visas=NO_VISA)
 
 
-def test_6_a_repeat_of_a_join_joins_the_first(engine):
-    _, second = again(engine)
-    third = run(engine, request_id="req_3")
-    assert third.joined_request_id == "req_1"
-
-
-def test_6_a_join_is_not_refused_and_writes_no_decision(engine):
-    again(engine)
-    with db.reading(engine) as session:
-        assert repo.decisions_about(session, SubjectType.REQUEST, "req_2") == []
-
-
-def test_6_a_repeat_of_a_refused_request_is_a_replay(engine):
-    plain = json.dumps({"visas": [], "workflow": {"different": True}}).encode()
-    run(engine, plaintext=plain)
-    assert run(engine, request_id="req_2", plaintext=plain).failed_check is Code.REPLAY
+@pytest.mark.parametrize("raw", [b'{"job_request": {"request_id": ""}}',
+                                 b'{"job_request": {"request_id": 5}}'])
+def test_6_a_delivery_with_no_request_id_is_no_request(engine, raw):
+    document = json.loads(signed_request(MEMBER, RECIPIENT, now=NOW))
+    document["job_request"]["request_id"] = json.loads(raw)["job_request"]["request_id"]
+    with pytest.raises(RequestError):
+        with db.writing(engine) as session:
+            requests.deliver(session, KEYS, json.dumps(document).encode(), node=NODE,
+                             visas=NO_VISA, now=NOW)
 
 
 # 7 cannot_decrypt
@@ -294,7 +399,50 @@ def test_9_the_right_visa_passes(engine):
 
 
 def test_9_a_visa_for_another_dataset(engine):
-    assert run_tokens(engine, [VISAS.visa(value="EGAD2")]).failed_check is Code.VISA_MISSING
+    other = "https://dac.test/datasets/EGAD2"
+    assert run_tokens(engine, [VISAS.visa(value=other)]).failed_check is Code.VISA_MISSING
+
+
+def test_9_a_visa_carrying_the_dataset_id_is_not_the_visa_value(engine):
+    assert run_tokens(engine, [VISAS.visa(value="EGAD1")]).failed_check is (
+        Code.VISA_MISSING)
+
+
+def test_9_the_comparison_is_exact(engine):
+    for near in (VALUE + "/", VALUE.upper(), VALUE.replace("https", "http")):
+        with db.writing(engine) as session:
+            session.exec(delete(Request))
+        assert run_tokens(engine, [VISAS.visa(value=near)]).failed_check is (
+            Code.VISA_MISSING), near
+
+
+def test_9_a_binding_with_no_visa_value_refuses_every_visa(engine):
+    with db.writing(engine) as session:
+        repo.dataset_binding(session, "EGAD1").visa_value = None
+    assert run_tokens(engine, [VISAS.visa()]).failed_check is Code.VISA_MISSING
+
+
+def test_9_a_visa_with_no_value_does_not_match_a_binding_with_none(engine):
+    with db.writing(engine) as session:
+        repo.dataset_binding(session, "EGAD1").visa_value = None
+    assert run_tokens(engine, [VISAS.visa(value=None)]).failed_check is (
+        Code.VISA_MISSING)
+
+
+def test_9_a_binding_with_no_visa_value_is_fine_where_no_visa_is_required(engine):
+    with db.writing(engine) as session:
+        repo.dataset_binding(session, "EGAD1").visa_value = None
+    assert run(engine).outcome is Outcome.ACCEPTED
+
+
+def test_9_an_unbound_dataset_is_left_to_check_10(engine):
+    raw = signed_request(MEMBER, RECIPIENT, now=NOW, visas=[VISAS.visa()],
+                         datasets=("EGAD1", "EGAD2"))
+    with db.writing(engine) as session:
+        requests.receive(session, raw, now=NOW)
+        result = requests.check(session, KEYS, "req_1", node=NODE, visas=REQUIRED,
+                                now=NOW)
+    assert result.failed_check is Code.DATASET_NOT_BOUND
 
 
 def test_9_a_visa_issued_to_someone_else(engine):
@@ -315,8 +463,13 @@ def test_9_a_visa_from_an_issuer_nobody_trusts(engine):
 
 
 def test_9_every_dataset_needs_its_own_visa():
-    allowed = REQUIRED.allow([VISAS.visa()], LS_AAI, ["EGAD1", "EGAD2"])
+    allowed = REQUIRED.allow([VISAS.visa()], LS_AAI,
+                             [VALUE, "https://dac.test/datasets/EGAD2"])
     assert allowed is False
+
+
+def test_9_a_missing_value_among_several_refuses():
+    assert REQUIRED.allow([VISAS.visa()], LS_AAI, [VALUE, None]) is False
 
 
 def test_9_requiring_a_visa_with_no_issuer_is_refused():

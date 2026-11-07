@@ -13,6 +13,13 @@ each is an assumption here until the API settles it:
 - `payload_digest` is over the decrypted bytes;
 - the payload is JSON with `visas`, a list of JWTs, and `workflow`, whose digest
   is over its RFC 8785 form.
+
+Check 6 is about the request_id, which the member signs. The same request_id
+delivered again joins the run when the first was accepted and gets the same
+refusal when it was refused, whatever has changed since: a refused request is
+sent again under a new request_id. A new request_id is a new request, even with
+the same payload. The same request_id on a different signed request is a replay.
+Check 5 comes first, so `not_after` is how long a request_id is held to this.
 """
 
 import base64
@@ -21,6 +28,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Optional
 
 import pyrage
@@ -31,15 +39,22 @@ from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 from node import age, decisions
 from store import repo
-from store.states import RefusalCode, VersionState
-from store.states import Verdict as Outcome
+from store.states import RefusalCode, Verdict, VersionState
+
+
+class Outcome(str, Enum):
+    """What a delivery gets. Only a new request's verdict is stored."""
+    ACCEPTED = Verdict.ACCEPTED.value
+    REFUSED = Verdict.REFUSED.value
+    JOINED = "joined"
 
 
 @dataclass(frozen=True)
 class Result:
     outcome: Outcome
     failed_check: Optional[RefusalCode] = None
-    joined_request_id: Optional[str] = None
+    repeat_of: Optional[str] = None
+    """Set when this is the same request again, joined or refused as before."""
     run_id: Optional[str] = None
     payload: Any = None
     """Only on acceptance, in memory, for starting the run. Never stored."""
@@ -148,8 +163,40 @@ def _member_id(request, session):
     return None
 
 
+def _signed_part(raw):
+    try:
+        return json.loads(raw)["job_request"]
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def _repeat(seen, document):
+    """Check 6 for a request_id already here."""
+    if seen.verdict is None:
+        raise ValueError(f"{seen.request_id} has to be checked before its repeats")
+    if _signed_part(seen.raw) != document.get("job_request"):
+        return _refused(RefusalCode.REPLAY)
+    if seen.verdict == Verdict.REFUSED.value:
+        return Result(Outcome.REFUSED, failed_check=RefusalCode(seen.failed_check),
+                      repeat_of=seen.request_id)
+    return Result(Outcome.JOINED, repeat_of=seen.request_id, run_id=seen.run_id)
+
+
+def _visa_values(request, session):
+    """The visa value of each named dataset that is bound, None where it has none.
+
+    An unbound dataset is left to check 10, which says what is wrong with it.
+    """
+    bindings = [repo.dataset_binding(session, dataset) for dataset in request.datasets]
+    return [row.visa_value for row in bindings if row is not None]
+
+
 def verify(request, store, keys, now, *, node, visas):
-    """The verdict on one request. `store` is a session, and is only read."""
+    """The verdict on one request. `store` is a session, and is only read.
+
+    `request` is the stored row of a new request, or the unstored delivery of one
+    already here (repo.request_as_delivered), which check 6 tells apart.
+    """
     session = store
     document = _document(request)
 
@@ -164,14 +211,9 @@ def verify(request, store, keys, now, *, node, visas):
     if request.not_after <= now:
         return _refused(RefusalCode.EXPIRED)
 
-    earlier = repo.first_with_payload(session, request.payload_digest,
-                                      excluding=request.request_id)
-    if earlier is not None:
-        if earlier.verdict == Outcome.REFUSED.value:
-            return _refused(RefusalCode.REPLAY)
-        # The earliest one, so never itself a join.
-        return Result(Outcome.JOINED, joined_request_id=earlier.request_id,
-                      run_id=earlier.run_id)
+    seen = repo.find_request(session, request.request_id)
+    if seen is not None and seen is not request:
+        return _repeat(seen, document)
 
     payload = _decrypted(document, request, keys)
     if payload is None:
@@ -179,7 +221,7 @@ def verify(request, store, keys, now, *, node, visas):
     if _workflow_digest(payload) != request.workflow_digest:
         return _refused(RefusalCode.HASH_MISMATCH)
     if not visas.allow(payload.get("visas"), _member_id(request, session),
-                       request.datasets):
+                       _visa_values(request, session)):
         return _refused(RefusalCode.VISA_MISSING)
     if any(repo.dataset_binding(session, dataset) is None
            for dataset in request.datasets):

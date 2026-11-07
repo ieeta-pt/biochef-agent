@@ -35,12 +35,14 @@
       </div>
       <ol class="m-0 flex list-none flex-col gap-1.5 p-0 text-[13px]">
         {% for mark, text in panel.marks %}
-        <li class="flex gap-2 {{ {'passed': 'text-ok', 'failed': 'text-bad font-medium', 'joined': 'text-brand-deep', 'not_reached': 'text-muted', 'waiting': 'text-muted'}[mark] }}">
-          <span aria-hidden="true">{{ {'passed': '✓', 'failed': '✗', 'joined': '↻', 'not_reached': '·', 'waiting': '·'}[mark] }}</span>
-          <span>{{ text }}{% if mark == 'not_reached' %} · not reached{% elif mark == 'joined' %} · repeated, joined {{ panel.joined }}{% elif mark == 'waiting' %} · not checked yet{% endif %}</span>
+        <li class="flex gap-2 {{ {'passed': 'text-ok', 'failed': 'text-bad font-medium', 'not_reached': 'text-muted', 'waiting': 'text-muted'}[mark] }}">
+          <span aria-hidden="true">{{ {'passed': '✓', 'failed': '✗', 'not_reached': '·', 'waiting': '·'}[mark] }}</span>
+          <span>{{ text }}{% if mark == 'not_reached' %} · not reached{% elif mark == 'waiting' %} · not checked yet{% endif %}</span>
         </li>
         {% endfor %}
       </ol>
+      {% for reason in panel.reasons %}<p class="m-0 text-[13px] text-bad">{{ reason }}</p>{% endfor %}
+      {% if panel.repeats %}<p class="m-0 text-[13px] text-brand-deep"><span aria-hidden="true">↻ </span>{{ panel.repeats }}</p>{% endif %}
       {% if panel.run_id %}<span class="mono text-[13px]">Run {{ panel.run_id }}</span>{% endif %}
       {% if panel.refused %}<p class="m-0 text-[13px] text-muted">The refusal is signed with the node key and sent to the coordinator, so the requester sees why.</p>{% endif %}
     </aside>

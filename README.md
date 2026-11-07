@@ -534,7 +534,7 @@ Everything the page loads is served by the agent: htmx, the fonts and the styles
 
 ## Requests
 
-A request is checked in the ten steps of the specification (section 6.3), and the first failure stops the rest. Every verdict writes an audit event, and a refusal is also a signed decision. A repeat of an accepted request joins its run instead of running again, and a repeat of a refused one is refused as a replay. `BIOCHEF_PASSPORT_REQUIRE_VISA` names the visa type required for each dataset, and the visa's value must be the dataset id, its subject the member, and its issuer one of `BIOCHEF_PASSPORT_VISA_ISSUERS`.
+A request is checked in the ten steps of the specification (section 6.3), and the first failure stops the rest. Every verdict writes an audit event, and a refusal is also a signed decision. A repeat is the same `request_id`, which the member signs: delivered again, it joins the run of an accepted request and gets the same refusal as a refused one, and only a count is kept. A new `request_id` is a new request even with the same payload, and the same `request_id` on a different signed request is refused as `replay`. Check 5 comes first, so a request_id is held to this until its `not_after`. `BIOCHEF_PASSPORT_REQUIRE_VISA` names the visa type required for each dataset, and the visa's value must be exactly the `visa_value` of the dataset's binding, its subject the member, and its issuer one of `BIOCHEF_PASSPORT_VISA_ISSUERS`. A binding with no `visa_value` matches no visa.
 
 The payload is decrypted with `pyrage`, and an accepted payload is kept in memory only.
 

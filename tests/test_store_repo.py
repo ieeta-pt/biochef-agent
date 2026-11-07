@@ -537,8 +537,6 @@ def test_a_request_naming_an_unknown_study_version_is_still_recorded(engine):
 @pytest.mark.parametrize("verdict,kwargs", [
     (Verdict.REFUSED, {}),
     (Verdict.ACCEPTED, {"failed_check": "expired"}),
-    (Verdict.JOINED, {}),
-    (Verdict.ACCEPTED, {"joined_request_id": "req_0"}),
 ])
 def test_verdicts_that_make_no_sense_are_refused(engine, verdict, kwargs):
     with db.writing(engine) as session:
@@ -566,23 +564,44 @@ def test_a_verdict_is_final(engine):
                              failed_check="expired")
 
 
-def test_a_repeat_finds_the_request_it_repeats(engine):
+def test_a_repeat_is_counted_and_changes_no_verdict(engine):
     with db.writing(engine) as session:
-        add_request(session, "req_1", payload="sha256:same")
+        add_request(session, "req_1")
         repo.set_verdict(session, "req_1", Verdict.ACCEPTED, run_id="run_1")
-        add_request(session, "req_2", payload="sha256:same")
-        found = repo.first_with_payload(session, "sha256:same", excluding="req_2")
-        assert found.request_id == "req_1"
-        repo.set_verdict(session, "req_2", Verdict.JOINED,
-                         joined_request_id="req_1", run_id="run_1")
+        repo.note_repeat(session, "req_1", now=NOW)
+        repo.note_repeat(session, "req_1", now=NOW)
+    with db.reading(engine) as session:
+        row = repo.get_request(session, "req_1")
+    assert (row.verdict, row.run_id, row.repeats, row.last_repeat_at) == (
+        "accepted", "run_1", 2, NOW)
 
 
-def test_a_request_not_yet_checked_is_not_a_repeat_target(engine):
+def test_a_request_not_yet_checked_has_no_repeats(engine):
     with db.writing(engine) as session:
-        add_request(session, "req_1", payload="sha256:same")
-        add_request(session, "req_2", payload="sha256:same")
-        assert repo.first_with_payload(session, "sha256:same",
-                                       excluding="req_2") is None
+        add_request(session, "req_1")
+    with pytest.raises(Conflict, match="not been checked"):
+        with db.writing(engine) as session:
+            repo.note_repeat(session, "req_1", now=NOW)
+
+
+def test_a_delivery_is_never_stored(engine):
+    with db.writing(engine) as session:
+        add_request(session, "req_1")
+        stored = repo.get_request(session, "req_1")
+        delivery = repo.request_as_delivered(
+            request_id="req_1", study_id="st", study_version=1,
+            study_digest="sha256:st", workflow_digest="sha256:w", member="m",
+            node="n", datasets=[], not_after=NOW, payload_digest="sha256:p",
+            raw=b"other", now=NOW)
+        assert delivery is not stored
+        assert repo.find_request(session, "req_1") is stored
+    with db.reading(engine) as session:
+        assert repo.get_request(session, "req_1").raw != b"other"
+
+
+def test_finding_a_request_that_is_not_there(engine):
+    with db.reading(engine) as session:
+        assert repo.find_request(session, "req_x") is None
 
 
 def test_the_same_request_id_with_other_bytes_is_refused(engine):

@@ -14,7 +14,8 @@ def _data(request, shown, selected):
     if shown not in FILTERS:
         raise HTTPException(status_code=404)
     with db.reading(bind_of(request)) as session:
-        return requests_page(session, repo.utcnow(), shown, selected)
+        return requests_page(session, repo.utcnow(), shown, selected,
+                             request.app.state.settings.required_visa)
 
 
 @router.get("/ui/requests")
