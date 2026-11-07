@@ -252,7 +252,11 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_PASSPORT_REQUIRE_VISA` | *(unset)* | a visa type a caller must hold to be let in |
 | `BIOCHEF_PASSPORT_REQUIRE_VISA_VALUE` | *(unset)* | the exact value that visa must carry |
 | `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess`, `apptainer` or `podman` |
-| `BIOCHEF_PODMAN_SELINUX` | | `disable` or `keep`, required with `podman`, see [Running it](#running-it) |
+| `BIOCHEF_PODMAN_MODE` | | `rootless` or `rootful`, required with `podman`, see [Running it](#running-it) |
+| `BIOCHEF_PODMAN_SELINUX` | | `disable` or `keep`, required with rootless `podman` |
+| `BIOCHEF_STEP_PIDS` | | the most processes a step may have, required with rootless `podman` |
+| `BIOCHEF_STEP_MEMORY` | | the most memory a step may use, such as `4g`, with no swap past it, required with rootless `podman` |
+| `BIOCHEF_PODMAN_HELPER` | | the absolute path of the installed `podman-step-root`, required with rootful `podman` |
 | `BIOCHEF_CONTAINER_IMAGE` | `docker://debian:stable-slim` | image each step runs in, under the `apptainer` runner |
 | `BIOCHEF_APPTAINER_CACHE` | `apptainer-cache` | where pulled container images are kept between runs |
 | `BIOCHEF_APPTAINER_ARGS` | `--contain --cleanenv --net --network none` | extra flags for apptainer itself |
@@ -350,11 +354,40 @@ not, and base-image security updates never arrive. A digest —
 which is the only way that cache invalidates. Deleting `apptainer-cache/` forces
 a re-pull in the meantime.
 
-`BIOCHEF_RUNNER=podman` runs each step with podman instead, through the `podman-step` script, which Snakemake uses as the shell for its rules. It needs a `docker://` image. Its steps have `--network=none`, a fixed choice with no setting, no capabilities and only the run's workspace mounted, and rootless podman keeps the agent's user. A container that a killed run leaves behind is removed afterwards.
+`BIOCHEF_RUNNER=podman` runs each step with podman instead, through the `podman-step` script, which Snakemake uses as the shell for its rules. It needs a `docker://` image. Its steps have `--network=none`, a fixed choice with no setting, no capabilities, `no-new-privileges`, a read-only root filesystem with a fresh `/tmp`, limits on processes and memory with no swap past the memory limit, and only the run's workspace mounted. A container that a killed run leaves behind is removed afterwards. The agent refuses to start as root with this runner.
 
-`BIOCHEF_PODMAN_SELINUX` must be set with this runner, and the agent refuses to start without it, because the right value depends on the host:
+`BIOCHEF_PODMAN_MODE` must be set, with no default:
 
-- `disable` runs each step with `--security-opt=label=disable`: no SELinux separation for the container, and the workspace mount works without relabelling anything. The other confinements stay: no network, no capabilities, `no-new-privileges`, the user namespace and only the run's workspace mounted.
+- `rootless` runs podman as the agent's user, and each step keeps that user. `BIOCHEF_PODMAN_SELINUX`, `BIOCHEF_STEP_PIDS` and `BIOCHEF_STEP_MEMORY` are required.
+- `rootful` is for a host where podman runs as root, such as Debian 11's podman 3.0.1. Under root, `--userns=keep-id` does not keep the agent's user: it becomes the host's user namespace with uid 0, so a step would run as root on the host. The agent still does not run as root. It calls `podman-step-root` through one sudo rule, and each step runs as a dedicated user, never root and never the agent's own.
+
+For `rootful`:
+
+1. Make a group for the steps and put the agent's user in it, and pick a user id for the steps that is neither root nor the agent's. It needs no account.
+2. Install `podman-step-root` owned by root, in a directory owned by root, neither writable by anyone else:
+   `install -o root -g root -m 0755 podman-step-root /usr/local/libexec/biochef-agent/podman-step-root`
+3. Write `/etc/biochef-agent/podman-step.conf`, owned by root and writable only by root, in a directory that is too. The path is fixed in the script. Every key is required, and an unknown or repeated one stops it:
+
+   ```
+   RUN_ROOT=/var/lib/biochef/runs
+   STEP_UID=1601
+   STEP_GID=1600
+   IMAGE=docker://debian:stable-slim
+   PIDS=256
+   MEMORY=4g
+   SELINUX=disable
+   ```
+
+   `RUN_ROOT` must be the agent's `BIOCHEF_RUN_ROOT`, a directory the agent owns, and `IMAGE` its `BIOCHEF_CONTAINER_IMAGE`. Under rootful podman this file decides the user, the image, the limits and SELinux. The agent reads it to check that its own settings agree and refuses to start if they do not, so leave `BIOCHEF_PODMAN_SELINUX`, `BIOCHEF_STEP_PIDS` and `BIOCHEF_STEP_MEMORY` unset or equal to it.
+4. Allow the agent's user exactly that script, and nothing else, in sudoers, then set `BIOCHEF_PODMAN_HELPER` to the same path:
+   `biochef ALL=(root) NOPASSWD: /usr/local/libexec/biochef-agent/podman-step-root`
+5. Install `catatonit` if the distribution has it only as a recommendation of podman, as Debian 11 does: the steps run with `--init`.
+
+The script runs a workspace only if it is a directory directly under `RUN_ROOT`, named by no symlink, owned by the agent's user and in the steps' group. Before a run, the agent puts the workspace in that group and gives the group the owner's permissions. Snakemake and the steps then run with umask `007`, so what they write stays readable by the agent and by nobody else. After a run, the script removes the run's containers and gives everything in the workspace back to the agent's user, whatever modes a step left, so the agent can delete it. CI sets this up in a Debian 11 container with its podman 3.0.1 and checks it for real: the sudo rule, the script's refusals, and from inside a step the user, the read-only root, the limits, a memory overrun, the network and another run's directory (`ci/podman-rootful.sh`).
+
+`BIOCHEF_PODMAN_SELINUX`, or `SELINUX` under rootful, must be set, because the right value depends on the host:
+
+- `disable` runs each step with `--security-opt=label=disable`: no SELinux separation for the container, and the workspace mount works without relabelling anything. The other confinements stay: no network, no capabilities, `no-new-privileges`, the read-only root, the limits, the step's user and only the run's workspace mounted.
 - `keep` leaves podman's SELinux labelling on, so a step runs confined as `container_t`. The workspace is not relabelled, so on a host with SELinux enforcing, the directory runs are made in (`BIOCHEF_RUN_ROOT`) has to carry a label containers may use, such as `container_file_t`, or every step fails with permission denied. On a host without SELinux it changes nothing.
 
 `BIOCHEF_APPTAINER_ARGS` defaults to `--contain --cleanenv --net --network none`. The last two give each step a network namespace with only loopback in it, so a tool cannot send data anywhere. On a host where apptainer refuses them the run fails, because carrying on with the network would be the worse outcome. Without `--contain`, apptainer binds the host's `/tmp` into the container, and that is where a run's directory lives unless `BIOCHEF_RUN_ROOT` says otherwise. Without it, a containerised tool is walled off from `/usr` and `/etc` while still able to read **every other run's data**. Without `--cleanenv`, the tool process also inherits the Agent's environment. Emptying this variable turns both protections off deliberately.

@@ -72,6 +72,13 @@ The image's os-release ID must differ from the runner's ("debian" against
 """
 TIMEOUT_S = int(os.getenv("BIOCHEF_PARITY_TIMEOUT", "600"))
 
+STEP_PIDS = "128"
+STEP_MEMORY = "256m"
+STEP_MEMORY_BYTES = 256 * 1024 ** 2
+ALLOCATE = 2 * STEP_MEMORY_BYTES
+"""The podman limits, and what a step tries to allocate: twice the limit, which
+the host can afford, so that only the limit can stop it."""
+
 INPUT_TEXT = "the quick brown fox\njumps over the lazy dog\n" * 32
 
 # Portable on purpose: this has to behave the same in the image's coreutils
@@ -85,7 +92,17 @@ rule all:
         "neighbour.txt",
         "exec.txt",
         "env_inheritance.txt",
-        "network.txt"
+        "network.txt",
+        "confined.txt"
+
+rule confined:
+    output:
+        o_0="confined.txt"
+    shell:
+        "if touch /usr/biochef-probe 2>/dev/null; then echo writable; "
+        "else echo read-only; fi > {output.o_0}; "
+        "{{ cat /sys/fs/cgroup/pids.max 2>/dev/null || echo none; }} >> {output.o_0}; "
+        "{{ cat /sys/fs/cgroup/memory.max 2>/dev/null || echo none; }} >> {output.o_0}"
 
 rule network:
     output:
@@ -131,6 +148,13 @@ rule env_inheritance:
     shell:
         "if printenv BIOCHEF_PARITY_ENV_PROBE >/dev/null; then echo inherited; "
         "else echo absent; fi > {output.o_0}"
+'''
+
+
+OVERRUN = f'''
+rule overrun:
+    output: "overrun.txt"
+    shell: "head -c {ALLOCATE} /dev/zero | tail > /dev/null; echo survived > {{output}}"
 '''
 
 
@@ -201,8 +225,10 @@ def main():
         # Both settings, so that neither stops a step from working. The runner
         # has no SELinux, so this proves the flags and the isolation, not what
         # an enforcing host does with the labels.
-        ("podman", PodmanRunner(image=IMAGE, selinux="disable")),
-        ("podman-keep", PodmanRunner(image=IMAGE, selinux="keep")),
+        ("podman", PodmanRunner(image=IMAGE, selinux="disable", mode="rootless",
+                                pids=STEP_PIDS, memory=STEP_MEMORY)),
+        ("podman-keep", PodmanRunner(image=IMAGE, selinux="keep", mode="rootless",
+                                     pids=STEP_PIDS, memory=STEP_MEMORY)),
     ]
 
     outcomes = {}
@@ -218,17 +244,17 @@ def main():
                            _read(ws, "neighbour.txt"), _read(ws, "exec.txt"),
                            _read(ws, "env_inheritance.txt"),
                            _read(ws, "work.stdout"), _read(ws, "work.stderr"),
-                           _read(ws, "network.txt"))
+                           _read(ws, "network.txt"), _read(ws, "confined.txt"))
         print(f"    ran on: {outcomes[label][1].decode().strip()!r}   "
               f"other runs' data: {outcomes[label][2].decode().strip()!r}",
               flush=True)
 
     (plain_result, plain_where, plain_neighbour, plain_exec,
      plain_env_result, plain_log_out, plain_log_err,
-     plain_network) = outcomes["subprocess"]
+     plain_network, plain_confined) = outcomes["subprocess"]
     (boxed_result, boxed_where, boxed_neighbour, boxed_exec,
      boxed_env_result, boxed_log_out, boxed_log_err,
-     boxed_network) = outcomes["apptainer"]
+     boxed_network, boxed_confined) = outcomes["apptainer"]
 
     failures = []
     if plain_result != boxed_result:
@@ -305,7 +331,7 @@ def main():
     # between the runners.
     for label in ("podman", "podman-keep"):
         (pod_result, pod_where, pod_neighbour, pod_exec, pod_env, pod_log_out,
-         pod_log_err, pod_network) = outcomes[label]
+         pod_log_err, pod_network, pod_confined) = outcomes[label]
         if pod_result != plain_result:
             failures.append(f"{label}: outputs differ: {pod_result[:200]!r}")
         if pod_where.strip() == plain_where.strip():
@@ -325,6 +351,27 @@ def main():
         pod_reach, pod_interfaces = pod_network.split()
         if pod_reach != b"unreachable" or int(pod_interfaces) != 0:
             failures.append(f"{label}: a step had the network ({pod_network!r})")
+        # The root filesystem and the limits in the step's own cgroup.
+        if pod_confined.split() != [b"read-only", STEP_PIDS.encode(),
+                                    str(STEP_MEMORY_BYTES).encode()]:
+            failures.append(f"{label}: read-only root, limits and the memory kill: "
+                            f"{pod_confined.split()!r}")
+
+    # And the memory limit enforced: a step that allocates twice its limit does
+    # not finish. A workflow of its own, because the kernel may kill the whole
+    # step rather than only the allocating process.
+    for label, runner in runners:
+        if not label.startswith("podman"):
+            continue
+        ws = _Workspace(tempfile.mkdtemp(dir=root))
+        with open(os.path.join(ws.path, "Snakefile"), "w") as f:
+            f.write(runner.snakefile_preamble() + OVERRUN)
+        outcome = runner.run(ws, timeout_s=TIMEOUT_S)
+        if outcome.returncode == 0 or os.path.exists(os.path.join(ws.path, "overrun.txt")):
+            failures.append(f"{label}: a step that allocated {ALLOCATE} bytes finished")
+        elif "137" not in outcome.stderr:
+            failures.append(f"{label}: the overrun failed, but not by being killed: "
+                            f"{outcome.stderr[-1500:]!r}")
 
     if failures:
         for f in failures:
@@ -339,7 +386,8 @@ def main():
           f"the test environment variable was not inherited; and a step could "
           f"reach the network on the host but only loopback inside; and podman "
           f"kept every one of those promises too, with SELinux labels disabled "
-          f"and kept")
+          f"and kept, and with a read-only root filesystem, the limits applied and a memory "
+          f"overrun killed")
     return 0
 
 
