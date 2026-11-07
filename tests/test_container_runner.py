@@ -38,7 +38,8 @@ if "oras" not in sys.modules:
 
 import pytest
 
-from runner import PROVIDERS, ApptainerRunner, SubprocessRunner, get_runner
+from runner import (PROVIDERS, ApptainerRunner, PodmanRunner, SubprocessRunner,
+                    get_runner)
 
 
 class _Workspace:
@@ -51,7 +52,7 @@ class _Workspace:
 
 
 def test_both_providers_are_available():
-    assert sorted(PROVIDERS) == ["apptainer", "subprocess"]
+    assert set(PROVIDERS) == {"subprocess", "apptainer", "podman"}
     assert isinstance(get_runner("apptainer"), ApptainerRunner)
 
 
@@ -340,3 +341,143 @@ def test_the_subprocess_runner_isolates_nothing():
 
 def test_the_default_isolates_the_network():
     assert ApptainerRunner().isolates_network is True
+
+
+# --------------------------------------------------------------------------
+# podman
+
+
+def test_podman_is_selectable():
+    assert isinstance(get_runner("podman"), PodmanRunner)
+    assert "podman" in PROVIDERS
+
+
+def test_podman_says_it_isolates_the_network():
+    assert PodmanRunner().isolates_network is True
+
+
+def test_podman_steps_run_through_the_wrapper():
+    preamble = PodmanRunner(image="docker://debian:stable-slim").snakefile_preamble()
+    assert 'shell.executable("' in preamble and 'podman-step"' in preamble
+    assert '"docker://debian:stable-slim"' in preamble
+    assert 'shell.prefix("set -euo pipefail; ")' in preamble
+
+
+def test_the_preamble_is_valid_python():
+    compile(PodmanRunner().snakefile_preamble().replace("shell.", "print."), "s", "exec")
+
+
+def test_the_image_cannot_inject_code():
+    with pytest.raises(ValueError):
+        PodmanRunner(image='docker://x"; import os #')
+
+
+@pytest.mark.parametrize("image", ["/images/tool.sif", "oras://x/y", "library://a/b"])
+def test_podman_needs_a_docker_reference(image):
+    with pytest.raises(ValueError, match="docker://"):
+        PodmanRunner(image=image)
+
+
+def test_podman_runs_snakemake_on_the_host():
+    argv = PodmanRunner().command(_Workspace("/ws"))
+    assert argv[0] == "snakemake" and "apptainer" not in " ".join(argv)
+
+
+def test_the_wrapper_cannot_be_given_the_network():
+    from pathlib import Path
+    script = (Path(__file__).resolve().parent.parent / "podman-step").read_text()
+    assert "--network=none" in script
+    assert "BIOCHEF_PODMAN_ARGS" not in script and '"$@"' not in script
+    for flag in ("--cap-drop=all", "--userns=keep-id", "--rm"):
+        assert flag in script
+
+
+def test_the_wrapper_is_executable():
+    import os
+    from pathlib import Path
+    assert os.access(Path(__file__).resolve().parent.parent / "podman-step", os.X_OK)
+
+
+def fake_podman(tmp_path, monkeypatch, listed=""):
+    import os
+    calls = tmp_path / "calls"
+    script = tmp_path / "podman"
+    script.write_text(f'#!/bin/sh\necho "$@" >> {calls}\n'
+                      f'[ "$1" = ps ] && echo {listed}\nexit 0\n')
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    return calls
+
+
+def test_a_step_gets_the_workspace_and_the_command(tmp_path, monkeypatch):
+    import subprocess
+    from pathlib import Path
+    calls = fake_podman(tmp_path, monkeypatch)
+    step = Path(__file__).resolve().parent.parent / "podman-step"
+    ws = tmp_path / "run-1"
+    ws.mkdir()
+    env = {**__import__("os").environ, "BIOCHEF_PODMAN_IMAGE": "docker://debian:x"}
+    subprocess.run([str(step), "-c", "echo hello"], cwd=ws, env=env, check=True)
+    line = calls.read_text()
+    assert "--network=none" in line and "biochef.run=run-1" in line
+    assert f"--volume {ws.resolve()}:{ws.resolve()}" in line or str(ws) in line
+    assert line.rstrip().endswith("docker://debian:x bash -c echo hello")
+
+
+def test_a_step_with_no_image_refuses(tmp_path, monkeypatch):
+    import subprocess
+    from pathlib import Path
+    fake_podman(tmp_path, monkeypatch)
+    step = Path(__file__).resolve().parent.parent / "podman-step"
+    env = {key: value for key, value in __import__("os").environ.items()
+           if key != "BIOCHEF_PODMAN_IMAGE"}
+    assert subprocess.run([str(step), "-c", "true"], cwd=tmp_path, env=env,
+                          capture_output=True).returncode != 0
+
+
+def test_leftover_containers_are_removed(tmp_path, monkeypatch):
+    calls = fake_podman(tmp_path, monkeypatch, listed="abc123")
+    PodmanRunner().after_run(_Workspace("/runs/run-1"))
+    text = calls.read_text()
+    assert "--filter label=biochef.run=run-1" in text
+    assert "rm --force abc123" in text
+
+
+def test_nothing_is_removed_when_nothing_is_left(tmp_path, monkeypatch):
+    calls = fake_podman(tmp_path, monkeypatch, listed="")
+    PodmanRunner().after_run(_Workspace("/runs/run-1"))
+    assert "rm --force" not in calls.read_text()
+
+
+def test_a_missing_podman_does_not_hide_the_result(monkeypatch, tmp_path):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    PodmanRunner().after_run(_Workspace("/runs/run-1"))
+
+
+def test_every_run_ends_with_after_run(tmp_path):
+    seen = []
+
+    class Watching(SubprocessRunner):
+        def command(self, ws):
+            return ["sh", "-c", "exit 3"]
+
+        def after_run(self, ws):
+            seen.append(ws.path)
+
+    workspace = _Workspace(tmp_path)
+    assert Watching().run(workspace, timeout_s=10).returncode == 3
+    assert seen == [str(tmp_path)]
+
+
+def test_after_run_also_follows_a_timeout(tmp_path):
+    seen = []
+
+    class Slow(SubprocessRunner):
+        def command(self, ws):
+            return ["sleep", "30"]
+
+        def after_run(self, ws):
+            seen.append(True)
+
+    Slow().run(_Workspace(tmp_path), timeout_s=1)
+    assert seen == [True]

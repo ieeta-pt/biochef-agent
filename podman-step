@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Runs one Snakemake step in a container. Snakemake has no podman mode, so
+# PodmanRunner makes this script the shell its rules run under, and each rule's
+# command arrives here as `-c <command>`, in the run's workspace.
+#
+# --network=none is here and not a setting: a step reaches nothing, whatever the
+# deployment says. Nothing of the agent's environment is passed in, and only this
+# workspace is mounted, so a step sees neither credentials nor another run.
+#
+# The label is how PodmanRunner finds a container that outlives a killed run.
+set -euo pipefail
+
+if [ "$#" -ne 2 ] || [ "$1" != "-c" ]; then
+    echo "podman-step expects: -c <command>" >&2
+    exit 2
+fi
+
+exec podman run --rm --init --pull=missing \
+    --network=none \
+    --userns=keep-id \
+    --cap-drop=all \
+    --security-opt=no-new-privileges \
+    --security-opt=label=disable \
+    --label "biochef.run=$(basename "$PWD")" \
+    --volume "$PWD:$PWD" \
+    --workdir "$PWD" \
+    "${BIOCHEF_PODMAN_IMAGE:?}" \
+    bash -c "$2" </dev/null

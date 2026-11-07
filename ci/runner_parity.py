@@ -51,7 +51,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from runner import CONTAINER_IMAGE, ApptainerRunner, SubprocessRunner
+from runner import CONTAINER_IMAGE, ApptainerRunner, PodmanRunner, SubprocessRunner
 
 IMAGE = os.getenv("BIOCHEF_PARITY_IMAGE") or CONTAINER_IMAGE
 """The image the service would actually use, not a copy of it.
@@ -174,6 +174,10 @@ def main():
         print("FAIL: neither apptainer nor singularity is on PATH; "
               "this check cannot verify anything", file=sys.stderr)
         return 2
+    if shutil.which("podman") is None:
+        print("FAIL: podman is not on PATH; this check cannot verify anything",
+              file=sys.stderr)
+        return 2
 
     os.environ["BIOCHEF_PARITY_ENV_PROBE"] = "test-value"
 
@@ -194,6 +198,7 @@ def main():
     runners = [
         ("subprocess", SubprocessRunner()),
         ("apptainer", ApptainerRunner(image=IMAGE, cache_dir=cache)),
+        ("podman", PodmanRunner(image=IMAGE)),
     ]
 
     outcomes = {}
@@ -291,6 +296,29 @@ def main():
             f"see only loopback"
         )
 
+    # The same promises from the second container runner. The workflow is the
+    # same, so a difference here is a difference between the runners.
+    (pod_result, pod_where, pod_neighbour, pod_exec, pod_env, pod_log_out,
+     pod_log_err, pod_network) = outcomes["podman"]
+    if pod_result != plain_result:
+        failures.append(f"podman's outputs differ: {pod_result[:200]!r}")
+    if pod_where.strip() == plain_where.strip():
+        failures.append("podman's steps ran on the host's operating system, so the "
+                        "container was never entered")
+    if pod_neighbour.strip() != b"hidden":
+        failures.append("a podman step could read another run's data on the host")
+    if pod_exec.strip() != b"executed-from-workspace":
+        failures.append(f"a file in the workspace did not execute under podman "
+                        f"({pod_exec.strip()!r})")
+    if pod_log_out or pod_log_err.strip() != b"step-stderr-marker":
+        failures.append(f"podman: per-rule log capture failed "
+                        f"(stdout={pod_log_out!r}, stderr={pod_log_err!r})")
+    if pod_env.strip() != b"absent":
+        failures.append("a podman step inherited the test environment variable")
+    pod_reach, pod_interfaces = pod_network.split()
+    if pod_reach != b"unreachable" or int(pod_interfaces) != 0:
+        failures.append(f"a podman step had the network ({pod_network!r})")
+
     if failures:
         for f in failures:
             print(f"FAIL: {f}", file=sys.stderr)
@@ -302,7 +330,8 @@ def main():
           f"a file placed in the workspace executed under both; and another "
           f"run's data was readable on the host but hidden inside it; "
           f"the test environment variable was not inherited; and a step could "
-          f"reach the network on the host but only loopback inside")
+          f"reach the network on the host but only loopback inside; and podman "
+          f"kept every one of those promises too")
     return 0
 
 

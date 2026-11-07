@@ -251,7 +251,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_PASSPORT_VISA_ISSUERS` | *(unset)* | comma-separated issuers whose visas count |
 | `BIOCHEF_PASSPORT_REQUIRE_VISA` | *(unset)* | a visa type a caller must hold to be let in |
 | `BIOCHEF_PASSPORT_REQUIRE_VISA_VALUE` | *(unset)* | the exact value that visa must carry |
-| `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess` or `apptainer` |
+| `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess`, `apptainer` or `podman` |
 | `BIOCHEF_CONTAINER_IMAGE` | `docker://debian:stable-slim` | image each step runs in, under the `apptainer` runner |
 | `BIOCHEF_APPTAINER_CACHE` | `apptainer-cache` | where pulled container images are kept between runs |
 | `BIOCHEF_APPTAINER_ARGS` | `--contain --cleanenv --net --network none` | extra flags for apptainer itself |
@@ -348,6 +348,8 @@ not, and base-image security updates never arrive. A digest —
 `docker://debian@sha256:…` — makes the reference change when the image does,
 which is the only way that cache invalidates. Deleting `apptainer-cache/` forces
 a re-pull in the meantime.
+
+`BIOCHEF_RUNNER=podman` runs each step with podman instead, through the `podman-step` script, which Snakemake uses as the shell for its rules. It needs a `docker://` image. Its steps have `--network=none`, a fixed choice with no setting, no capabilities and only the run's workspace mounted, and rootless podman keeps the agent's user. A container that a killed run leaves behind is removed afterwards.
 
 `BIOCHEF_APPTAINER_ARGS` defaults to `--contain --cleanenv --net --network none`. The last two give each step a network namespace with only loopback in it, so a tool cannot send data anywhere. On a host where apptainer refuses them the run fails, because carrying on with the network would be the worse outcome. Without `--contain`, apptainer binds the host's `/tmp` into the container, and that is where a run's directory lives unless `BIOCHEF_RUN_ROOT` says otherwise. Without it, a containerised tool is walled off from `/usr` and `/etc` while still able to read **every other run's data**. Without `--cleanenv`, the tool process also inherits the Agent's environment. Emptying this variable turns both protections off deliberately.
 
