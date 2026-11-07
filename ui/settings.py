@@ -47,6 +47,9 @@ class Settings:
     dev_user: str | None = None
     policy_engine_url: str | None = None
     required_visa: str | None = None
+    local_root: str | None = None
+    bindings_file: str | None = None
+    bindings_from_ui: bool = False
 
     @property
     def secure_cookies(self):
@@ -101,6 +104,32 @@ def _policy_engine(value):
     return value
 
 
+def _flag(value, name):
+    if value in (None, "false"):
+        return False
+    if value == "true":
+        return True
+    raise SettingsError(f"{name} must be true or false, not {value!r}")
+
+
+def _bindings():
+    """The dataset settings. Bindings need the source that can read them."""
+    from_ui = _flag(_setting(os.getenv("BIOCHEF_DATASET_BINDINGS_FROM_UI")),
+                    "BIOCHEF_DATASET_BINDINGS_FROM_UI")
+    bindings_file = _setting(os.getenv("BIOCHEF_DATASET_BINDINGS_FILE"))
+    root = _setting(os.getenv("BIOCHEF_LOCAL_ROOT"))
+    if from_ui or bindings_file:
+        sources = os.getenv("BIOCHEF_DATA_SOURCES") or ""
+        if "localpath" not in [item.strip() for item in sources.split(",")]:
+            raise SettingsError("dataset bindings need localpath in "
+                                "BIOCHEF_DATA_SOURCES")
+        if root is None or not os.path.isdir(root):
+            raise SettingsError("dataset bindings need BIOCHEF_LOCAL_ROOT set to "
+                                "an existing directory")
+    return {"local_root": root, "bindings_file": bindings_file,
+            "bindings_from_ui": from_ui}
+
+
 def load():
     """The settings of this process, read from the environment."""
     mode = _setting(os.getenv("BIOCHEF_UI_IDENTITY"))
@@ -122,6 +151,7 @@ def load():
         "policy_engine_url": _policy_engine(
             _setting(os.getenv("BIOCHEF_POLICY_ENGINE_URL"))),
         "required_visa": _setting(os.getenv("BIOCHEF_PASSPORT_REQUIRE_VISA")),
+        **_bindings(),
     }
 
     if mode == HEADER:

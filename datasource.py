@@ -23,6 +23,25 @@ class DataSourceError(Exception):
     """An input could not be obtained. The client's problem, not the service's."""
 
 
+def resolve_under_root(root, path):
+    """The real path of `path` under `root`, or a refusal.
+
+    The one place this rule lives, for a file a run reads and a folder a binding
+    names alike.
+
+    Resolved and then checked against the root, rather than checked and then
+    resolved. A symlink inside the root pointing outside it passes any test done
+    on the path as written.
+    """
+    if "\x00" in path:
+        raise DataSourceError(f"{path!r} contains a NUL byte")
+    root = os.path.realpath(root)
+    resolved = os.path.realpath(os.path.join(root, path))
+    if resolved != root and not resolved.startswith(root + os.sep):
+        raise DataSourceError(f"{path!r} resolves outside BIOCHEF_LOCAL_ROOT")
+    return resolved
+
+
 class DataSource:
     """A way of getting one named input into a run's workspace."""
 
@@ -160,17 +179,10 @@ class LocalPathSource(DataSource):
                 f"{type(spec).__name__}"
             )
 
-        if "\x00" in spec:
-            raise DataSourceError(f"{name!r}: the localpath path contains a NUL byte")
-
-        # Resolved and then checked against the root, rather than checked and
-        # then resolved. A symlink inside the root pointing outside it passes
-        # any test done on the path as written.
-        resolved = os.path.realpath(os.path.join(self.root, spec))
-        if resolved != self.root and not resolved.startswith(self.root + os.sep):
-            raise DataSourceError(
-                f"{name!r}: {spec!r} resolves outside BIOCHEF_LOCAL_ROOT"
-            )
+        try:
+            resolved = resolve_under_root(self.root, spec)
+        except DataSourceError as refused:
+            raise DataSourceError(f"{name!r}: {refused}") from None
 
         if not os.path.isfile(resolved):
             raise DataSourceError(f"{name!r}: {spec!r} is not a file")
