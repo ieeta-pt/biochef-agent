@@ -213,12 +213,12 @@ def test_no_interface_but_loopback_passes(tmp_path):
 
 def test_an_interface_up_fails(tmp_path):
     result = check_network(Scripted("2 1\n"), root=str(tmp_path))
-    assert not result.ok and "saw 2 interfaces up" in result.detail
+    assert not result.ok and "saw 2 routes or addresses" in result.detail
 
 
-def test_a_step_that_cannot_list_interfaces_fails(tmp_path):
+def test_a_step_that_cannot_read_its_routes_fails(tmp_path):
     result = check_network(Scripted("0 0\n"), root=str(tmp_path))
-    assert not result.ok and "could not list" in result.detail
+    assert not result.ok and "could not read its network routes" in result.detail
 
 
 def test_a_step_that_did_not_run_fails(tmp_path):
@@ -256,7 +256,7 @@ def test_the_step_tries_the_probe(tmp_path, listening):
                   probe=listening)
     text = kept.read_text()
     assert f"/dev/tcp/{listening[0]}/{listening[1]}" in text
-    assert "/sys/class/net/" in text
+    assert "/proc/net/route" in text and "/proc/net/if_inet6" in text
 
 
 def test_the_probe_comes_from_the_setting(tmp_path, listening, monkeypatch):
@@ -269,9 +269,52 @@ def test_the_host_itself_fails_the_check(tmp_path):
     """The real step, run on the host: a check that passed here would be useless."""
     result = check_network(SubprocessRunner(), root=str(tmp_path), force=True)
     assert result is not None and not result.ok
-    # Linux lists the host's interfaces, and some are up; a host without
-    # /sys/class/net, such as macOS, cannot list them, which fails as well.
-    assert ("interfaces up" in result.detail) == sys.platform.startswith("linux")
+    # Linux has the host's routes; a host without /proc/net, such as macOS,
+    # cannot read them, which fails as well.
+    assert ("routes or addresses" in result.detail) == sys.platform.startswith("linux")
+
+
+@pytest.fixture
+def net(tmp_path, monkeypatch):
+    """The real rule, run by snakemake, against routes and addresses of a test's own."""
+    folder = tmp_path / "net"
+    folder.mkdir()
+    monkeypatch.setattr(runner, "NET", str(folder))
+
+    def write(routes=(), addresses=()):
+        (folder / "route").write_text(
+            "Iface\tDestination\tGateway\n"
+            + "".join(f"{dev}\t00000000\t00000000\n" for dev in routes))
+        (folder / "if_inet6").write_text("".join(
+            f"00000000000000000000000000000001 01 80 10 80 {dev}\n" for dev in addresses))
+    return write
+
+
+class Host(SubprocessRunner):
+    @property
+    def guarantees(self):
+        return {"network": ENFORCED, "filesystem": NONE, "environment": NONE}
+
+
+@pytest.mark.parametrize("routes,addresses,ok", [
+    ((), ("lo",), True),
+    (("lo",), ("lo",), True),
+    (("eth0",), ("lo",), False),
+    ((), ("lo", "eth0"), False),
+])
+def test_the_real_rule_counts_routes_and_addresses(net, tmp_path, routes, addresses, ok):
+    net(routes, addresses)
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    result = check_network(Host(), root=str(runs))
+    assert result.ok is ok, result.detail
+
+
+def test_the_real_rule_fails_without_routes_to_read(net, tmp_path):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    result = check_network(Host(), root=str(runs))
+    assert not result.ok and "could not read" in result.detail
 
 
 # --------------------------------------------------------------------------
@@ -310,7 +353,7 @@ def test_a_failing_check_stops_the_agent_and_is_audited_first(api, monkeypatch):
     with pytest.raises(main.NetworkCheckFailed, match="does not start"):
         main.check_runner_network()
     event = json.loads(trail.read_text())
-    assert event["ok"] is False and "1 interfaces up" in event["detail"]
+    assert event["ok"] is False and "1 routes or addresses" in event["detail"]
 
 
 def test_on_a_node_the_check_reaches_the_node_screen(api, monkeypatch, tmp_path):
@@ -326,5 +369,5 @@ def test_on_a_node_the_check_reaches_the_node_screen(api, monkeypatch, tmp_path)
     with db.reading(bind) as session:
         status = repo.node_status(session)
         assert status.network_check_ok is False
-        assert "3 interfaces up" in status.network_check_detail
+        assert "3 routes or addresses" in status.network_check_detail
         assert status.network_checked_at is not None

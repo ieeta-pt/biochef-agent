@@ -282,21 +282,21 @@ def test_an_isolating_runner_not_checked_yet_says_so(engine):
 
 def test_a_passed_check_is_shown(engine):
     with db.writing(engine) as session:
-        repo.record_network_check(session, ok=True, detail="no interface but loopback",
+        repo.record_network_check(session, ok=True, detail="no route or address but loopback",
                                   now=NOW)
     text = web(engine, network_isolated=True, guarantees=ALL_ENFORCED).get(
         "/ui/node").text
-    assert "text-ok\">Checked at start" in text and "no interface but loopback" in text
+    assert "text-ok\">Checked at start" in text and "no route or address but loopback" in text
 
 
 def test_a_failed_check_is_shown_in_bad_colours(engine):
     with db.writing(engine) as session:
-        repo.record_network_check(session, ok=False, detail="a step saw 1 interfaces up",
+        repo.record_network_check(session, ok=False, detail="a step saw 1 routes or addresses besides loopback",
                                   now=NOW)
     text = web(engine, network_isolated=True, guarantees=ALL_ENFORCED).get(
         "/ui/node").text
     assert 'font-medium text-bad">Check at start failed' in text
-    assert "a step saw 1 interfaces up" in text
+    assert "a step saw 1 routes or addresses besides loopback" in text
 
 
 @pytest.mark.parametrize("required,words", [

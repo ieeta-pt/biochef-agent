@@ -816,13 +816,20 @@ class NetworkCheck(NamedTuple):
     detail: str
 
 
+NET = "/proc/net"
+"""Where a step reads its routes. A constant so that the tests can run the real
+rule against files of their own."""
+
 _CHECK_RULE = r'''
 rule network_check:
     output: "network-check.txt"
     shell:
-        "up=0; lo=0; for i in /sys/class/net/*; do [ -f \"$i/flags\" ] || continue; "
-        "if [ \"${{i##*/}}\" = lo ]; then lo=1; continue; fi; f=$(cat \"$i/flags\"); "
-        "if (( f & 1 )); then up=$((up+1)); fi; done; echo $up $lo > {output}; "
+        "up=0; read=0; if [ -r __NET__/route ]; then read=1; "
+        "while read -r dev rest; do [ \"$dev\" = Iface ] || [ \"$dev\" = lo ] "
+        "|| up=$((up+1)); done < __NET__/route; fi; "
+        "if [ -r __NET__/if_inet6 ]; then while read -r a b c d e dev; do "
+        "[ \"$dev\" = lo ] || up=$((up+1)); done < __NET__/if_inet6; fi; "
+        "echo $up $read > {output}; "
         __REACH__
 '''
 
@@ -836,8 +843,10 @@ def check_network(provider: Runner, root: str = None, timeout_s: int = 600,
 
     For a runner whose network guarantee is enforced, at start, so that a host
     where the flag is accepted and has no effect is found before any data is.
-    The step counts the interfaces other than loopback that are up, which must be
-    none. With a probe, it also tries to connect to it, which must fail, and the
+    The step counts the IPv4 routes and IPv6 addresses on anything but loopback,
+    which must be none. It reads them from /proc/net, which is the step's own
+    network namespace, and not from /sys/class/net, which apptainer binds from
+    the host, so it lists the host's interfaces whatever the namespace. With a probe, it also tries to connect to it, which must fail, and the
     agent first connects to it itself, so that "unreachable" means isolation and
     not a network that is down. Returns None for a runner that claims nothing,
     unless `force`.
@@ -865,7 +874,8 @@ def check_network(provider: Runner, root: str = None, timeout_s: int = 600,
     try:
         with open(os.path.join(path, "Snakefile"), "w") as stream:
             stream.write(provider.snakefile_preamble()
-                         + _CHECK_RULE.replace("__REACH__", reach))
+                         + _CHECK_RULE.replace("__REACH__", reach)
+                         .replace("__NET__", NET))
         result = provider.run(ws, timeout_s=timeout_s)
         if result.returncode != 0:
             return NetworkCheck(False, f"the check step did not run (exit "
@@ -874,17 +884,17 @@ def check_network(provider: Runner, root: str = None, timeout_s: int = 600,
             seen = stream.read().split()
     finally:
         shutil.rmtree(path, ignore_errors=True)
-    up, loopback = (seen + ["?", "?"])[:2]
-    if loopback != "1":
-        # Not even loopback: the step could not list the interfaces at all, so
-        # "none up" would mean nothing.
-        return NetworkCheck(False, "a step could not list its network interfaces")
-    if up != "0":
-        return NetworkCheck(False, f"a step saw {up} interfaces up besides loopback")
+    found, readable = (seen + ["?", "?"])[:2]
+    if readable != "1":
+        # The step could not read its routes at all, so "none" would mean nothing.
+        return NetworkCheck(False, "a step could not read its network routes")
+    if found != "0":
+        return NetworkCheck(False, f"a step saw {found} routes or addresses besides "
+                                   f"loopback")
     if probe and seen[2:] != ["unreachable"]:
         return NetworkCheck(False, f"a step reached {probe[0]}:{probe[1]}")
     if probe:
-        return NetworkCheck(True, f"no interface but loopback, and "
+        return NetworkCheck(True, f"no route or address but loopback, and "
                                   f"{probe[0]}:{probe[1]} unreachable from a step")
-    return NetworkCheck(True, "no interface but loopback (no BIOCHEF_NETWORK_PROBE "
-                              "to try a connection)")
+    return NetworkCheck(True, "no route or address but loopback (no "
+                              "BIOCHEF_NETWORK_PROBE to try a connection)")
