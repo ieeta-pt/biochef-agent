@@ -532,6 +532,14 @@ The page refuses to start without `BIOCHEF_AUDIT_LOG`, because every decision ma
 
 Everything the page loads is served by the agent: htmx, the fonts and the stylesheet are in `ui/static/`, and `ui/static.sha256` records the vendored files. `ui/static/app.css` is built and committed, so nothing else is needed at runtime. After changing a template or `ui/tailwind/input.css`, run `make css`, which downloads the pinned Tailwind CLI, checks it against `ui/tailwind/SHA256SUMS` and rebuilds the file. CI fails if the committed file differs.
 
+## Requests
+
+A request is checked in the ten steps of the specification (section 6.3), and the first failure stops the rest. Every verdict writes an audit event, and a refusal is also a signed decision. A repeat is the same `request_id`, which the member signs: delivered again, it joins the run of an accepted request and gets the same refusal as a refused one, and only a count is kept. A new `request_id` is a new request even with the same payload, and the same `request_id` on a different signed request is refused as `replay`. Check 5 comes first, so a request_id is held to this until its `not_after`. `BIOCHEF_PASSPORT_REQUIRE_VISA` names the visa type required for each dataset, and the visa's value must be exactly the `visa_value` of the dataset's binding, its subject the member, and its issuer one of `BIOCHEF_PASSPORT_VISA_ISSUERS`. A binding with no `visa_value` matches no visa.
+
+The payload is decrypted with `pyrage`, and an accepted payload is kept in memory only.
+
+The coordinator's agent API does not exist yet, so `node/verify.py` lists three details of the format that are assumptions until it does.
+
 ## Dataset bindings
 
 A study names datasets by id, and a binding says which folder under `BIOCHEF_LOCAL_ROOT` holds one. Both ways of binding need `localpath` in `BIOCHEF_DATA_SOURCES` and an existing `BIOCHEF_LOCAL_ROOT`.

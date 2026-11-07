@@ -185,7 +185,6 @@ class Request(SQLModel, table=True):
         _one_of("verdict", Verdict),
         _one_of("failed_check", RefusalCode),
         Index("request_received", "received_at"),
-        Index("request_payload", "payload_digest"),
     )
 
     request_id: str = Field(primary_key=True)
@@ -204,9 +203,11 @@ class Request(SQLModel, table=True):
     received_at: datetime = _moment(nullable=False)
     verdict: Optional[str] = None
     failed_check: Optional[str] = None
-    joined_request_id: Optional[str] = Field(default=None,
-                                             foreign_key="request.request_id")
     run_id: Optional[str] = None
+    # The same request_id delivered again: it joins the run or repeats the refusal
+    # (section 6.3, check 6), and only the count and the last time are kept.
+    repeats: int = Field(default=0, sa_column_kwargs={"server_default": "0"})
+    last_repeat_at: Optional[datetime] = _moment(nullable=True)
 
 
 class RunSummary(SQLModel, table=True):
