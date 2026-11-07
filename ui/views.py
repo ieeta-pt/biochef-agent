@@ -6,7 +6,7 @@ know. Nothing is carried over from the mocks.
 
 import hashlib
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from node import review
@@ -484,7 +484,9 @@ def request_rows(session, study_id, offset=0):
                 request.member, UNKNOWN_MEMBER),
             "workflow": titles.get(request.workflow_digest,
                                    fmt.short_digest(request.workflow_digest)),
-            "check": _check_pill(request), "run": _run_text(session, request)})
+            "check": _check_pill(request), "run": _run_text(session, request),
+            "run_id": (request.run_id if request.verdict == Verdict.ACCEPTED.value
+                       else None)})
     total = repo.count_requests_of_study(session, study_id)
     shown = offset + len(rows)
     return {"rows": rows, "older": max(0, total - shown), "next_offset": shown,
@@ -613,6 +615,101 @@ def requests_page(session, now, shown="all", selected=None, required_visa=None):
             "rows": [_request_row(session, row) for row in rows],
             "panel": (_request_panel(session, chosen, required_visa) if chosen
                       else None)}
+
+
+# Run
+
+STEP_PILLS = {"COMPLETE": "ok", "RUNNING": "info", "FAILED": "bad", "PENDING": "mute"}
+RUN_PILLS = {"COMPLETE": "ok", "RUNNING": "info", "QUEUED": "mute",
+             "INITIALIZING": "info", "CANCELING": "warn", "CANCELED": "mute",
+             "EXECUTOR_ERROR": "bad", "SYSTEM_ERROR": "bad"}
+EGRESS_LABELS = {
+    "not_ready": ("mute", "Egress not started"),
+    "rules_pending": ("mute", "Checking output rules"),
+    "awaiting_airlock": ("warn", "Waiting for the airlock"),
+    "awaiting_review": ("warn", "Waiting for your review"),
+    "released": ("ok", "Released"), "withheld": ("bad", "Withheld"),
+    "sent": ("ok", "Result sent")}
+LIVE_STATES = ("QUEUED", "INITIALIZING", "RUNNING", "CANCELING")
+
+
+def _size(bytes_):
+    if bytes_ >= 1_000_000:
+        return f"{bytes_ / 1_000_000:.1f} MB"
+    if bytes_ >= 1_000:
+        return f"{bytes_ // 1_000} KB"
+    return f"{bytes_} B"
+
+
+def _duration(step):
+    if not step.get("started_at") or not step.get("ended_at"):
+        return None
+    start = datetime.fromisoformat(step["started_at"])
+    end = datetime.fromisoformat(step["ended_at"])
+    return f"{max(1, round((end - start).total_seconds() / 60))} min"
+
+
+def _egress_decision(session, run_id):
+    about = repo.decisions_about(session, SubjectType.EGRESS, run_id)
+    return about[0] if about else None
+
+
+def run_page(session, run, tab, settings, log="run"):
+    request = (repo.get_request(session, run.request_id)
+               if run.request_id else None)
+    study = workflow = member = None
+    if request is not None:
+        study, titles, labels = _titles_of_study(session, request)
+        workflow = titles.get(request.workflow_digest,
+                              fmt.short_digest(request.workflow_digest))
+        member = labels.get(request.member, UNKNOWN_MEMBER)
+    files = run.egress_files
+    held = sum(row.get("verdict") == "held_back" for row in files)
+    good = sum(row.get("verdict") == "pass" for row in files)
+    decision = _egress_decision(session, run.run_id)
+    can_undo = bool(decision and decision.posted_to_coordinator_at is None
+                    and run.egress_state in ("released", "withheld"))
+    return {
+        "id": run.run_id, "tab": tab, "log": log,
+        "request_id": run.request_id, "study": study, "workflow": workflow,
+        "member": member,
+        "started": fmt.minute(run.started_at) if run.started_at else None,
+        "ended": fmt.minute(run.ended_at) if run.ended_at else None,
+        "state": run.state, "state_pill": RUN_PILLS.get(run.state, "mute"),
+        "egress": EGRESS_LABELS[run.egress_state], "egress_state": run.egress_state,
+        "mode": settings.egress_mode,
+        "steps": [{"id": row["id"], "state": row["state"],
+                   "pill": STEP_PILLS.get(row["state"], "mute"),
+                   "time": _duration(row)} for row in run.steps],
+        "files": [{"file": row["file"], "size": _size(row["size"]),
+                   "pass": row.get("verdict") == "pass",
+                   "judged": row.get("verdict") is not None,
+                   "reason": row.get("reason")} for row in files],
+        "good": good, "held": held,
+        "airlock_at": fmt.minute(run.airlock_at) if run.airlock_at else None,
+        "review_open": (run.egress_state == "awaiting_review"
+                        and settings.egress_mode == "manual"),
+        "decision": decision and {
+            "id": decision.id, "by": decision.user, "at": fmt.minute(decision.at),
+            "action": decision.action, "can_undo": can_undo},
+        "live": run.state in LIVE_STATES,
+        "can_cancel": run.state in ("QUEUED", "INITIALIZING", "RUNNING")
+        and not run.cancel_requested,
+        "cancel_requested": run.cancel_requested,
+        "log_tabs": ["run"] + [row["id"] for row in run.steps],
+        "log_text": _log_text(run, log), "node_logs_ready": not run.state in LIVE_STATES,
+        "has_manifest": run.manifest_path is not None,
+        "exit_code": run.exit_code,
+    }
+
+
+def _log_text(run, log):
+    if log == "run":
+        return (run.log_stdout + run.log_stderr) or "Nothing logged yet."
+    entry = run.node_logs.get(log)
+    if entry is None:
+        return "This step has no log. Per step logs exist only after the run ends."
+    return (entry.get("stdout", "") + entry.get("stderr", "")) or "Nothing logged."
 
 
 # Datasets

@@ -50,6 +50,7 @@ class Settings:
     local_root: str | None = None
     bindings_file: str | None = None
     bindings_from_ui: bool = False
+    egress_mode: str = "airlock"
 
     @property
     def secure_cookies(self):
@@ -130,6 +131,15 @@ def _bindings():
             "bindings_from_ui": from_ui}
 
 
+def _egress_mode():
+    value = _setting(os.getenv("BIOCHEF_EGRESS_MODE"))
+    if value not in ("airlock", "manual"):
+        raise SettingsError("BIOCHEF_EGRESS_MODE must be `airlock` or `manual`; there "
+                            "is no default, because each one lets results leave "
+                            "differently")
+    return value
+
+
 def load():
     """The settings of this process, read from the environment."""
     mode = _setting(os.getenv("BIOCHEF_UI_IDENTITY"))
@@ -151,6 +161,7 @@ def load():
         "policy_engine_url": _policy_engine(
             _setting(os.getenv("BIOCHEF_POLICY_ENGINE_URL"))),
         "required_visa": _setting(os.getenv("BIOCHEF_PASSPORT_REQUIRE_VISA")),
+        "egress_mode": _egress_mode(),
         **_bindings(),
     }
 

@@ -572,6 +572,33 @@ def set_egress_state(session, run_id, state, now=None, *, retain_seconds=None):
     return row
 
 
+def runs_in_egress_state(session, state):
+    return list(session.exec(select(RunSummary).where(
+        RunSummary.egress_state == state.value)))
+
+
+def runs_not_finished(session):
+    return list(session.exec(select(RunSummary).where(
+        RunSummary.state.in_(("QUEUED", "INITIALIZING", "RUNNING", "CANCELING")))))
+
+
+def runs_ready_for_egress(session):
+    """Finished runs of a request that no output rule has looked at yet."""
+    return list(session.exec(select(RunSummary).where(
+        RunSummary.state == "COMPLETE",
+        RunSummary.request_id.is_not(None),
+        RunSummary.workspace_path.is_not(None),
+        RunSummary.egress_state == EgressState.NOT_READY.value)))
+
+
+def reopen_review(session, run_id):
+    """Undo of a person's release or withholding, and the only way back."""
+    row = get_run(session, run_id)
+    row.egress_state = EgressState.AWAITING_REVIEW.value
+    row.retain_until = None
+    return row
+
+
 def runs_with_workspaces(session):
     """What the API process needs to rebuild retention after a restart."""
     return list(session.exec(select(RunSummary).where(

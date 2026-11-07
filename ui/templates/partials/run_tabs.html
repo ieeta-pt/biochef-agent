@@ -1,0 +1,92 @@
+{% from "partials/macros.html" import pill %}
+<div id="run-tabs" class="flex flex-col gap-4">
+  <div role="tablist" aria-label="Run sections" class="flex gap-1 border-b border-line">
+    {% for name, label in [('egress', 'Egress'), ('logs', 'Logs'), ('manifest', 'Manifest')] %}
+    <button type="button" role="tab" aria-selected="{{ 'true' if detail.tab == name else 'false' }}" class="tab-button {{ 'tab-on' if detail.tab == name }}" hx-get="/ui/_/runs/{{ detail.id }}/tab/{{ name }}" hx-target="#run-tabs" hx-swap="outerHTML">{{ label }}</button>
+    {% endfor %}
+  </div>
+  {% if detail.tab == 'egress' %}
+  <section aria-label="Egress steps" class="grid grid-cols-[repeat(auto-fit,minmax(200px,1fr))] gap-3">
+    <div class="card flex flex-col gap-1 p-4 text-[13px]">
+      <span class="lbl">1 · Output rules</span>
+      {% if detail.good or detail.held %}<span>{{ detail.good }} file{{ '' if detail.good == 1 else 's' }} pass, {{ detail.held }} held back</span>{% else %}<span class="text-muted">Not judged yet</span>{% endif %}
+      {% if settings.policy_engine_url %}<a href="{{ settings.policy_engine_url }}" target="_blank" rel="noopener noreferrer">Details in the Policy Engine ↗</a>{% endif %}
+    </div>
+    {% if detail.mode == 'airlock' %}
+    <div class="card flex flex-col gap-1 p-4 text-[13px]">
+      <span class="lbl">2 · TRE airlock</span>
+      {% if detail.airlock_at %}<span>Handed to the airlock {{ detail.airlock_at }}</span>{% endif %}
+      <span>{{ {'awaiting_airlock': "Waiting for the TRE's decision", 'released': 'Released by the airlock', 'sent': 'Released by the airlock', 'withheld': 'Withheld by the airlock'}.get(detail.egress_state, 'Not reached yet') }}</span>
+    </div>
+    {% else %}
+    <div class="card flex flex-col gap-1 p-4 text-[13px]">
+      <span class="lbl">2 · Review in the agent</span>
+      {% if detail.decision %}<span>{{ 'Released' if detail.decision.action == 'release' else 'Withheld' }} by {{ detail.decision.by }} {{ detail.decision.at }}, signed.{% if detail.decision.action == 'withhold' %} The requester gets no result from this node.{% endif %}</span>
+      {% elif detail.egress_state == 'awaiting_review' %}<span class="text-warn">Waiting for your review</span>
+      {% else %}<span class="text-muted">Not reached yet</span>{% endif %}
+    </div>
+    {% endif %}
+    <div class="card flex flex-col gap-1 p-4 text-[13px]">
+      <span class="lbl">3 · Encrypt and sign</span>
+      <span>{% if detail.egress_state == 'sent' %}For {{ detail.member }}, signed with the node key{% elif detail.egress_state == 'released' %}Waiting to be encrypted for {{ detail.member }}{% else %}Not yet{% endif %}</span>
+    </div>
+    <div class="card flex flex-col gap-1 p-4 text-[13px]">
+      <span class="lbl">4 · Sent to coordinator</span>
+      <span>{{ 'Posted' if detail.egress_state == 'sent' else 'Not yet' }}</span>
+    </div>
+  </section>
+  <section aria-label="Output files" class="card table-box">
+    <table>
+      <thead><tr><th>File</th><th>Size</th><th>Output rules</th></tr></thead>
+      <tbody>
+        {% for row in detail.files %}
+        <tr {% if row.judged and not row.pass %}class="bg-warn-soft"{% endif %}>
+          <td class="mono">{{ row.file }}</td>
+          <td>{{ row.size }}</td>
+          <td>{% if not row.judged %}<span class="text-muted">Not judged yet</span>{% elif row.pass %}<span class="text-ok">✓ {{ row.reason }}</span>{% else %}<span class="text-warn">held back · {{ row.reason }}</span>{% endif %}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="3">No output files recorded.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% if detail.review_open %}
+  <section aria-label="Review" class="card flex flex-wrap items-center gap-3 px-6 py-4">
+    <button type="button" class="btn btn-primary" hx-post="/ui/_/runs/{{ detail.id }}/release" hx-target="#decision-error" hx-swap="innerHTML">Release {{ detail.good }} file{{ '' if detail.good == 1 else 's' }} and sign</button>
+    <button type="button" class="btn btn-danger" hx-post="/ui/_/runs/{{ detail.id }}/withhold" hx-target="#decision-error" hx-swap="innerHTML">Withhold and sign</button>
+    <span class="text-[13px] text-muted">This node reviews egress in the agent, because the TRE has no airlock.</span>
+  </section>
+  {% endif %}
+  {% if detail.decision and detail.decision.can_undo %}
+  <div role="status" class="flex flex-wrap items-center justify-between gap-3 rounded-control bg-ok-soft p-4 text-sm text-ok">
+    <span>{{ 'Released' if detail.decision.action == 'release' else 'Withheld' }} and signed.</span>
+    <button type="button" class="btn-link" hx-post="/ui/_/decisions/{{ detail.decision.id }}/undo" hx-target="#decision-error" hx-swap="innerHTML">Undo before the next poll</button>
+  </div>
+  {% endif %}
+  <p class="m-0 text-[13px] text-muted">Outputs stay on this node until egress is decided, then follow the retention setting on the Node page.</p>
+  {% elif detail.tab == 'logs' %}
+  <section aria-label="Logs" class="card flex flex-col gap-3 p-4">
+    <div class="flex flex-wrap items-center justify-between gap-2">
+      <div class="flex flex-wrap gap-1">
+        {% for name in detail.log_tabs %}
+        <button type="button" class="tab-button {{ 'tab-on' if detail.log == name }}" aria-pressed="{{ 'true' if detail.log == name else 'false' }}" hx-get="/ui/_/runs/{{ detail.id }}/tab/logs?log={{ name }}" hx-target="#run-tabs" hx-swap="outerHTML">{{ 'Run log' if name == 'run' else name }}</button>
+        {% endfor %}
+      </div>
+      <a class="btn btn-quiet flex items-center no-underline" href="/ui/runs/{{ detail.id }}/download/log?log={{ detail.log }}">Download</a>
+    </div>
+    {% include "partials/run_log.html" %}
+    <p class="m-0 text-[13px] text-muted">The run log is live while the run goes. Each step's log appears when the run ends. Logs never leave this node.</p>
+  </section>
+  {% else %}
+  <section aria-label="Manifest" class="card flex flex-col gap-3 p-4">
+    {% if detail.manifest %}
+    <pre class="mono m-0 max-h-96 overflow-auto rounded-control bg-head p-3 text-xs">{{ detail.manifest }}</pre>
+    <a href="/ui/runs/{{ detail.id }}/download/run.json" class="text-sm">Download run.json</a>
+    {% else %}
+    <p class="m-0 text-sm text-muted">run.json is not available: the run left none, or its workspace is no longer kept.</p>
+    {% endif %}
+    {% if detail.exit_code is not none and not detail.live %}<span class="mono text-[13px]">exit code {{ detail.exit_code }}</span>{% endif %}
+  </section>
+  {% endif %}
+</div>

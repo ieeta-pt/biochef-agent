@@ -8,6 +8,7 @@ The middleware added last runs first, so the order of a request is security
 headers, identity, CSRF, then the route.
 """
 
+import retention
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -22,7 +23,7 @@ from ui.csrf import CsrfMiddleware
 from ui.identity import IdentityMiddleware
 from ui.render import HERE
 from ui.routes import datasets as datasets_screen
-from ui.routes import decisions, inbox, node, requests, studies, workflows
+from ui.routes import decisions, inbox, node, requests, runs, studies, workflows
 from ui.security import SecurityHeadersMiddleware
 
 
@@ -34,9 +35,10 @@ def create_app(settings, *, bind, keys, policy=None):
     app.state.keys = keys
     app.state.policy = policy
     app.state.binding_conflicts = []
+    app.state.keep_seconds = retention.KEEP_OUTPUTS_SECONDS
 
-    for screen in (inbox, studies, workflows, decisions, requests, datasets_screen,
-                   node):
+    for screen in (inbox, studies, workflows, decisions, requests, runs,
+                   datasets_screen, node):
         app.include_router(screen.router)
     app.mount("/ui/static", StaticFiles(directory=HERE / "static"), name="static")
 

@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% from "partials/macros.html" import pill %}
+{% block title %}Run {{ detail.id }}{% endblock %}
+{% block header %}
+<nav aria-label="Breadcrumb" class="flex flex-wrap gap-2 text-sm"><a href="/ui/requests">Requests</a><span aria-hidden="true" class="text-muted">/</span><span class="mono">{{ detail.request_id or detail.id }}</span></nav>
+<header class="flex flex-wrap items-end justify-between gap-4">
+  <div class="flex flex-col gap-1.5">
+    <h1 class="m-0 text-[26px] font-medium">Run of {{ detail.request_id or detail.id }}</h1>
+    <span class="text-[13px] text-muted">{% if detail.study %}{{ detail.study }} · {{ detail.workflow }} · requested by {{ detail.member }}{% else %}Not from a study request{% endif %}{% if detail.started %} · {{ detail.started }}{% if detail.ended %} to {{ detail.ended }}{% endif %}{% endif %}</span>
+  </div>
+  <div class="flex flex-wrap items-center gap-2">
+    {{ pill(detail.state_pill, detail.state) }}
+    {{ pill(detail.egress[0], detail.egress[1]) }}
+    {% if detail.can_cancel %}<button type="button" class="btn btn-quiet-danger" hx-post="/ui/_/runs/{{ detail.id }}/cancel" hx-target="#decision-error" hx-swap="innerHTML">Cancel run</button>{% endif %}
+    {% if detail.cancel_requested and detail.live %}<span class="text-[13px] text-warn">Cancelling</span>{% endif %}
+  </div>
+</header>
+<div id="decision-error"></div>
+{% endblock %}
+{% block content %}
+<section aria-label="Steps" class="card overflow-x-auto p-4">
+  <div class="flex min-w-max items-center gap-3">
+    {% for step in detail.steps %}
+    <div class="pill-{{ step.pill }} flex min-w-32 flex-col gap-0.5 rounded-control px-3 py-2 text-[13px]"><span class="font-medium">{{ step.id }}</span><span class="text-xs">{{ step.state }}{% if step.time %} · {{ step.time }}{% endif %}</span></div>
+    {% else %}
+    <span class="text-sm text-muted">No step has started yet.</span>
+    {% endfor %}
+  </div>
+</section>
+{% include "partials/run_tabs.html" %}
+{% endblock %}
