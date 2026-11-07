@@ -59,6 +59,9 @@ class Settings:
     keep_outputs_seconds: int = 3600
     poll_seconds: int = 30
     network_isolated: bool = False
+    guarantees: tuple = (("network", "none"), ("filesystem", "none"),
+                         ("environment", "none"))
+    require_network_isolation: bool = False
 
     @property
     def secure_cookies(self):
@@ -166,10 +169,15 @@ def _node_facts():
 
 
 def _isolation(name):
+    """What the runner guarantees, read from the runner, under the same rule."""
     try:
-        return runner.get_runner(name).isolates_network
+        chosen = runner.get_runner(name)
+        required = runner.require_network_isolation()
     except ValueError as refused:
         raise SettingsError(str(refused)) from None
+    return {"network_isolated": chosen.isolates_network,
+            "guarantees": tuple(chosen.guarantees.items()),
+            "require_network_isolation": required}
 
 
 def _egress_mode():
@@ -204,8 +212,7 @@ def load():
         "required_visa": _setting(os.getenv("BIOCHEF_PASSPORT_REQUIRE_VISA")),
         "egress_mode": _egress_mode(),
         **_node_facts(),
-        "network_isolated": _isolation(
-            _setting(os.getenv("BIOCHEF_RUNNER")) or "subprocess"),
+        **_isolation(_setting(os.getenv("BIOCHEF_RUNNER")) or "subprocess"),
         **_bindings(),
     }
 

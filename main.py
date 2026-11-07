@@ -36,14 +36,19 @@ from steplogs import (LiveLog, Progress, clamp, failing_steps,
                       make_step_log_names, read_node_logs)
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
 from evidence_verification import EvidenceVerificationError
-from runner import SubprocessRunner, get_runner
+from runner import SubprocessRunner, check_network, get_runner
 from signing import SignatureError
 
 
 
 @asynccontextmanager
 async def _node_lifespan(_app):
-    """On a node, the API process also serves the database channel (section 3.1)."""
+    """On a node, the API process also serves the database channel (section 3.1).
+
+    Before anything, a runner that says it keeps steps off the network shows it
+    does, with one step, and the agent does not start if it does not.
+    """
+    await asyncio.to_thread(check_runner_network)
     worker = start_node_worker()
     yield
     if worker is not None:
@@ -823,6 +828,37 @@ class _NodeLoop:
 
 def retention_keep_seconds():
     return retention.KEEP_OUTPUTS_SECONDS
+
+
+EVENT_NETWORK_CHECK = "node.runner.network_check"
+
+
+class NetworkCheckFailed(RuntimeError):
+    """The runner says it isolates the network, and a step showed it does not."""
+
+
+def check_runner_network():
+    """Run the runner's network check, record it, and refuse to start on a failure.
+
+    Recorded in the audit trail, and on a node in node_status for the Node
+    screen, before the refusal, so that the reason outlives the process.
+    """
+    result = check_network(RUNNER, root=RUN_ROOT, timeout_s=RUN_TIMEOUT_S)
+    if result is None:
+        return None
+    audit.record(EVENT_NETWORK_CHECK, runner=RUNNER.name, ok=result.ok,
+                 detail=result.detail)
+    if node_runtime.mode() is not None:
+        from store import repo
+        with db.writing(db.engine()) as session:
+            repo.record_network_check(session, ok=result.ok, detail=result.detail)
+    if not result.ok:
+        raise NetworkCheckFailed(
+            f"BIOCHEF_RUNNER={RUNNER.name} says its steps have no network, and the "
+            f"check at start found otherwise: {result.detail}. The agent does not "
+            f"start.")
+    logger.info("network check: %s", result.detail)
+    return result
 
 
 def start_node_worker():

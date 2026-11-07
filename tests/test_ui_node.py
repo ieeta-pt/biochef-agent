@@ -242,3 +242,66 @@ def test_the_check_only_reads(bare, trail):
     before = trail.read_text()
     web(bare).get("/ui/node")
     assert trail.read_text() == before
+
+
+# What the runner guarantees, and its network check at start (section 14.1)
+
+ALL_ENFORCED = (("network", "enforced"), ("filesystem", "enforced"),
+                ("environment", "enforced"))
+
+
+def test_the_card_lists_the_three_guarantees(engine):
+    text = web(engine).get("/ui/node").text
+    for aspect in ("Network:", "Filesystem:", "Environment:"):
+        assert aspect in text
+    assert text.count('<span class="font-medium text-warn">none</span>') == 3
+
+
+def test_enforced_guarantees_are_in_ok_colours(engine):
+    text = web(engine, runner="podman", network_isolated=True,
+               guarantees=ALL_ENFORCED).get("/ui/node").text
+    assert text.count('<span class="text-ok">enforced by the agent</span>') == 3
+
+
+def test_an_attested_guarantee_says_it_is_not_verified(engine):
+    text = web(engine, guarantees=(("network", "attested"), ("filesystem", "none"),
+                                   ("environment", "none"))).get("/ui/node").text
+    assert ('<span class="font-medium text-warn">left to the backend, not verified'
+            '</span>') in text
+
+
+def test_no_check_is_shown_for_a_runner_that_claims_no_isolation(engine):
+    assert "at start" not in web(engine).get("/ui/node").text
+
+
+def test_an_isolating_runner_not_checked_yet_says_so(engine):
+    text = web(engine, network_isolated=True, guarantees=ALL_ENFORCED).get(
+        "/ui/node").text
+    assert '<span class="text-[13px] text-muted">Not checked at start yet</span>' in text
+
+
+def test_a_passed_check_is_shown(engine):
+    with db.writing(engine) as session:
+        repo.record_network_check(session, ok=True, detail="no interface but loopback",
+                                  now=NOW)
+    text = web(engine, network_isolated=True, guarantees=ALL_ENFORCED).get(
+        "/ui/node").text
+    assert "text-ok\">Checked at start" in text and "no interface but loopback" in text
+
+
+def test_a_failed_check_is_shown_in_bad_colours(engine):
+    with db.writing(engine) as session:
+        repo.record_network_check(session, ok=False, detail="a step saw 1 interfaces up",
+                                  now=NOW)
+    text = web(engine, network_isolated=True, guarantees=ALL_ENFORCED).get(
+        "/ui/node").text
+    assert 'font-medium text-bad">Check at start failed' in text
+    assert "a step saw 1 interfaces up" in text
+
+
+@pytest.mark.parametrize("required,words", [
+    (True, "Required: a runner the agent does not isolate is refused"),
+    (False, "Not required")])
+def test_the_rule_is_among_the_settings(engine, required, words):
+    text = web(engine, require_network_isolation=required).get("/ui/node").text
+    assert f"<span>{words}</span>" in text

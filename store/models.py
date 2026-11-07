@@ -290,6 +290,9 @@ class NodeStatus(SQLModel, table=True):
     last_poll_at: Optional[datetime] = _moment(nullable=True)
     last_success_at: Optional[datetime] = _moment(nullable=True)
     last_error: Optional[str] = None
+    network_checked_at: Optional[datetime] = _moment(nullable=True)
+    network_check_ok: Optional[bool] = None
+    network_check_detail: Optional[str] = None
 
 
 IMMUTABLE = {

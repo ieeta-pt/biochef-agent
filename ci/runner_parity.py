@@ -51,7 +51,8 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from runner import CONTAINER_IMAGE, ApptainerRunner, PodmanRunner, SubprocessRunner
+from runner import (CONTAINER_IMAGE, ApptainerRunner, PodmanRunner, SubprocessRunner,
+                    check_network)
 
 IMAGE = os.getenv("BIOCHEF_PARITY_IMAGE") or CONTAINER_IMAGE
 """The image the service would actually use, not a copy of it.
@@ -372,6 +373,18 @@ def main():
         elif "137" not in outcome.stderr:
             failures.append(f"{label}: the overrun failed, but not by being killed: "
                             f"{outcome.stderr[-1500:]!r}")
+
+    # The check the agent runs at start (SPEC.md 14.1), through the real runners:
+    # it must pass in their containers and fail on the host, with a probe the
+    # host can reach.
+    probe = ("1.1.1.1", 53)
+    for label, runner in runners:
+        result = check_network(runner, root=root, timeout_s=TIMEOUT_S, probe=probe,
+                               force=True)
+        if (label == "subprocess") == result.ok:
+            failures.append(f"{label}: the network check at start said "
+                            f"{result.ok}: {result.detail}")
+        print(f"    network check, {label}: {result.ok}: {result.detail}", flush=True)
 
     if failures:
         for f in failures:

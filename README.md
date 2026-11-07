@@ -252,6 +252,8 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_PASSPORT_REQUIRE_VISA` | *(unset)* | a visa type a caller must hold to be let in |
 | `BIOCHEF_PASSPORT_REQUIRE_VISA_VALUE` | *(unset)* | the exact value that visa must carry |
 | `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess`, `apptainer` or `podman` |
+| `BIOCHEF_REQUIRE_NETWORK_ISOLATION` | `false` | `true` refuses to start with a runner the agent does not itself keep off the network, see [What each runner guarantees](#what-each-runner-guarantees) |
+| `BIOCHEF_NETWORK_PROBE` | *(unset)* | `host:port` the agent can reach and a step must not, tried by the network check at start |
 | `BIOCHEF_PODMAN_MODE` | | `rootless` or `rootful`, required with `podman`, see [Running it](#running-it) |
 | `BIOCHEF_PODMAN_SELINUX` | | `disable` or `keep`, required with rootless `podman` |
 | `BIOCHEF_STEP_PIDS` | | the most processes a step may have, required with rootless `podman` |
@@ -389,6 +391,20 @@ The script runs a workspace only if it is a directory directly under `RUN_ROOT`,
 
 - `disable` runs each step with `--security-opt=label=disable`: no SELinux separation for the container, and the workspace mount works without relabelling anything. The other confinements stay: no network, no capabilities, `no-new-privileges`, the read-only root, the limits, the step's user and only the run's workspace mounted.
 - `keep` leaves podman's SELinux labelling on, so a step runs confined as `container_t`. The workspace is not relabelled, so on a host with SELinux enforcing, the directory runs are made in (`BIOCHEF_RUN_ROOT`) has to carry a label containers may use, such as `container_file_t`, or every step fails with permission denied. On a host without SELinux it changes nothing.
+
+### What each runner guarantees
+
+Each runner says, for every step, whether the agent keeps it off the network, whether it sees only its workspace and image, and whether it inherits the agent's environment. Each is `enforced` (the agent applies it to every step, and a step it cannot apply it to fails), `attested` (the operator says the backend applies it, and the agent cannot check) or `none`. The Node screen shows the three.
+
+| Runner | Network | Filesystem | Environment |
+|---|---|---|---|
+| `subprocess` | none | none, the host's | none, inherited |
+| `apptainer` | enforced with `--net --network none` in `BIOCHEF_APPTAINER_ARGS`, the default | enforced with `--contain` or `--containall` | enforced with `--cleanenv` or `--containall` |
+| `podman` | enforced | enforced | enforced |
+
+`BIOCHEF_REQUIRE_NETWORK_ISOLATION=true` makes the agent and the page refuse to start with a runner whose network guarantee is not `enforced`: `subprocess`, `apptainer` with the isolation flags removed, and any runner that only attests it. An attested isolation does not count, because the rule is for the case where nobody checks.
+
+At start, the API process runs one step through a runner whose network guarantee is `enforced`, the way every step runs. The step counts the interfaces besides loopback that are up, which must be none. With `BIOCHEF_NETWORK_PROBE=host:port`, the agent first connects to it itself, and the step then tries to as well, which must fail. Without the probe, only the interfaces are checked. The result goes to the audit trail as `node.runner.network_check` and, on a node, to the Node screen. If the step finds the network, the agent does not start. This catches a host where the isolation flag is accepted and has no effect.
 
 `BIOCHEF_APPTAINER_ARGS` defaults to `--contain --cleanenv --net --network none`. The last two give each step a network namespace with only loopback in it, so a tool cannot send data anywhere. On a host where apptainer refuses them the run fails, because carrying on with the network would be the worse outcome. Without `--contain`, apptainer binds the host's `/tmp` into the container, and that is where a run's directory lives unless `BIOCHEF_RUN_ROOT` says otherwise. Without it, a containerised tool is walled off from `/usr` and `/etc` while still able to read **every other run's data**. Without `--cleanenv`, the tool process also inherits the Agent's environment. Emptying this variable turns both protections off deliberately.
 

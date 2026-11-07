@@ -747,6 +747,26 @@ def _coordinator_card(session, settings, now):
     return {"kind": "ok", "headline": "Online", "detail": f"Last poll {last}"}
 
 
+GUARANTEE_WORDS = {"enforced": "enforced by the agent",
+                   "attested": "left to the backend, not verified",
+                   "none": "none"}
+
+
+def _network_check(session, settings):
+    """The API process's check at start, or why there is none."""
+    if not settings.network_isolated:
+        return None
+    status = repo.node_status(session)
+    if status is None or status.network_checked_at is None:
+        return {"kind": "mute", "text": "Not checked at start yet"}
+    when = fmt.minute(status.network_checked_at)
+    if status.network_check_ok:
+        return {"kind": "ok", "text": f"Checked at start {when}: "
+                                      f"{status.network_check_detail}"}
+    return {"kind": "bad", "text": f"Check at start failed {when}: "
+                                   f"{status.network_check_detail}"}
+
+
 def _federation_card(session):
     latest = repo.latest_federation_list(session)
     if latest is None:
@@ -835,6 +855,10 @@ def node_page(session, settings, keys, events, now):
         "coordinator": _coordinator_card(session, settings, now),
         "runner": settings.runner, "busy": repo.count_busy_runs(session),
         "slots": settings.max_concurrent_runs, "isolated": settings.network_isolated,
+        "guarantees": [(aspect.capitalize(), GUARANTEE_WORDS[value], value)
+                       for aspect, value in settings.guarantees],
+        "network_check": _network_check(session, settings),
+        "require_isolation": settings.require_network_isolation,
         "egress": ("Through the TRE airlock", "review in the agent")
         if settings.egress_mode == "airlock"
         else ("Review in the agent", "through the TRE airlock"),

@@ -20,8 +20,11 @@ lose the group-kill.
 import json
 import os
 import re
+import shutil
 import signal
+import socket
 import subprocess
+import tempfile
 import threading
 import time
 from typing import List, NamedTuple
@@ -35,6 +38,19 @@ def _kill_group(pgid):
         os.killpg(pgid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
+
+
+ENFORCED = "enforced"
+"""The agent applies it to every step, and a step it cannot apply it to fails."""
+ATTESTED = "attested"
+"""The operator says the backend applies it; the agent cannot check."""
+NONE = "none"
+"""Nobody applies it."""
+
+GUARANTEES = ("network", "filesystem", "environment")
+"""What a runner says about each step: whether it can reach the network, whether
+it sees more than its own workspace and image, and whether it inherits the
+agent's environment."""
 
 
 class RunResult(NamedTuple):
@@ -55,9 +71,19 @@ class Runner:
     name = "runner"
 
     @property
+    def guarantees(self) -> dict:
+        """network, filesystem and environment, each enforced, attested or none."""
+        return {aspect: NONE for aspect in GUARANTEES}
+
+    @property
     def isolates_network(self) -> bool:
-        """Whether a step can reach nothing beyond loopback."""
-        return False
+        """Whether the agent itself keeps a step from anything beyond loopback.
+
+        Only an enforced guarantee counts. An attested one is someone's word that
+        nobody here checks, and the rule that reads this exists for the case where
+        nobody does.
+        """
+        return self.guarantees["network"] == ENFORCED
 
     def command(self, ws) -> List[str]:
         raise NotImplementedError
@@ -392,10 +418,19 @@ class ApptainerRunner(Runner):
         return f"{self.name} ({self.image})"
 
     @property
-    def isolates_network(self) -> bool:
+    def guarantees(self) -> dict:
+        """Read from the flags actually passed, so emptying them shows here.
+
+        --containall is --contain and --cleanenv, among others.
+        """
         words = self.apptainer_args.split()
-        return ("--net" in words and "--network" in words
-                and words[words.index("--network") + 1:][:1] == ["none"])
+        network = ("--net" in words and "--network" in words
+                   and words[words.index("--network") + 1:][:1] == ["none"])
+        contained = "--contain" in words or "--containall" in words
+        clean = "--cleanenv" in words or "--containall" in words
+        return {"network": ENFORCED if network else NONE,
+                "filesystem": ENFORCED if contained else NONE,
+                "environment": ENFORCED if clean else NONE}
 
     def snakefile_preamble(self) -> str:
         return f"container: {self._literal}\n"
@@ -639,8 +674,9 @@ class PodmanRunner(Runner):
         self.umask = 0o007
 
     @property
-    def isolates_network(self) -> bool:
-        return True
+    def guarantees(self) -> dict:
+        """All three, fixed in podman-step and podman-step-root with no setting."""
+        return {aspect: ENFORCED for aspect in GUARANTEES}
 
     def describe(self) -> str:
         if self.mode == "rootful":
@@ -739,4 +775,116 @@ def get_runner(name: str) -> Runner:
             f"BIOCHEF_RUNNER={name!r} is not a runner. "
             f"Available: {', '.join(sorted(PROVIDERS))}."
         ) from None
-    return provider()
+    chosen = provider()
+    network = chosen.guarantees["network"]
+    if require_network_isolation() and network != ENFORCED:
+        raise ValueError(
+            f"BIOCHEF_REQUIRE_NETWORK_ISOLATION=true refuses BIOCHEF_RUNNER={name}: "
+            f"the agent does not itself keep its steps off the network (network "
+            f"isolation is {network}). An attested isolation does not count"
+        )
+    return chosen
+
+
+def require_network_isolation(value: str = None) -> bool:
+    """BIOCHEF_REQUIRE_NETWORK_ISOLATION: true, false, or unset for false."""
+    raw = (os.getenv("BIOCHEF_REQUIRE_NETWORK_ISOLATION", "") if value is None
+           else value).strip()
+    if raw in ("", "false"):
+        return False
+    if raw == "true":
+        return True
+    raise ValueError(f"BIOCHEF_REQUIRE_NETWORK_ISOLATION={raw!r} must be true or false")
+
+
+_PROBE_SHAPE = re.compile(r"\A([A-Za-z0-9][A-Za-z0-9.-]{0,252}):([1-9][0-9]{0,4})\Z")
+
+
+def network_probe(value: str = None):
+    """BIOCHEF_NETWORK_PROBE: host:port the agent can reach and a step must not."""
+    raw = (os.getenv("BIOCHEF_NETWORK_PROBE", "") if value is None else value).strip()
+    if not raw:
+        return None
+    found = _PROBE_SHAPE.match(raw)
+    if not found or int(found.group(2)) > 65535:
+        raise ValueError(f"BIOCHEF_NETWORK_PROBE={raw!r} must be host:port")
+    return found.group(1), int(found.group(2))
+
+
+class NetworkCheck(NamedTuple):
+    ok: bool
+    detail: str
+
+
+_CHECK_RULE = r'''
+rule network_check:
+    output: "network-check.txt"
+    shell:
+        "up=0; lo=0; for i in /sys/class/net/*; do [ -f \"$i/flags\" ] || continue; "
+        "if [ \"${{i##*/}}\" = lo ]; then lo=1; continue; fi; f=$(cat \"$i/flags\"); "
+        "if (( f & 1 )); then up=$((up+1)); fi; done; echo $up $lo > {output}; "
+        __REACH__
+'''
+
+_REACH = ('"if timeout 5 bash -c \'exec 3<>/dev/tcp/{host}/{port}\' 2>/dev/null; "\n'
+          '        "then echo reachable; else echo unreachable; fi >> {{output}}"')
+
+
+def check_network(provider: Runner, root: str = None, timeout_s: int = 600,
+                  probe=None, force: bool = False):
+    """One step that tries the network, run the way every step is run.
+
+    For a runner whose network guarantee is enforced, at start, so that a host
+    where the flag is accepted and has no effect is found before any data is.
+    The step counts the interfaces other than loopback that are up, which must be
+    none. With a probe, it also tries to connect to it, which must fail, and the
+    agent first connects to it itself, so that "unreachable" means isolation and
+    not a network that is down. Returns None for a runner that claims nothing,
+    unless `force`.
+    """
+    if provider.guarantees["network"] != ENFORCED and not force:
+        return None
+    probe = network_probe() if probe is None else probe
+    if probe:
+        try:
+            socket.create_connection(probe, timeout=5).close()
+        except OSError as error:
+            return NetworkCheck(False, f"the agent itself cannot reach "
+                                       f"{probe[0]}:{probe[1]} ({error}), so a step "
+                                       f"that cannot either proves nothing")
+        reach = _REACH.format(host=probe[0], port=probe[1])
+    else:
+        reach = '"true"'
+    path = tempfile.mkdtemp(prefix="biochef-run-", dir=root or None)
+
+    class _Workspace:
+        pass
+
+    ws = _Workspace()
+    ws.path = path
+    try:
+        with open(os.path.join(path, "Snakefile"), "w") as stream:
+            stream.write(provider.snakefile_preamble()
+                         + _CHECK_RULE.replace("__REACH__", reach))
+        result = provider.run(ws, timeout_s=timeout_s)
+        if result.returncode != 0:
+            return NetworkCheck(False, f"the check step did not run (exit "
+                                       f"{result.returncode}): {result.stderr[-500:]}")
+        with open(os.path.join(path, "network-check.txt")) as stream:
+            seen = stream.read().split()
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+    up, loopback = (seen + ["?", "?"])[:2]
+    if loopback != "1":
+        # Not even loopback: the step could not list the interfaces at all, so
+        # "none up" would mean nothing.
+        return NetworkCheck(False, "a step could not list its network interfaces")
+    if up != "0":
+        return NetworkCheck(False, f"a step saw {up} interfaces up besides loopback")
+    if probe and seen[2:] != ["unreachable"]:
+        return NetworkCheck(False, f"a step reached {probe[0]}:{probe[1]}")
+    if probe:
+        return NetworkCheck(True, f"no interface but loopback, and "
+                                  f"{probe[0]}:{probe[1]} unreachable from a step")
+    return NetworkCheck(True, "no interface but loopback (no BIOCHEF_NETWORK_PROBE "
+                              "to try a connection)")
