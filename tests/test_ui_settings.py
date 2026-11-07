@@ -216,7 +216,7 @@ def test_the_fake_policy_engine_is_for_development_only(ready, dev):
     dev.setenv("BIOCHEF_UI_IDENTITY", "header")
     dev.setenv("BIOCHEF_UI_IDENTITY_HEADER", USER_HEADER)
     dev.setenv("BIOCHEF_UI_TRUSTED_PROXIES", "10.0.0.0/24")
-    assert ui_app.configured_app().state.policy is None
+    assert ui_app.configured_app().state.policy.name == "The agent's own check"
 
 
 # The processes, as started

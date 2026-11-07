@@ -184,6 +184,13 @@ def test_the_fake_policy_engine_labels_itself(client):
         client.get("/ui/inbox").text)
 
 
+def test_the_agents_own_check_says_what_it_leaves_open(engine):
+    from node.policy import LocalRules
+    text = client_for(settings(), bind=engine, policy=LocalRules()).get("/ui/inbox").text
+    assert ("The agent&#39;s own check · types and sizes are checked here; min_count "
+            "and aggregates_only cannot be until the Policy Engine is connected.") in text
+
+
 def test_without_a_policy_engine_the_page_says_so(engine):
     text = client_for(settings(), bind=engine).get("/ui/inbox").text
     assert "Policy Engine not connected yet." in text

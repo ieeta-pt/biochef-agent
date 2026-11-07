@@ -10,6 +10,7 @@
     <div class="card flex flex-col gap-1 p-4 text-[13px]">
       <span class="lbl">1 · Output rules</span>
       {% if detail.good or detail.held %}<span>{{ detail.good }} file{{ '' if detail.good == 1 else 's' }} pass, {{ detail.held }} held back</span>{% else %}<span class="text-muted">Not judged yet</span>{% endif %}
+      {% if detail.unverified %}<span class="text-warn">Not verified: {{ detail.unverified | join(', ') }}. The agent checked types and sizes only, as no Policy Engine is connected.</span>{% endif %}
       {% if settings.policy_engine_url %}<a href="{{ settings.policy_engine_url }}" target="_blank" rel="noopener noreferrer">Details in the Policy Engine ↗</a>{% endif %}
     </div>
     {% if detail.mode == 'airlock' %}
@@ -43,7 +44,7 @@
         <tr {% if row.judged and not row.pass %}class="bg-warn-soft"{% endif %}>
           <td class="mono">{{ row.file }}</td>
           <td>{{ row.size }}</td>
-          <td>{% if not row.judged %}<span class="text-muted">Not judged yet</span>{% elif row.pass %}<span class="text-ok">✓ {{ row.reason }}</span>{% else %}<span class="text-warn">held back · {{ row.reason }}</span>{% endif %}</td>
+          <td>{% if not row.judged %}<span class="text-muted">Not judged yet</span>{% elif row.pass %}<span class="text-ok">✓ {{ row.reason }}</span>{% if row.unverified %}<span class="block text-warn">{{ row.unverified | join(', ') }} not verified</span>{% endif %}{% else %}<span class="text-warn">held back · {{ row.reason }}</span>{% endif %}</td>
         </tr>
         {% else %}
         <tr><td colspan="3">No output files recorded.</td></tr>
@@ -53,7 +54,12 @@
   </section>
   {% if detail.review_open %}
   <section aria-label="Review" class="card flex flex-wrap items-center gap-3 px-6 py-4">
-    <button type="button" class="btn btn-primary" hx-post="/ui/_/runs/{{ detail.id }}/release" hx-target="#decision-error" hx-swap="innerHTML">Release {{ detail.good }} file{{ '' if detail.good == 1 else 's' }} and sign</button>
+    {% if detail.unverified %}
+    <div id="release-fields" class="flex w-full flex-col gap-2 rounded-control bg-warn-soft px-4 py-3.5">
+      <label class="flex min-h-11 items-center gap-2.5 text-sm"><input type="checkbox" name="confirm_unverified" class="size-5"> I have checked {{ detail.unverified | join(' and ') }} myself. The signed release will say they were not verified by the agent.</label>
+    </div>
+    {% endif %}
+    <button type="button" class="btn btn-primary" hx-post="/ui/_/runs/{{ detail.id }}/release"{% if detail.unverified %} hx-include="#release-fields"{% endif %} hx-target="#decision-error" hx-swap="innerHTML">Release {{ detail.good }} file{{ '' if detail.good == 1 else 's' }} and sign</button>
     <button type="button" class="btn btn-danger" hx-post="/ui/_/runs/{{ detail.id }}/withhold" hx-target="#decision-error" hx-swap="innerHTML">Withhold and sign</button>
     <span class="text-[13px] text-muted">This node reviews egress in the agent, because the TRE has no airlock.</span>
   </section>

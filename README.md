@@ -537,11 +537,11 @@ Everything the page loads is served by the agent: htmx, the fonts and the styles
 
 A node sets `BIOCHEF_EGRESS_MODE` to `airlock` or `manual`. That also turns on the mirror: the API process copies each run into `run_summary`, carries out cancellations asked for on the page, and rebuilds retained workspaces after a restart, because the database is the only channel between the two processes. A plain agent leaves it unset and needs no database.
 
-Output rules judge every file first, and a file held back never leaves in either mode. Then the TRE's airlock decides, or a data manager releases or withholds on the Run screen with a signed decision. A released run is encrypted for the requester, signed with the node key and posted.
+Output rules judge every file first, and a file held back never leaves in either mode. Then the TRE's airlock decides, or a data manager releases or withholds on the Run screen with a signed decision. A released run is encrypted for the requester, signed with the node key and posted. A withheld one gets a signed notice with no files, made when it is withheld and kept until the coordinator can be told.
 
 The retention clock of `BIOCHEF_KEEP_OUTPUTS` starts at `sent` or `withheld`, not when the run ends. A run waiting for egress is never evicted, and when such runs fill `BIOCHEF_MAX_RETAINED_RUNS` a new run gets 503.
 
-The Policy Engine, the airlock and the coordinator's result endpoint are protocols in `node/` with fakes. Without a real one a run waits at that stage: nothing skips it.
+The Policy Engine, the airlock and the coordinator's result endpoint are protocols in `node/` with fakes. Until the Policy Engine is connected, the agent checks `types` and `max_bytes` itself, from each file's name and size, and marks `min_count` and `aggregates_only` as not verified on every file that passes. A data manager releasing such a run ticks an explicit confirmation, and the signed decision names the rules that were not verified; in airlock mode the airlock receives the same marking. Without an airlock, an airlock node's runs wait: nothing skips that stage.
 
 ## Requests
 

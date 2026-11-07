@@ -284,11 +284,14 @@ def ready_run(engine, tmp_path):
         repo.save_run(session, "run_1", state="COMPLETE", request_id="req_1", **seeded)
 
 
-def test_with_no_policy_engine_a_run_waits(engine, tmp_path, monkeypatch):
+def test_with_no_policy_engine_the_agent_checks_what_it_can(engine, tmp_path,
+                                                            monkeypatch):
     monkeypatch.setenv("BIOCHEF_EGRESS_MODE", "manual")
     ready_run(engine, tmp_path)
     worker(engine).tick()
-    assert row_of(engine, "run_1").egress_state == "not_ready"
+    row = row_of(engine, "run_1")
+    assert row.egress_state == "awaiting_review"
+    assert row.egress_files[0]["unverified"] == ["min_count", "aggregates_only"]
 
 
 def test_with_no_airlock_a_run_waits(engine, tmp_path, monkeypatch):

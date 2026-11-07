@@ -224,3 +224,51 @@ def test_a_withholding_shows_its_notice_waiting(engine):
     text = client.get("/ui/runs/run_8e90").text
     assert "A notice that the result was withheld is signed" in text
     assert "Notice waiting to be sent" in text
+
+
+def unverified_review(engine):
+    files = [{**row, "unverified": ["min_count"] if row["verdict"] == "pass" else []}
+             for row in mock.OUTPUT_FILES]
+    with db.writing(engine) as session:
+        repo.save_run(session, "run_8e90", state="COMPLETE", egress_files=files)
+        repo.set_egress_state(session, "run_8e90", EgressState.RULES_PENDING)
+        repo.set_egress_state(session, "run_8e90", EgressState.AWAITING_REVIEW)
+
+
+def post_form(client, path, **data):
+    page = client.get("/ui/inbox").text
+    token = re.search(r'name="csrf-token" content="([^"]+)"', page).group(1)
+    return client.post(path, data=data, headers={"X-CSRF-Token": token})
+
+
+def test_the_page_says_what_was_not_verified(engine):
+    unverified_review(engine)
+    text = web(engine, "manual").get("/ui/runs/run_8e90").text
+    assert "Not verified: min_count." in text
+    assert "min_count not verified" in text
+    assert 'name="confirm_unverified"' in text and 'hx-include="#release-fields"' in text
+
+
+def test_a_release_without_the_confirmation_is_refused(engine):
+    unverified_review(engine)
+    client = web(engine, "manual")
+    response = post_form(client, "/ui/_/runs/run_8e90/release")
+    assert response.status_code == 409
+    assert "Confirm that you checked them" in response.text
+    with db.reading(engine) as session:
+        assert repo.get_run(session, "run_8e90").egress_state == "awaiting_review"
+
+
+def test_a_confirmed_release_from_the_page(engine):
+    unverified_review(engine)
+    client = web(engine, "manual")
+    post_form(client, "/ui/_/runs/run_8e90/release", confirm_unverified="on")
+    with db.reading(engine) as session:
+        assert repo.get_run(session, "run_8e90").egress_state == "released"
+        decision = repo.decisions_about(session, SubjectType.EGRESS, "run_8e90")[0]
+    assert decision.reason == "released with rules not verified: min_count"
+
+
+def test_a_fully_checked_run_asks_for_no_confirmation(engine):
+    to_review(engine)
+    assert "confirm_unverified" not in web(engine, "manual").get("/ui/runs/run_8e90").text

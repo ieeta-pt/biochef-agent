@@ -2,7 +2,9 @@
 
 import os
 
-from fastapi import APIRouter, HTTPException, Request
+from typing import Optional
+
+from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import PlainTextResponse, Response
 
 from node import decisions, egress
@@ -84,8 +86,12 @@ def _review(request, run_id, decide):
 
 
 @router.post("/ui/_/runs/{run_id}/release")
-def release(request: Request, run_id: str):
-    return _review(request, run_id, egress.release)
+def release(request: Request, run_id: str,
+            confirm_unverified: Optional[str] = Form(None)):
+    def decide(session, keys, *, node, run_id, user):
+        return egress.release(session, keys, node=node, run_id=run_id, user=user,
+                              confirm_unverified=confirm_unverified == "on")
+    return _review(request, run_id, decide)
 
 
 @router.post("/ui/_/runs/{run_id}/withhold")

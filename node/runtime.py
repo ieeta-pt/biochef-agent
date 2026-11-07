@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 import retention
 from node import egress
+from node.policy import LocalRules
 from store import db, repo
 from store.states import EGRESS_FINISHED, EgressState
 
@@ -167,7 +168,9 @@ class NodeWorker:
         self.keys = keys
         self.node = node
         self.airlock = airlock
-        self.policy = policy
+        # Without the Policy Engine the agent checks what it can, and marks the
+        # rest as not verified (node/policy.py).
+        self.policy = policy or LocalRules()
         self.coordinator = coordinator
         self.workspace_of = workspace_of or retained.workspace
         self.keep_seconds = (retention.KEEP_OUTPUTS_SECONDS if keep_seconds is None
@@ -179,7 +182,7 @@ class NodeWorker:
         with db.writing(self.bind) as session:
             for row in repo.runs_ready_for_egress(session):
                 needs_airlock = mode() == egress.AIRLOCK
-                if self.policy is None or (needs_airlock and self.airlock is None):
+                if needs_airlock and self.airlock is None:
                     continue    # Nothing skips a stage: the run waits.
                 egress.start(session, row.run_id, self.policy, self.airlock,
                              mode=mode(), now=now, keep_seconds=self.keep_seconds)

@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 
 from node import datasets
 from node import keys as node_keys
-from node.policy import FakePolicyEngine
+from node.policy import FakePolicyEngine, LocalRules
 from store import db, migrate
 from store.errors import NotFound
 from ui import settings as ui_settings
@@ -67,8 +67,9 @@ def configured_app():
     if not migrate.is_current(bind):
         raise ui_settings.SettingsError("the database schema is not current; run: "
                                         "python -m store migrate")
-    # Development has no Policy Engine to ask, and the page labels this one.
-    policy = FakePolicyEngine() if settings.identity == ui_settings.DEV else None
+    # Development has no Policy Engine to ask, and the page labels this one. A
+    # node has none yet either, and says what its own check leaves open.
+    policy = FakePolicyEngine() if settings.identity == ui_settings.DEV else LocalRules()
     keys = node_keys.load()
     app = create_app(settings, bind=bind, keys=keys, policy=policy)
     if settings.bindings_file:

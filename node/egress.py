@@ -24,6 +24,7 @@ from typing import Protocol
 
 import audit
 from node import decisions
+from node.policy import UNVERIFIED_HERE
 from store import repo
 from store.errors import AlreadyPosted, Conflict
 from store.states import Action, EgressState, MessageKind, SubjectType
@@ -41,8 +42,8 @@ EVENT_NOTICE = "node.egress.notice"
 
 
 class Airlock(Protocol):
-    def submit(self, files) -> str:
-        ...
+    def submit(self, files, unverified=()) -> str:
+        """`unverified`: rules of the study nobody checked, for the reviewer."""
 
     def status(self, ticket) -> str:
         """`pending`, `released` or `withheld`."""
@@ -53,11 +54,13 @@ class FakeAirlock:
 
     def __init__(self):
         self.submitted = {}
+        self.unverified = {}
         self.answers = {}
 
-    def submit(self, files):
+    def submit(self, files, unverified=()):
         ticket = f"fake-{len(self.submitted) + 1}"
         self.submitted[ticket] = list(files)
+        self.unverified[ticket] = list(unverified)
         return ticket
 
     def status(self, ticket):
@@ -81,6 +84,12 @@ def passing(row):
     return [entry for entry in row.egress_files if entry.get("verdict") == PASS]
 
 
+def unverified(row):
+    """The rules nobody checked on the files that would leave, in a fixed order."""
+    found = {rule for entry in passing(row) for rule in entry.get("unverified", ())}
+    return [rule for rule in UNVERIFIED_HERE if rule in found]
+
+
 def _retain_until(session, run_id, state, now, keep_seconds):
     repo.set_egress_state(session, run_id, state, now, retain_seconds=keep_seconds)
 
@@ -100,10 +109,12 @@ def start(session, run_id, policy, airlock, *, mode, now=None, keep_seconds=None
         judged.append({**entry,
                        "verdict": verdict.verdict if verdict else HELD_BACK,
                        "reason": verdict.reason if verdict else
-                       "the output rules did not cover this file"})
+                       "the output rules did not cover this file",
+                       "unverified": list(verdict.unverified) if verdict else []})
     repo.save_run(session, run_id, state=run.state, egress_files=judged)
     if mode == AIRLOCK:
-        ticket = airlock.submit([entry["file"] for entry in passing(run)])
+        ticket = airlock.submit([entry["file"] for entry in passing(run)],
+                                unverified=unverified(run))
         repo.save_run(session, run_id, state=run.state, airlock_ticket=ticket,
                       airlock_at=now)
         repo.set_egress_state(session, run_id, EgressState.AWAITING_AIRLOCK, now)
@@ -145,16 +156,27 @@ def poll_airlock(session, airlock, keys, *, node, now=None, keep_seconds=None):
             keep_withheld_notice(session, keys, run.run_id, node=node, now=now)
 
 
-def _decide(session, keys, node, run_id, action, user, now):
+def _decide(session, keys, node, run_id, action, user, now, reason=None):
     return decisions.decide(session, keys, node=node, subject_type=SubjectType.EGRESS,
-                            subject_id=run_id, action=action, user=user, at=now)
+                            subject_id=run_id, action=action, user=user, at=now,
+                            reason=reason)
 
 
-def release(session, keys, *, node, run_id, user, now=None):
-    """A person lets the passing files go. Manual mode only, and signed."""
+def release(session, keys, *, node, run_id, user, now=None, confirm_unverified=False):
+    """A person lets the passing files go. Manual mode only, and signed.
+
+    Rules nobody checked need the person to say so, and the signed decision
+    names them, so the release is on the record as one made without them.
+    """
     now = now or repo.utcnow()
+    open_rules = unverified(repo.get_run(session, run_id))
+    if open_rules and not confirm_unverified:
+        raise Conflict(f"{' and '.join(open_rules)} have not been verified. Confirm "
+                       f"that you checked them before releasing.")
     repo.set_egress_state(session, run_id, EgressState.RELEASED, now)
-    return _decide(session, keys, node, run_id, Action.RELEASE, user, now)
+    reason = (f"released with rules not verified: {', '.join(open_rules)}"
+              if open_rules else None)
+    return _decide(session, keys, node, run_id, Action.RELEASE, user, now, reason)
 
 
 def withhold(session, keys, *, node, run_id, user, now=None, keep_seconds=None):

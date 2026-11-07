@@ -13,7 +13,7 @@ import pytest
 import audit
 from node import age, decisions, egress
 from node.keys import generate
-from node.policy import FakePolicyEngine
+from node.policy import FakePolicyEngine, LocalRules
 from store import db, repo
 from store.errors import AlreadyPosted, Conflict, IllegalTransition
 from store.states import EgressState, MessageKind, SubjectType, Verdict
@@ -47,9 +47,10 @@ def engine(tmp_path, monkeypatch):
     return bind
 
 
-def start(engine, mode, airlock=None):
+def start(engine, mode, airlock=None, policy=None):
     with db.writing(engine) as session:
-        egress.start(session, "run_1", FakePolicyEngine(), airlock, mode=mode, now=NOW)
+        egress.start(session, "run_1", policy or FakePolicyEngine(), airlock, mode=mode,
+                     now=NOW)
 
 
 def run_of(engine):
@@ -394,3 +395,90 @@ def test_a_notice_cannot_be_rewritten(engine):
         with db.writing(engine) as session:
             repo.message_of(session, "run_1", MessageKind.WITHHELD_RESULT).document = b"x"
     assert notice(engine).document != b"x"
+
+
+# Without the Policy Engine: the agent's own check (section 6.5)
+
+
+def local(engine, mode=egress.MANUAL, airlock=None, rules=None):
+    if rules is not None:
+        with db.writing(engine) as session:
+            repo.study_version_named(session, "st-01", 1).output_rules = rules
+    start(engine, mode, airlock, LocalRules())
+    return run_of(engine)
+
+
+def test_the_agent_checks_types_and_sizes_itself(engine):
+    run = local(engine)
+    assert {row["file"]: row["verdict"] for row in run.egress_files} == {
+        "summary.tsv": "pass", "log.txt": "held_back", "big.tsv": "held_back"}
+
+
+def test_what_it_cannot_check_is_marked_on_every_passing_file(engine):
+    run = local(engine)
+    assert run.egress_files[0]["unverified"] == ["min_count", "aggregates_only"]
+    assert egress.unverified(run) == ["min_count", "aggregates_only"]
+
+
+def test_held_back_files_carry_no_marking(engine):
+    run = local(engine)
+    assert all(row["unverified"] == [] for row in run.egress_files
+               if row["verdict"] == "held_back")
+
+
+def test_rules_the_study_does_not_set_are_not_marked(engine):
+    rules = {"types": ["tsv"], "max_bytes": 100}
+    assert egress.unverified(local(engine, rules=rules)) == []
+
+
+def test_aggregates_only_false_is_nothing_to_verify(engine):
+    rules = {"types": ["tsv"], "aggregates_only": False}
+    assert egress.unverified(local(engine, rules=rules)) == []
+
+
+def test_releasing_unverified_rules_needs_a_confirmation(engine):
+    local(engine)
+    with pytest.raises(Conflict, match="min_count and aggregates_only have not been"):
+        with db.writing(engine) as session:
+            egress.release(session, KEYS, node=NODE, run_id="run_1", user="j.silva",
+                           now=NOW)
+    assert run_of(engine).egress_state == "awaiting_review"
+
+
+def test_a_confirmed_release_is_signed_and_says_what_was_not_verified(engine, tmp_path):
+    local(engine)
+    with db.writing(engine) as session:
+        decision = egress.release(session, KEYS, node=NODE, run_id="run_1",
+                                  user="j.silva", now=NOW, confirm_unverified=True).id
+    with db.reading(engine) as session:
+        row = repo.get_decision(session, decision)
+    signed = decisions.verify(row.object_raw, row.signature, KEYS.signing.public_key())
+    assert signed["reason"] == ("released with rules not verified: min_count, "
+                                "aggregates_only")
+    assert audit.read(str(tmp_path / "audit.jsonl"))[-1]["reason"] == signed["reason"]
+
+
+def test_a_release_with_everything_verified_needs_no_confirmation(engine):
+    decision = review(engine, egress.release)
+    with db.reading(engine) as session:
+        assert repo.get_decision(session, decision).reason is None
+
+
+def test_the_airlock_gets_the_same_marking(engine):
+    airlock = egress.FakeAirlock()
+    run = local(engine, egress.AIRLOCK, airlock)
+    assert airlock.unverified[run.airlock_ticket] == ["min_count", "aggregates_only"]
+    assert airlock.submitted[run.airlock_ticket] == ["summary.tsv"]
+
+
+def test_the_fake_engine_marks_nothing(engine):
+    airlock = egress.FakeAirlock()
+    start(engine, egress.AIRLOCK, airlock)
+    assert airlock.unverified[run_of(engine).airlock_ticket] == []
+
+
+def test_the_studys_rules_verdict_says_what_stays_open():
+    verdict = LocalRules().check_rules({**RULES, "aggregates_only": True})
+    assert verdict.acceptable is False
+    assert "min_count and aggregates_only cannot be" in verdict.text
+    assert LocalRules().check_rules({"types": ["tsv"]}).acceptable is True

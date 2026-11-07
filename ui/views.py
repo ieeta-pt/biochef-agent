@@ -9,7 +9,7 @@ import json
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
-from node import review
+from node import egress, review
 from store import repo
 from store.states import Action, MessageKind, SubjectType, Verdict, VersionState
 from ui import compare, format as fmt
@@ -685,8 +685,10 @@ def run_page(session, run, tab, settings, log="run"):
         "files": [{"file": row["file"], "size": _size(row["size"]),
                    "pass": row.get("verdict") == "pass",
                    "judged": row.get("verdict") is not None,
-                   "reason": row.get("reason")} for row in files],
+                   "reason": row.get("reason"),
+                   "unverified": row.get("unverified", [])} for row in files],
         "good": good, "held": held,
+        "unverified": egress.unverified(run),
         "airlock_at": fmt.minute(run.airlock_at) if run.airlock_at else None,
         "notice": notice and {"sent": fmt.minute(notice.sent_at) if notice.sent_at
                               else None},
