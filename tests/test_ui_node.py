@@ -1,0 +1,239 @@
+"""The Node screen (mock 07) and the audit check of section 8.7."""
+
+import json
+from datetime import timedelta
+
+import pytest
+
+import audit
+from node import decisions, review
+from store import db, repo, seed
+from store.fixtures import mock
+from store.states import Action, SubjectType
+from tests.store_support import NOW, add_version, fresh_database
+from tests.ui_support import KEYS, client_for, dev_settings
+from ui.views import events_without_decision
+
+
+@pytest.fixture
+def trail(tmp_path, monkeypatch):
+    path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("BIOCHEF_AUDIT_LOG", str(path))
+    return path
+
+
+@pytest.fixture
+def engine(tmp_path, trail):
+    bind = fresh_database(tmp_path)[1]
+    seed.seed(bind, keys=KEYS)
+    return bind
+
+
+def web(engine, **settings):
+    return client_for(dev_settings(node_name=mock.NODE, **settings), bind=engine)
+
+
+def test_the_four_cards(engine):
+    text = web(engine).get("/ui/node").text
+    assert "Ready" in text and "Up to date" in text and "5 nodes" in text
+    assert "Online" in text and "Last poll" in text
+    assert "subprocess" in text
+
+
+def test_fingerprints_are_short_with_the_full_ones_behind_a_toggle(engine):
+    text = web(engine).get("/ui/node").text
+    print_ = KEYS.signing_fingerprint
+    assert f"ed25519:{print_[8:12]}…{print_[-4:]}" in text
+    assert print_ in text and "Show fingerprints" in text
+    assert KEYS.encryption_fingerprint in text
+
+
+def test_no_private_key_reaches_the_page(engine):
+    assert "PRIVATE" not in web(engine).get("/ui/node").text
+
+
+def test_isolation_is_off_in_warn_colours(engine):
+    text = web(engine, runner="apptainer").get("/ui/node").text
+    assert '<span class="text-[13px] font-medium text-warn">Network isolation: off</span>' in text
+    assert "steps run without network" not in text
+
+
+def test_busy_slots_are_counted_from_the_store(engine):
+    assert "1 of 4 slots busy" in web(engine).get("/ui/node").text
+
+
+def test_the_settings(engine):
+    text = web(engine, egress_mode="manual", bindings_from_ui=True, local_root="/data",
+               signing_mode="strict").get("/ui/node").text
+    assert "Review in the agent" in text and "through the TRE airlock" in text
+    assert "Config file and this page" in text and "/data" in text
+    assert "Kept 1 hour, at most 32 runs, then deleted" in text
+    assert "strict · unsigned tools never run" in text
+
+
+def test_the_other_settings(engine):
+    text = web(engine).get("/ui/node").text
+    assert "Through the TRE airlock" in text and "Config file only" in text
+    assert "off · tool signatures are not checked" in text
+
+
+def test_a_silent_coordinator_goes_offline_in_bad_colours(engine):
+    with db.writing(engine) as session:
+        repo.record_poll(session, ok=True, now=repo.utcnow() - timedelta(minutes=10))
+    text = web(engine).get("/ui/node").text
+    assert "Offline since" in text and "text-bad" in text
+
+
+def test_three_poll_intervals_is_the_limit(engine):
+    with db.writing(engine) as session:
+        repo.record_poll(session, ok=True, now=repo.utcnow() - timedelta(seconds=80))
+    assert "Online" in web(engine).get("/ui/node").text
+
+
+def test_a_node_that_never_polled_says_so(tmp_path, trail):
+    (tmp_path / "e").mkdir()
+    bind = fresh_database(tmp_path / "e")[1]
+    text = web(bind).get("/ui/node").text
+    assert "Not connected yet" in text and "No signed node list yet" in text
+    assert "Nothing in the audit trail yet." in text
+
+
+def decide(session, user="j.silva", subject_id=7, action=Action.REFUSE, at=NOW):
+    return decisions.decide(session, KEYS, node="n",
+                            subject_type=SubjectType.WORKFLOW_VERSION,
+                            subject_id=subject_id, action=action, user=user, at=at)
+
+
+def test_the_audit_log_shows_the_newest_first(engine, trail):
+    with db.writing(engine) as session:
+        decide(session, subject_id=1)
+        decide(session, subject_id=2, action=Action.APPROVE)
+    text = web(engine).get("/ui/node").text
+    assert text.index("Workflow version approved") < text.index("Workflow version refused")
+    assert "node key" in text
+
+
+def test_only_the_newest_50_are_shown(engine, trail):
+    for index in range(60):
+        audit.record("run.state", run_id=f"run_{index}", state="RUNNING")
+    text = web(engine).get("/ui/node").text
+    assert "run_59" in text and "run_10<" in text and "run_9<" not in text
+
+
+def test_every_kind_of_event_has_words(engine, trail):
+    audit.record("node.request.checked", request_id="r1", verdict="refused",
+                 failed_check="expired")
+    audit.record("node.request.checked", request_id="r2", verdict="joined")
+    audit.record("node.request.checked", request_id="r3", verdict="accepted")
+    text = web(engine).get("/ui/node").text
+    assert "Request refused, expired" in text
+    assert "Repeated request joined existing run" in text and "Request accepted" in text
+
+
+def test_a_bad_line_in_the_trail_is_shown_not_hidden(engine, trail):
+    audit.record("run.state", run_id="r1", state="RUNNING")
+    with open(trail, "a") as handle:
+        handle.write("not json\n")
+    text = web(engine).get("/ui/node").text
+    assert "Unreadable line 2" in text and '<tr class="bg-bad-soft">' in text
+
+
+def test_the_export_is_the_file(engine, trail):
+    audit.record("run.state", run_id="r1", state="RUNNING")
+    response = web(engine).get("/ui/node/audit.jsonl")
+    assert "attachment" in response.headers["content-disposition"]
+    assert json.loads(response.text)["run_id"] == "r1"
+
+
+def test_a_trail_that_does_not_exist_yet_is_a_404(engine):
+    assert web(engine).get("/ui/node/audit.jsonl").status_code == 404
+
+
+def test_the_api_has_no_audit_route():
+    import main
+    paths = [route.path for route in main.app.routes]
+    assert not [path for path in paths if "audit" in path]
+
+
+# The audit check
+
+
+def orphans(engine):
+    with db.reading(engine) as session:
+        return events_without_decision(session, audit.read())
+
+
+@pytest.fixture
+def bare(tmp_path, trail):
+    return fresh_database(tmp_path)[1]
+
+
+def test_a_healthy_trail_has_nothing_to_show(engine, trail):
+    with db.writing(engine) as session:
+        decide(session)
+    assert orphans(engine) == []
+    assert "✓ Every decision event in the audit trail has its decision." in (
+        web(engine).get("/ui/node").text)
+
+
+def test_a_failed_commit_leaves_an_event_with_no_decision(bare, trail):
+    with pytest.raises(RuntimeError):
+        with db.writing(bare) as session:
+            decide(session)
+            raise RuntimeError("the commit failed")
+    assert len(orphans(bare)) == 1
+
+
+def test_the_screen_lists_it_in_warn_colours(bare, trail):
+    with pytest.raises(RuntimeError):
+        with db.writing(bare) as session:
+            decide(session, user="a.costa")
+            raise RuntimeError("the commit failed")
+    text = web(bare).get("/ui/node").text
+    assert "1 audit event with no decision behind it." in text
+    assert '<tr class="bg-warn-soft">' in text and "a.costa" in text
+
+
+def test_an_undone_decision_is_accounted_for(bare, trail):
+    with db.writing(bare) as session:
+        version = add_version(session).id
+        decision = review.approve_study(session, KEYS, node="n", version_id=version,
+                                         user="j.silva", dac_confirmed=True, now=NOW).id
+    with db.writing(bare) as session:
+        review.undo(session, decision, user="j.silva")
+    assert orphans(bare) == []
+
+
+def test_an_id_reused_after_a_rollback_does_not_hide_the_event(bare, trail):
+    with pytest.raises(RuntimeError):
+        with db.writing(bare) as session:
+            first = decide(session, subject_id=1).id
+            raise RuntimeError("the commit failed")
+    with db.writing(bare) as session:
+        second = decide(session, subject_id=2).id
+    assert first == second
+    found = orphans(bare)
+    assert [event["subject_id"] for event in found] == ["1"]
+
+
+def test_an_undo_matches_the_latest_event_with_that_id(bare, trail):
+    """A rolled back event, then a real decision with the same id, then its undo."""
+    with pytest.raises(RuntimeError):
+        with db.writing(bare) as session:
+            decide(session, subject_id=1)
+            raise RuntimeError("the commit failed")
+    with db.writing(bare) as session:
+        decision = decide(session, subject_id=2).id
+    with db.writing(bare) as session:
+        decisions.undo(session, decision, user="j.silva")
+    assert [event["subject_id"] for event in orphans(bare)] == ["1"]
+
+
+def test_the_check_only_reads(bare, trail):
+    with pytest.raises(RuntimeError):
+        with db.writing(bare) as session:
+            decide(session)
+            raise RuntimeError("the commit failed")
+    before = trail.read_text()
+    web(bare).get("/ui/node")
+    assert trail.read_text() == before

@@ -10,7 +10,9 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from node import egress, review
+from node.keys import short_fingerprint
 from store import repo
+from store.models import Decision
 from store.states import Action, MessageKind, SubjectType, Verdict, VersionState
 from ui import compare, format as fmt
 
@@ -715,6 +717,142 @@ def _log_text(run, log):
     if entry is None:
         return "This step has no log. Per step logs exist only after the run ends."
     return (entry.get("stdout", "") + entry.get("stderr", "")) or "Nothing logged."
+
+
+# Node
+
+ISOLATED_RUNNERS = ()
+"""Runners whose steps have no network. None yet (parts 9 and 9b)."""
+
+SIGNING_TEXT = {"strict": "strict · unsigned tools never run",
+                "warn": "warn · unsigned tools run, with a warning",
+                "off": "off · tool signatures are not checked"}
+ACTIONS = {"approve": "approved", "refuse": "refused", "withdraw": "withdrawn",
+           "release": "released", "withhold": "withheld", "bind": "bound",
+           "unbind": "unbound", "cancel": "cancelled"}
+SUBJECTS = {"study_version": "Study version", "workflow_version": "Workflow version",
+            "request": "Request", "run": "Run", "egress": "Egress",
+            "dataset_binding": "Dataset"}
+AUDIT_ROWS = 50
+
+
+def _coordinator_card(session, settings, now):
+    status = repo.node_status(session)
+    if status is None or status.last_poll_at is None:
+        return {"kind": "mute", "headline": "Not connected yet", "detail": None}
+    last = fmt.ago(status.last_poll_at, now)
+    success = status.last_success_at
+    limit = timedelta(seconds=3 * settings.poll_seconds)
+    if success is None or now - success > limit:
+        since = fmt.minute(success) if success else "the first poll"
+        return {"kind": "bad", "headline": f"Offline since {since}",
+                "detail": f"Last poll {last}"}
+    return {"kind": "ok", "headline": "Online", "detail": f"Last poll {last}"}
+
+
+def _federation_card(session):
+    latest = repo.latest_federation_list(session)
+    if latest is None:
+        return {"kind": "mute", "headline": "No signed node list yet", "detail": None}
+    return {"kind": "ok", "headline": "Up to date",
+            "detail": f'{compare.plural(len(latest.nodes), "node")} · list v{latest.version}'}
+
+
+def _span(seconds):
+    if seconds % 3600 == 0:
+        return compare.plural(seconds // 3600, "hour")
+    if seconds % 60 == 0:
+        return compare.plural(seconds // 60, "minute")
+    return compare.plural(seconds, "second")
+
+
+def _event_text(event):
+    name = event.get("event", "")
+    if name == "node.decision":
+        subject = SUBJECTS.get(event.get("subject_type"), "Subject")
+        return f'{subject} {ACTIONS.get(event.get("action"), event.get("action"))}'
+    if name == "node.decision.undone":
+        return "Decision undone"
+    if name == "node.request.checked":
+        if event.get("verdict") == "refused":
+            return f'Request refused, {CHECK_LABELS.get(event.get("failed_check"), "")}'
+        if event.get("verdict") == "joined":
+            return "Repeated request joined existing run"
+        return "Request accepted"
+    if name == "run.state":
+        return f'Run {event.get("state")}'
+    if name == "unreadable":
+        return f'Unreadable line {event.get("line")}'
+    return name
+
+
+def _audit_row(event):
+    subject = (event.get("subject_id") or event.get("request_id")
+               or event.get("run_id") or event.get("decision_id") or "n/a")
+    when = event.get("at")
+    try:
+        when = fmt.minute(datetime.fromisoformat(when))
+    except (TypeError, ValueError):
+        when = "n/a"
+    return {"when": when, "event": _event_text(event), "subject": str(subject),
+            "by": event.get("user") or event.get("caller") or "agent",
+            "signed": "node key" if event.get("signed") else "n/a",
+            "bad": event.get("event") == "unreadable"}
+
+
+def events_without_decision(session, events):
+    """Decision events with no decision behind them (section 8.7).
+
+    An event is written before its transaction commits, so a commit that fails
+    leaves one. Matched on more than the id, because SQLite gives the id of a
+    rolled back row to the next decision. An undone event cancels the latest
+    decision event with that id, since that decision was deleted on purpose.
+    """
+    open_events = []
+    for event in events:
+        if event.get("event") == "node.decision":
+            open_events.append(event)
+        elif event.get("event") == "node.decision.undone":
+            for index in range(len(open_events) - 1, -1, -1):
+                if open_events[index].get("decision_id") == event.get("decision_id"):
+                    del open_events[index]
+                    break
+    missing = []
+    for event in open_events:
+        row = session.get(Decision, event.get("decision_id"))
+        if row is None or (row.subject_type, row.subject_id, row.action, row.user) != (
+                event.get("subject_type"), event.get("subject_id"),
+                event.get("action"), event.get("user")):
+            missing.append(event)
+    return missing
+
+
+def node_page(session, settings, keys, events, now):
+    orphans = events_without_decision(session, events)
+    isolated = settings.runner in ISOLATED_RUNNERS
+    newest = list(reversed(events))[:AUDIT_ROWS]
+    return {
+        "signing": keys.signing_fingerprint, "encryption": keys.encryption_fingerprint,
+        "signing_short": short_fingerprint(keys.signing_fingerprint),
+        "encryption_short": short_fingerprint(keys.encryption_fingerprint),
+        "federation": _federation_card(session),
+        "coordinator": _coordinator_card(session, settings, now),
+        "runner": settings.runner, "busy": repo.count_busy_runs(session),
+        "slots": settings.max_concurrent_runs, "isolated": isolated,
+        "egress": ("Through the TRE airlock", "review in the agent")
+        if settings.egress_mode == "airlock"
+        else ("Review in the agent", "through the TRE airlock"),
+        "bindings": ("Config file and this page", "config file only")
+        if settings.bindings_from_ui
+        else ("Config file only", "config file and this page"),
+        "root": settings.local_root or "Not set",
+        "retention": (f"Kept {_span(settings.keep_outputs_seconds)}, at most "
+                      f"{settings.max_retained_runs} runs, then deleted"),
+        "signatures": SIGNING_TEXT.get(settings.signing_mode, settings.signing_mode),
+        "events": [_audit_row(event) for event in newest],
+        "orphans": [_audit_row(event) for event in orphans],
+        "orphan_ids": [event.get("decision_id") for event in orphans],
+    }
 
 
 # Datasets
