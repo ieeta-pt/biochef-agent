@@ -136,6 +136,28 @@ def test_outside_the_root_is_refused_in_place(engine, root):
     assert "outside the data root" in response.text
 
 
+@pytest.mark.parametrize("value,message", [
+    ("x" * 2049, "at most 2048 characters"), ("a\x00b", "control characters"),
+    ("https://dac.example.org/a\nb", "control characters"),
+])
+def test_a_bad_visa_value_from_the_page_is_refused_in_place(engine, root, value, message):
+    response = post(client(engine, root), "/ui/_/datasets/bind",
+                    dataset_id=mock.RARE_DATASET, location="rare/pilot_v1",
+                    visa_value=value)
+    assert response.status_code == 409
+    assert message in response.text
+    with db.reading(engine) as session:
+        assert repo.dataset_binding(session, mock.RARE_DATASET) is None
+
+
+def test_the_page_keeps_a_visa_value_without_the_space_around_it(engine, root):
+    post(client(engine, root), "/ui/_/datasets/bind", dataset_id=mock.RARE_DATASET,
+         location="rare/pilot_v1", visa_value="  https://dac.example.org/rare \n")
+    with db.reading(engine) as session:
+        assert repo.dataset_binding(session, mock.RARE_DATASET).visa_value == (
+            "https://dac.example.org/rare")
+
+
 def test_the_config_wins_in_place(engine, root):
     response = post(client(engine, root), "/ui/_/datasets/bind",
                     dataset_id=mock.CARDIO_DATASET, location="rare/pilot_v1")
