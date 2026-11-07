@@ -104,7 +104,7 @@ def test_the_container_is_contained_by_default():
     assert runner_module.APPTAINER_ARGS == ("--contain --cleanenv --net "
                                             "--network none")
     argv = ApptainerRunner(cache_dir="/cache").command(_Workspace("/ws"))
-    assert "--apptainer-args=--contain --cleanenv" in argv
+    assert "--apptainer-args=--contain --cleanenv --net --network none" in argv
 
 
 def test_the_apptainer_args_are_one_argv_element():
@@ -329,14 +329,14 @@ def test_the_service_writes_the_preamble_into_the_snakefile():
     ("", False),
 ])
 def test_isolation_is_read_from_the_flags_actually_passed(args, isolated):
-    runner = runner_module.ApptainerRunner(image="docker://debian:stable-slim",
-                                           apptainer_args=args)
+    runner = ApptainerRunner(image="docker://debian:stable-slim",
+                             apptainer_args=args)
     assert runner.isolates_network is isolated
 
 
 def test_the_subprocess_runner_isolates_nothing():
-    assert runner_module.SubprocessRunner().isolates_network is False
+    assert SubprocessRunner().isolates_network is False
 
 
 def test_the_default_isolates_the_network():
-    assert runner_module.ApptainerRunner().isolates_network is True
+    assert ApptainerRunner().isolates_network is True

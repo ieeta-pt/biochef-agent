@@ -93,7 +93,7 @@ rule network:
     shell:
         "if timeout 10 bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' 2>/dev/null; "
         "then echo reachable; else echo unreachable; fi > {output.o_0}; "
-        "tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' ' | grep -v '^lo$' "
+        "tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' ' | sed '/^lo$/d' "
         "| wc -l >> {output.o_0}"
 
 rule work:
