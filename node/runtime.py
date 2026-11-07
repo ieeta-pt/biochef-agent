@@ -185,7 +185,8 @@ class NodeWorker:
                              mode=mode(), now=now, keep_seconds=self.keep_seconds)
         if self.airlock is not None:
             with db.writing(self.bind) as session:
-                egress.poll_airlock(session, self.airlock, now=now,
+                egress.poll_airlock(session, self.airlock, self.keys, node=self.node,
+                                    now=now,
                                     keep_seconds=self.keep_seconds)
         if self.coordinator is not None:
             with db.writing(self.bind) as session:

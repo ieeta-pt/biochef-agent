@@ -10,6 +10,10 @@ The Policy Engine, the TRE's airlock and the coordinator's result endpoint are n
 there yet, so all three are protocols with fakes for development and tests. With
 none of them a run waits rather than leaves: a missing piece stops egress, and
 nothing skips a stage to keep things moving.
+
+A withheld result still gets an answer. The signed notice is made when the result
+is withheld, by a person or by the airlock, and kept as a message waiting to be
+sent: what goes out is what was decided then. Sending it is part 8.
 """
 
 import base64
@@ -18,10 +22,11 @@ import io
 import tarfile
 from typing import Protocol
 
+import audit
 from node import decisions
 from store import repo
-from store.errors import Conflict
-from store.states import Action, EgressState, SubjectType
+from store.errors import AlreadyPosted, Conflict
+from store.states import Action, EgressState, MessageKind, SubjectType
 
 AIRLOCK = "airlock"
 MANUAL = "manual"
@@ -31,6 +36,8 @@ HELD_BACK = "held_back"
 PENDING = "pending"
 RELEASED = "released"
 WITHHELD = "withheld"
+
+EVENT_NOTICE = "node.egress.notice"
 
 
 class Airlock(Protocol):
@@ -104,7 +111,29 @@ def start(session, run_id, policy, airlock, *, mode, now=None, keep_seconds=None
         repo.set_egress_state(session, run_id, EgressState.AWAITING_REVIEW, now)
 
 
-def poll_airlock(session, airlock, *, now=None, keep_seconds=None):
+def _recipient_key(session, request):
+    """The requester's age key, from the study version the request named."""
+    version = repo.study_version_named(session, request.study_id, request.study_version)
+    return next(row for row in repo.member_keys(session, version.id)
+                if row.member == request.member).result_key
+
+
+def keep_withheld_notice(session, keys, run_id, *, node, now=None):
+    """The signed answer for a result that does not leave, kept until it is sent."""
+    decisions.require_a_trail()
+    now = now or repo.utcnow()
+    run = repo.get_run(session, run_id)
+    request = repo.get_request(session, run.request_id)
+    document = partial(keys, request, _recipient_key(session, request), WITHHELD,
+                       node=node)
+    row = repo.add_message(session, run_id, MessageKind.WITHHELD_RESULT,
+                           decisions.canonical(document), now)
+    audit.record(EVENT_NOTICE, run_id=run_id, request_id=request.request_id,
+                 message_id=row.id, decision=WITHHELD, signed_by=keys.signing_fingerprint)
+    return row
+
+
+def poll_airlock(session, airlock, keys, *, node, now=None, keep_seconds=None):
     now = now or repo.utcnow()
     for run in repo.runs_in_egress_state(session, EgressState.AWAITING_AIRLOCK):
         answer = airlock.status(run.airlock_ticket)
@@ -113,6 +142,7 @@ def poll_airlock(session, airlock, *, now=None, keep_seconds=None):
         elif answer == WITHHELD:
             repo.set_egress_state(session, run.run_id, EgressState.WITHHELD, now,
                                   retain_seconds=keep_seconds)
+            keep_withheld_notice(session, keys, run.run_id, node=node, now=now)
 
 
 def _decide(session, keys, node, run_id, action, user, now):
@@ -131,7 +161,9 @@ def withhold(session, keys, *, node, run_id, user, now=None, keep_seconds=None):
     now = now or repo.utcnow()
     repo.set_egress_state(session, run_id, EgressState.WITHHELD, now,
                           retain_seconds=keep_seconds)
-    return _decide(session, keys, node, run_id, Action.WITHHOLD, user, now)
+    decision = _decide(session, keys, node, run_id, Action.WITHHOLD, user, now)
+    keep_withheld_notice(session, keys, run_id, node=node, now=now)
+    return decision
 
 
 def undo_review(session, decision, *, user):
@@ -143,6 +175,12 @@ def undo_review(session, decision, *, user):
                 else EgressState.WITHHELD.value)
     if run.egress_state != expected:
         raise Conflict("This decision cannot be undone: the run has moved on.")
+    if decision.action == Action.WITHHOLD.value:
+        try:
+            repo.delete_unsent_message(session, run.run_id, MessageKind.WITHHELD_RESULT)
+        except AlreadyPosted:
+            raise Conflict("The requester has already been told the result was "
+                           "withheld, so this cannot be undone.") from None
     repo.reopen_review(session, run.run_id)
     decisions.undo(session, decision.id, user=user)
 
@@ -202,17 +240,14 @@ def send_released(session, keys, coordinator, workspace_of, *, node, now=None,
         if ws is None:
             continue
         request = repo.get_request(session, run.request_id)
-        version = repo.study_version_named(session, request.study_id,
-                                           request.study_version)
-        key = next(row for row in repo.member_keys(session, version.id)
-                   if row.member == request.member)
 
         def read(name):
             with ws.open_read(name) as handle:
                 return handle.read()
 
         names = [entry["file"] for entry in passing(run)]
-        coordinator.post_result(partial(keys, request, key.result_key, RELEASED,
+        coordinator.post_result(partial(keys, request,
+                                        _recipient_key(session, request), RELEASED,
                                         node=node, names=names, read=read,
                                         encrypt=_encrypt))
         repo.set_egress_state(session, run.run_id, EgressState.SENT, now,

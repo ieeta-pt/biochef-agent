@@ -15,8 +15,8 @@ from node import age, decisions, egress
 from node.keys import generate
 from node.policy import FakePolicyEngine
 from store import db, repo
-from store.errors import Conflict, IllegalTransition
-from store.states import EgressState, SubjectType, Verdict
+from store.errors import AlreadyPosted, Conflict, IllegalTransition
+from store.states import EgressState, MessageKind, SubjectType, Verdict
 from tests.store_support import NOW, RULES, add_version, fresh_database
 
 KEYS = generate()
@@ -95,7 +95,8 @@ def answered(engine, answer):
     start(engine, egress.AIRLOCK, airlock)
     airlock.answers[run_of(engine).airlock_ticket] = answer
     with db.writing(engine) as session:
-        egress.poll_airlock(session, airlock, now=NOW, keep_seconds=KEEP)
+        egress.poll_airlock(session, airlock, KEYS, node=NODE, now=NOW,
+                            keep_seconds=KEEP)
     return run_of(engine)
 
 
@@ -290,3 +291,106 @@ def test_the_rules_used_are_the_studys():
         egress_files = FILES
     verdicts = FakePolicyEngine().check(Row, RULES)
     assert [row.verdict for row in verdicts] == ["pass", "held_back", "held_back"]
+
+
+# The withheld notice, kept for part 8 to send
+
+
+def notice(engine):
+    with db.reading(engine) as session:
+        return repo.message_of(session, "run_1", MessageKind.WITHHELD_RESULT)
+
+
+def test_withholding_keeps_a_signed_notice_waiting_to_be_sent(engine):
+    review(engine, egress.withhold, keep_seconds=KEEP)
+    row = notice(engine)
+    assert row.sent_at is None and row.created_at == NOW
+    document = json.loads(row.document)
+    assert document["decision"] == "withheld" and document["ciphertext"] is None
+    assert document["statement"]["subject"] == []
+    statement = decisions.canonical(document["statement"])
+    signature = base64.urlsafe_b64decode(document["signature"] + "==")
+    KEYS.signing.public_key().verify(signature, statement)
+    fingerprint = "sha256:" + hashlib.sha256(str(RESULT.to_public()).encode()).hexdigest()
+    assert document["statement"]["predicate"]["recipient_key"] == fingerprint
+
+
+def test_the_notice_is_the_canonical_form_of_what_was_signed(engine):
+    review(engine, egress.withhold)
+    row = notice(engine)
+    assert decisions.canonical(json.loads(row.document)) == row.document
+
+
+def test_the_airlock_withholding_keeps_a_notice_too(engine):
+    answered(engine, "withheld")
+    assert notice(engine) is not None
+
+
+def test_a_release_keeps_no_notice(engine):
+    review(engine, egress.release)
+    assert notice(engine) is None
+
+
+def test_the_airlock_releasing_keeps_no_notice(engine):
+    answered(engine, "released")
+    assert notice(engine) is None
+
+
+def test_the_notice_is_audited(engine, tmp_path):
+    review(engine, egress.withhold)
+    event = [row for row in audit.read(str(tmp_path / "audit.jsonl"))
+             if row["event"] == "node.egress.notice"][0]
+    assert (event["run_id"], event["decision"], event["message_id"]) == (
+        "run_1", "withheld", notice(engine).id)
+    assert event["signed_by"] == KEYS.signing_fingerprint
+
+
+def test_undoing_a_withholding_drops_its_notice(engine):
+    undo(engine, review(engine, egress.withhold))
+    assert notice(engine) is None
+
+
+def test_a_withholding_whose_notice_went_cannot_be_undone(engine):
+    decision = review(engine, egress.withhold)
+    with db.writing(engine) as session:
+        repo.mark_message_sent(session, notice(engine).id, now=NOW)
+    with pytest.raises(Conflict, match="already been told"):
+        undo(engine, decision)
+    assert run_of(engine).egress_state == "withheld"
+    assert notice(engine).sent_at == NOW
+
+
+def test_withholding_again_after_an_undo_keeps_a_new_notice(engine):
+    undo(engine, review(engine, egress.withhold))
+    with db.writing(engine) as session:
+        egress.withhold(session, KEYS, node=NODE, run_id="run_1", user="j.silva", now=NOW)
+    assert notice(engine) is not None
+
+
+def test_unsent_messages_are_listed_and_sent_once(engine):
+    review(engine, egress.withhold)
+    with db.writing(engine) as session:
+        waiting = repo.unsent_messages(session)
+        assert [row.run_id for row in waiting] == ["run_1"]
+        repo.mark_message_sent(session, waiting[0].id, now=NOW)
+        assert repo.unsent_messages(session) == []
+    with pytest.raises(AlreadyPosted):
+        with db.writing(engine) as session:
+            repo.mark_message_sent(session, notice(engine).id, now=NOW)
+
+
+def test_no_trail_no_notice(engine, monkeypatch):
+    start(engine, egress.MANUAL)
+    monkeypatch.delenv("BIOCHEF_AUDIT_LOG")
+    with pytest.raises(decisions.DecisionError):
+        with db.writing(engine) as session:
+            egress.keep_withheld_notice(session, KEYS, "run_1", node=NODE, now=NOW)
+    assert notice(engine) is None
+
+
+def test_a_notice_cannot_be_rewritten(engine):
+    review(engine, egress.withhold)
+    with pytest.raises(Exception):
+        with db.writing(engine) as session:
+            repo.message_of(session, "run_1", MessageKind.WITHHELD_RESULT).document = b"x"
+    assert notice(engine).document != b"x"

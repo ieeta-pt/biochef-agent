@@ -17,12 +17,12 @@ from sqlmodel import select
 from store.errors import (AlreadyPosted, Conflict, IdentityNotVerified,
                           IllegalTransition, NotFound, StaleList)
 from store.models import (DatasetBinding, Decision, FederationList, MemberKey,
-                          NodeStatus, Request, RunSummary, Study, StudyVersion,
-                          WorkflowVersion)
+                          NodeStatus, OutgoingMessage, Request, RunSummary, Study,
+                          StudyVersion, WorkflowVersion)
 from store.states import (BUSY_RUN_STATES, CANCELLABLE_RUN_STATES,
                           EGRESS_ALLOWED, EGRESS_FINISHED, STUDY_ALLOWED,
                           WORKFLOW_ALLOWED, BindingSource, EgressState,
-                          RefusalCode, VersionState, Verdict)
+                          MessageKind, RefusalCode, VersionState, Verdict)
 
 
 SHORT_ID_LENGTH = 8
@@ -597,6 +597,47 @@ def reopen_review(session, run_id):
     row.egress_state = EgressState.AWAITING_REVIEW.value
     row.retain_until = None
     return row
+
+
+def add_message(session, run_id, kind, document, now=None):
+    """Keep a signed document for the coordinator. One of each kind per run."""
+    get_run(session, run_id)
+    row = OutgoingMessage(run_id=run_id, kind=MessageKind(kind).value,
+                          document=document, created_at=now or utcnow())
+    session.add(row)
+    session.flush()
+    return row
+
+
+def message_of(session, run_id, kind):
+    return session.exec(select(OutgoingMessage).where(
+        OutgoingMessage.run_id == run_id,
+        OutgoingMessage.kind == MessageKind(kind).value)).first()
+
+
+def unsent_messages(session):
+    """What is waiting for the coordinator, oldest first. Sending it is part 8."""
+    return list(session.exec(select(OutgoingMessage)
+                             .where(OutgoingMessage.sent_at.is_(None))
+                             .order_by(OutgoingMessage.created_at, OutgoingMessage.id)))
+
+
+def mark_message_sent(session, message_id, now=None):
+    row = _get(session, OutgoingMessage, message_id)
+    if row.sent_at is not None:
+        raise AlreadyPosted(f"message {message_id} was already sent")
+    row.sent_at = now or utcnow()
+    return row
+
+
+def delete_unsent_message(session, run_id, kind):
+    """Undo of what the message says. Refused once it has gone, in one statement."""
+    result = session.exec(delete(OutgoingMessage).where(
+        OutgoingMessage.run_id == run_id,
+        OutgoingMessage.kind == MessageKind(kind).value,
+        OutgoingMessage.sent_at.is_(None)))
+    if result.rowcount == 0 and message_of(session, run_id, kind) is not None:
+        raise AlreadyPosted(f"the {kind} message of {run_id} was already sent")
 
 
 def runs_with_workspaces(session):

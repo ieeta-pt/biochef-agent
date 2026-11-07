@@ -28,11 +28,11 @@
     {% endif %}
     <div class="card flex flex-col gap-1 p-4 text-[13px]">
       <span class="lbl">3 · Encrypt and sign</span>
-      <span>{% if detail.egress_state == 'sent' %}For {{ detail.member }}, signed with the node key{% elif detail.egress_state == 'released' %}Waiting to be encrypted for {{ detail.member }}{% else %}Not yet{% endif %}</span>
+      <span>{% if detail.egress_state == 'sent' %}For {{ detail.member }}, signed with the node key{% elif detail.egress_state == 'released' %}Waiting to be encrypted for {{ detail.member }}{% elif detail.notice %}Nothing to encrypt. A notice that the result was withheld is signed with the node key{% else %}Not yet{% endif %}</span>
     </div>
     <div class="card flex flex-col gap-1 p-4 text-[13px]">
       <span class="lbl">4 · Sent to coordinator</span>
-      <span>{{ 'Posted' if detail.egress_state == 'sent' else 'Not yet' }}</span>
+      <span>{% if detail.egress_state == 'sent' %}Posted{% elif detail.notice and detail.notice.sent %}Notice posted {{ detail.notice.sent }}{% elif detail.notice %}Notice waiting to be sent{% else %}Not yet{% endif %}</span>
     </div>
   </section>
   <section aria-label="Output files" class="card table-box">

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 from node import review
 from store import repo
-from store.states import Action, SubjectType, Verdict, VersionState
+from store.states import Action, MessageKind, SubjectType, Verdict, VersionState
 from ui import compare, format as fmt
 
 UNKNOWN_MEMBER = "unknown member"
@@ -667,6 +667,7 @@ def run_page(session, run, tab, settings, log="run"):
     held = sum(row.get("verdict") == "held_back" for row in files)
     good = sum(row.get("verdict") == "pass" for row in files)
     decision = _egress_decision(session, run.run_id)
+    notice = repo.message_of(session, run.run_id, MessageKind.WITHHELD_RESULT)
     can_undo = bool(decision and decision.posted_to_coordinator_at is None
                     and run.egress_state in ("released", "withheld"))
     return {
@@ -687,6 +688,8 @@ def run_page(session, run, tab, settings, log="run"):
                    "reason": row.get("reason")} for row in files],
         "good": good, "held": held,
         "airlock_at": fmt.minute(run.airlock_at) if run.airlock_at else None,
+        "notice": notice and {"sent": fmt.minute(notice.sent_at) if notice.sent_at
+                              else None},
         "review_open": (run.egress_state == "awaiting_review"
                         and settings.egress_mode == "manual"),
         "decision": decision and {

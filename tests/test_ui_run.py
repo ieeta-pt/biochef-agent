@@ -215,3 +215,12 @@ def test_a_run_from_the_plain_api_has_no_request(engine):
         repo.save_run(session, "run_api", state="COMPLETE")
     text = web(engine).get("/ui/runs/run_api").text
     assert "Not from a study request" in text
+
+
+def test_a_withholding_shows_its_notice_waiting(engine):
+    to_review(engine)
+    client = web(engine, "manual")
+    post(client, "/ui/_/runs/run_8e90/withhold")
+    text = client.get("/ui/runs/run_8e90").text
+    assert "A notice that the result was withheld is signed" in text
+    assert "Notice waiting to be sent" in text
