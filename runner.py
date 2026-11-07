@@ -54,6 +54,11 @@ class Runner:
 
     name = "runner"
 
+    @property
+    def isolates_network(self) -> bool:
+        """Whether a step can reach nothing beyond loopback."""
+        return False
+
     def command(self, ws) -> List[str]:
         raise NotImplementedError
 
@@ -272,7 +277,8 @@ created and destroyed per run, so an image cached inside one would be pulled
 again every time.
 """
 
-APPTAINER_ARGS = os.getenv("BIOCHEF_APPTAINER_ARGS", "--contain --cleanenv")
+APPTAINER_ARGS = os.getenv("BIOCHEF_APPTAINER_ARGS",
+                           "--contain --cleanenv --net --network none")
 """Extra flags for the apptainer invocation itself.
 
 --contain by default, and the default is the point. Apptainer binds the host's
@@ -285,9 +291,16 @@ from another is the wrong half to get right. The container runs as the same
 user, so the 0700 mode on a workspace does not help.
 
 --cleanenv stops ordinary Agent environment variables, including registry
-credentials, being inherited by the tool process. It does not isolate /proc or
-the network. Emptying this variable turns both protections off, for an operator
-who needs host access and knows what that means.
+credentials, being inherited by the tool process.
+
+--net --network none gives each step a network namespace with only loopback in
+it. A tool that processed a patient cohort must not be able to send it anywhere,
+and the difference between the two is the whole reason a TRE exists. On a host
+where apptainer refuses this, runs fail rather than carry on with the network:
+isolation that quietly stops applying is worse than a run that stops.
+
+None of this isolates /proc. Emptying this variable turns all of it off, for an
+operator who needs host access and knows what that means.
 """
 
 _IMAGE_SHAPE = re.compile(r"\A[A-Za-z0-9/][A-Za-z0-9._:/@+-]{0,255}\Z")
@@ -366,6 +379,12 @@ class ApptainerRunner(Runner):
 
     def describe(self) -> str:
         return f"{self.name} ({self.image})"
+
+    @property
+    def isolates_network(self) -> bool:
+        words = self.apptainer_args.split()
+        return ("--net" in words and "--network" in words
+                and words[words.index("--network") + 1:][:1] == ["none"])
 
     def snakefile_preamble(self) -> str:
         return f"container: {self._literal}\n"

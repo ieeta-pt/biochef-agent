@@ -721,9 +721,6 @@ def _log_text(run, log):
 
 # Node
 
-ISOLATED_RUNNERS = ()
-"""Runners whose steps have no network. None yet (parts 9 and 9b)."""
-
 SIGNING_TEXT = {"strict": "strict · unsigned tools never run",
                 "warn": "warn · unsigned tools run, with a warning",
                 "off": "off · tool signatures are not checked"}
@@ -829,7 +826,6 @@ def events_without_decision(session, events):
 
 def node_page(session, settings, keys, events, now):
     orphans = events_without_decision(session, events)
-    isolated = settings.runner in ISOLATED_RUNNERS
     newest = list(reversed(events))[:AUDIT_ROWS]
     return {
         "signing": keys.signing_fingerprint, "encryption": keys.encryption_fingerprint,
@@ -838,7 +834,7 @@ def node_page(session, settings, keys, events, now):
         "federation": _federation_card(session),
         "coordinator": _coordinator_card(session, settings, now),
         "runner": settings.runner, "busy": repo.count_busy_runs(session),
-        "slots": settings.max_concurrent_runs, "isolated": isolated,
+        "slots": settings.max_concurrent_runs, "isolated": settings.network_isolated,
         "egress": ("Through the TRE airlock", "review in the agent")
         if settings.egress_mode == "airlock"
         else ("Review in the agent", "through the TRE airlock"),

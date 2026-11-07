@@ -6,7 +6,7 @@
 Asserting only that is not enough on its own. A container runner that silently
 fell back to running on the host would satisfy it perfectly, and that is exactly
 the failure worth catching -- the whole point of E2 is that the step is NOT on
-the host. So the workflow produces five things:
+the host. So the workflow produces six things:
 
   result.txt      the actual work. Must be byte-for-byte identical.
   where.txt       which operating system the step ran on. Must DIFFER.
@@ -22,6 +22,10 @@ produces -- convert.py builds every command as `cmd = [f"./{node.bin}"]` -- and
 every other rule here runs something the image supplies. A container that binds
 the workspace readable but cannot execute out of it would run no real workflow
 at all, while a check made entirely of image-supplied tools reported green.
+
+  network.txt  whether a step could open a connection, and which interfaces it
+               could see. Must reach the network outside and see only loopback
+               inside.
 
 The runner is ubuntu; the image is debian. If where.txt matches between the two
 runs, the container was never entered and the parity is meaningless.
@@ -80,7 +84,17 @@ rule all:
         "where.txt",
         "neighbour.txt",
         "exec.txt",
-        "env_inheritance.txt"
+        "env_inheritance.txt",
+        "network.txt"
+
+rule network:
+    output:
+        o_0="network.txt"
+    shell:
+        "if timeout 10 bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' 2>/dev/null; "
+        "then echo reachable; else echo unreachable; fi > {output.o_0}; "
+        "tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' ' | grep -v '^lo$' "
+        "| wc -l >> {output.o_0}"
 
 rule work:
     input:
@@ -194,15 +208,18 @@ def main():
         outcomes[label] = (_read(ws, "result.txt"), _read(ws, "where.txt"),
                            _read(ws, "neighbour.txt"), _read(ws, "exec.txt"),
                            _read(ws, "env_inheritance.txt"),
-                           _read(ws, "work.stdout"), _read(ws, "work.stderr"))
+                           _read(ws, "work.stdout"), _read(ws, "work.stderr"),
+                           _read(ws, "network.txt"))
         print(f"    ran on: {outcomes[label][1].decode().strip()!r}   "
               f"other runs' data: {outcomes[label][2].decode().strip()!r}",
               flush=True)
 
     (plain_result, plain_where, plain_neighbour, plain_exec,
-     plain_env_result, plain_log_out, plain_log_err) = outcomes["subprocess"]
+     plain_env_result, plain_log_out, plain_log_err,
+     plain_network) = outcomes["subprocess"]
     (boxed_result, boxed_where, boxed_neighbour, boxed_exec,
-     boxed_env_result, boxed_log_out, boxed_log_err) = outcomes["apptainer"]
+     boxed_env_result, boxed_log_out, boxed_log_err,
+     boxed_network) = outcomes["apptainer"]
 
     failures = []
     if plain_result != boxed_result:
@@ -258,6 +275,22 @@ def main():
     if boxed_env_result.strip() != b"absent":
         failures.append("a containerised step inherited the test environment variable")
 
+    # A tool that processed the data must not be able to send it anywhere. The
+    # host-side run is what makes this a test: if it could not connect either,
+    # "unreachable" inside would prove nothing about the container.
+    plain_reach, plain_interfaces = plain_network.split()
+    boxed_reach, boxed_interfaces = boxed_network.split()
+    if plain_reach != b"reachable" or int(plain_interfaces) == 0:
+        failures.append(
+            f"the host-side step could not reach the network ({plain_network!r}), "
+            f"so this check cannot tell isolation apart from a network that is down"
+        )
+    if boxed_reach != b"unreachable" or int(boxed_interfaces) != 0:
+        failures.append(
+            f"a containerised step had the network ({boxed_network!r}); it must "
+            f"see only loopback"
+        )
+
     if failures:
         for f in failures:
             print(f"FAIL: {f}", file=sys.stderr)
@@ -268,7 +301,8 @@ def main():
           f"{boxed_where.decode().strip()!r}), so the container was real; "
           f"a file placed in the workspace executed under both; and another "
           f"run's data was readable on the host but hidden inside it; "
-          f"the test environment variable was not inherited")
+          f"the test environment variable was not inherited; and a step could "
+          f"reach the network on the host but only loopback inside")
     return 0
 
 
