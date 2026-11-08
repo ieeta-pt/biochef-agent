@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from node import egress, review
 from node.keys import short_fingerprint
 from store import repo
+from store.errors import NotFound
 from store.models import Decision
 from store.states import Action, MessageKind, SubjectType, Verdict, VersionState
 from ui import compare, format as fmt
@@ -738,6 +739,18 @@ SUBJECTS = {"study_version": "Study version", "workflow_version": "Workflow vers
             "dataset_binding": "Dataset"}
 AUDIT_ROWS = 50
 
+EVENT_LABELS = {
+    "node.egress.notice": "Notice of a withheld result signed",
+}
+"""Words for the events that are not a decision, a request check or a run state. A text
+or a function of the event. An event with no entry here is shown by `_humanise`, so
+a new kind of event is readable before anyone has written its line."""
+
+
+def _humanise(name):
+    words = name.replace(".", " ").replace("_", " ").strip()
+    return words[:1].upper() + words[1:] if words else "Unnamed event"
+
 
 def _coordinator_card(session, settings, now):
     status = repo.node_status(session)
@@ -806,12 +819,37 @@ def _event_text(event):
         return f'Run {event.get("state")}'
     if name == "unreadable":
         return f'Unreadable line {event.get("line")}'
-    return name
+    label = EVENT_LABELS.get(name)
+    if label is not None:
+        return label(event) if callable(label) else label
+    return _humanise(name)
 
 
-def _audit_row(event):
-    subject = (event.get("subject_id") or event.get("request_id")
-               or event.get("run_id") or event.get("decision_id") or "n/a")
+def _subject_name(session, subject_type, subject_id):
+    """What a person calls a version, where the trail has only its number."""
+    try:
+        number = int(subject_id)
+    except (TypeError, ValueError):
+        return None
+    try:
+        if subject_type == "study_version":
+            return version_title(session, repo.get_study_version(session, number))
+        if subject_type == "workflow_version":
+            return workflow_title(repo.get_workflow_version(session, number))
+    except NotFound:
+        pass            # a trail outlives the rows it names: say the number
+    return None
+
+
+def _audit_row(session, event, undone=None):
+    """One line of the trail. `undone` is the decision event an undo takes back."""
+    kind, subject_id = event.get("subject_type"), event.get("subject_id")
+    if undone is not None:
+        kind, subject_id = undone.get("subject_type"), undone.get("subject_id")
+    subject = (_subject_name(session, kind, subject_id) or subject_id
+               or event.get("request_id") or event.get("run_id")
+               or (f'decision {event["decision_id"]}' if event.get("decision_id")
+                   else None) or "n/a")
     when = event.get("at")
     try:
         when = fmt.minute(datetime.fromisoformat(when))
@@ -821,6 +859,20 @@ def _audit_row(event):
             "by": event.get("user") or event.get("caller") or "agent",
             "signed": "node key" if event.get("signed") else "n/a",
             "bad": event.get("event") == "unreadable"}
+
+
+def _audit_rows(session, events):
+    """The rows of the trail in its own order. An undo names the subject of the
+    decision it takes back, which it does not carry, from the event that made it."""
+    decided, rows = {}, []
+    for event in events:
+        undone = None
+        if event.get("event") == "node.decision":
+            decided[event.get("decision_id")] = event
+        elif event.get("event") == "node.decision.undone":
+            undone = decided.get(event.get("decision_id"))
+        rows.append(_audit_row(session, event, undone))
+    return rows
 
 
 def events_without_decision(session, events):
@@ -852,7 +904,7 @@ def events_without_decision(session, events):
 
 def node_page(session, settings, keys, events, now):
     orphans = events_without_decision(session, events)
-    newest = list(reversed(events))[:AUDIT_ROWS]
+    rows = _audit_rows(session, events)
     return {
         "signing": keys.signing_fingerprint, "encryption": keys.encryption_fingerprint,
         "signing_short": short_fingerprint(keys.signing_fingerprint),
@@ -875,8 +927,8 @@ def node_page(session, settings, keys, events, now):
         "retention": (f"Kept {_span(settings.keep_outputs_seconds)}, at most "
                       f"{settings.max_retained_runs} runs, then deleted"),
         "signatures": SIGNING_TEXT.get(settings.signing_mode, settings.signing_mode),
-        "events": [_audit_row(event) for event in newest],
-        "orphans": [_audit_row(event) for event in orphans],
+        "events": list(reversed(rows))[:AUDIT_ROWS],
+        "orphans": [_audit_row(session, event) for event in orphans],
         "orphan_ids": [event.get("decision_id") for event in orphans],
     }
 
