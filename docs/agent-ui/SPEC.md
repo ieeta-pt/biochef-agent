@@ -591,7 +591,7 @@ What the agent keeps, because it can check it:
 | The image | Only `repository@sha256:<64 hex>` is accepted; a tag, a scheme or a short digest stops the agent |
 | The task | Built from the command and the image alone: no `env`, no credential, no stdin. The command is one argument of a fixed wrapper, never spliced into it |
 | The token | In a file only the agent's user can read, sent only in an `Authorization` header; no redirect is followed and the agent's proxy settings are not used. The URL is https, or http to this host |
-| What the server sees | A copy of the workspace without `Snakefile` and `.snakemake`, in a directory of its own under `BIOCHEF_TES_STAGING`. A link or special file in the workspace stops the step |
+| What the server sees | A copy of the workspace without `Snakefile` and `.snakemake`, in a directory of its own under `BIOCHEF_TES_STAGING`. A link or special file in the workspace stops the step. The task sees it at `/in`, read-only (Funnel mounts every input so), copies it to a scratch directory, runs the step there and writes what changed to `/out`, the one directory a TES server must make writable |
 | What comes back | The task hashes the workspace before and after and returns what changed with a manifest of SHA-256. The agent places a file only if every file is plain, the manifest and the files agree exactly, and no path leaves the workspace or names `Snakefile` or `.snakemake`. If one check fails, nothing from the step is placed |
 | Ownership | A server running as root returns files owned by root. `tes-step-root`, called through one sudo rule, gives the step's directory back to the agent; it has one command, `finish`, and works only two levels under `STAGING_ROOT` of `/etc/biochef-agent/tes-step.conf` |
 | A killed run | The group kill does not reach the server, so when a run ends the agent cancels the run's unfinished tasks by name prefix, waits for them and clears the staging |
@@ -613,7 +613,15 @@ Settings, all required unless said, none with a default:
 
 Limits of this runner: each step costs a copy of the workspace by the agent and another by the server; a step's output arrives when its task ends, not as it is written; a file a step deletes is not deleted in the workspace; the image needs `bash`, `find`, `sha256sum`, `sort`, `comm` and `cp`.
 
-Done when: the parity workflow runs through a TES server running as root, the files come back owned by root and are the agent's after the helper, nine kinds of bad arrival are refused with nothing placed, a timed-out run leaves no task running, and no secret of the agent's is in any task posted. Not covered: a real Funnel. CI uses a stand-in that speaks the same exchange, and what Funnel does with `file://` directories is assumed, not checked (14.6).
+Done when: the parity workflow runs through a TES server running as root, the files come back owned by root and are the agent's after the helper, nine kinds of bad arrival are refused with nothing placed, a timed-out run leaves no task running, and no secret of the agent's is in any task posted. CI does this against two servers with one check (`ci/tes_check.py`): a stand-in that speaks the same exchange, which the unit tests also use, and Funnel v0.12.2.
+
+Funnel v0.12.2 has a tag and no release, binary or public image, so the job builds it from the commit the tag names (`d5f0655`) and configures it from its own default config as an operator who attests network isolation would: `docker run` with no network, its own `--read-only`, and `LocalStorage.AllowedDirs` the staging root. What running it showed, and the runner follows:
+
+- A `DIRECTORY` input and output over `file://` work, and so does the `name_prefix` filter: the check cancels a timed-out run through it and lists the run's task as `CANCELED` by it.
+- Funnel mounts every input read-only. The first version of the runner wrote in the input directory and failed with `Read-only file system`, which is why the step now runs in a copy.
+- The agent checks paths itself and does not rely on the TES server's directory checks.
+
+Not covered by the Funnel job: Funnel's own authentication. The job reaches it on the loopback with `BIOCHEF_TES_AUTH=none`. Funnel accepts basic authentication and OIDC bearer tokens, and the bearer path of the runner is proven against the stand-in only (14.6).
 
 ### 14.3 Singularity (part 9d)
 
@@ -628,7 +636,7 @@ Done when: CI installs SingularityCE from its published package, checked against
 
 ### 14.4 The TES API (part 9f)
 
-`python -m tesapi` is a listener of its own that lets the TRE's workflow engines send the node a TES task. It is not routes on the agent's API: the API's callers are federations and editors, these are the TRE's own tools, and the two share no credential, queue, slot or port. It never opens the node's database.
+`python -m tesapi` is a listener of its own that lets the TRE's workflow engines send the node a TES task. It is not routes on the agent's API: the API's callers are federations and editors, these are the TRE's own tools, and the two share no credential, queue, slot or port. It keeps its tasks in one table of the node's database, `tes_task`, and opens no other: it reads no study, request, decision, dataset binding or run.
 
 A task is one command in one image, with files in and out. It becomes a Snakefile of one rule and runs through `BIOCHEF_RUNNER`, so it gets that runner's guarantees (14.1) and the same isolation rule and check at start. It runs in a workspace of its own, which is removed.
 
@@ -640,18 +648,26 @@ It refuses first:
 | Off this host without TLS | `BIOCHEF_TESAPI_TLS_CERT` and `BIOCHEF_TESAPI_TLS_KEY` are required unless it listens on loopback |
 | An image not listed | `BIOCHEF_TESAPI_IMAGES`, each by digest; no tag, no second executor. The listener does not start if the runner cannot run a listed image (`subprocess` runs none; rootful podman runs only the image of its configuration) |
 | A URL that is not `file://` | Only `file://` on this host |
-| A path not in a listed directory | `BIOCHEF_TESAPI_DIRS`; paths are normal, absolute and behind no symlink |
-| The node's own data | The listener does not start if a listed directory contains or lies inside `BIOCHEF_LOCAL_ROOT` (where studies' datasets are bound), `BIOCHEF_RUN_ROOT`, the audit log, the database file, the node's keys, `BIOCHEF_TES_STAGING`, the token and TLS files or the apptainer cache. Each task is checked against the same list again |
+| A path not in a listed directory | Inputs are read from `BIOCHEF_TES_READ_DIRS` and outputs written to `BIOCHEF_TES_WRITE_DIRS`; paths are normal, absolute and behind no symlink |
+| The two lists sharing a directory | The listener does not start if a read directory and a write directory are the same place or one is inside the other, so nothing a task wrote can be read back as an input and nothing it read can be overwritten. `BIOCHEF_TESAPI_DIRS`, the single list, stops it too and says what replaces it |
+| The node's own data | The listener does not start if a listed directory, of either list, contains or lies inside `BIOCHEF_LOCAL_ROOT` (where studies' datasets are bound), `BIOCHEF_RUN_ROOT`, the audit log, the database file (the default one too, when `BIOCHEF_DB_URL` is unset), the node's keys, `BIOCHEF_TES_STAGING`, the token and TLS files or the apptainer cache. Each task is checked against the same list again |
 | Anything of the caller's in the step | `env`, `stdin`, `stdout`, `stderr`, `volumes`, `resources` and anything not understood are refused, not ignored |
 | A full queue | `BIOCHEF_TESAPI_MAX_CONCURRENT` (1) run, `BIOCHEF_TESAPI_MAX_QUEUED` (16) wait, and the next gets 503. Neither is the agent's `BIOCHEF_MAX_CONCURRENT_RUNS` or a request the coordinator sent; the machine's CPU and memory are still shared |
 | Too many bytes | `BIOCHEF_TESAPI_MAX_BYTES` (1 GiB) in and out together, and `BIOCHEF_TESAPI_TIMEOUT` (900 s) |
 | An unrecordable task | `BIOCHEF_AUDIT_LOG` is required, and a task is refused with 503 if its event cannot be written |
 
-Audit events carry `"source": "tes"`: `tes.start`, `tes.task.created` (image, URLs, a SHA-256 of the command and never the arguments), `tes.task.state` at every state, `tes.task.refused`, and `tes.auth.refused`, written at most once a second with the count of those not written. A task is written to no `run_summary`, so it appears on no screen of the page: it is not a request.
+Audit events carry `"source": "tes"`: `tes.start`, `tes.task.created` (image, URLs, a SHA-256 of the command and never the arguments), `tes.task.state` at every state, `tes.task.refused`, and `tes.auth.refused`, written at most once a second with the count of those not written. A task is written to no `run_summary`, so it appears on no screen of the page: it is not a request. It is written to `tes_task` (migration 0006) at every state, with the URLs of its inputs and outputs and not the inline content of an input, and the newest 1000 are kept. The listener does not start against a schema older than that, as the page does not. A task that was queued or running when the listener stopped is read back as `SYSTEM_ERROR` with the reason in `system_logs` and a `tes.task.state` event with `error: restarted`, because its workspace, its runner and its place in the queue were in the process that stopped. One listener per database: a second one started against the same database would end the first one's running tasks.
 
-Narrower than TES: one executor; `command` is a list of arguments; paths are `/work/<file>`, and the command runs in the workspace, so an argument that starts with `/work` is written as the workspace's path and a path inside a shell script is not; `exit_code` is Snakemake's, so a failure is 1 and the tool's message is in `stderr`; logs arrive when the task ends; tasks are in memory, so a restart forgets them, and a caller sees only its own; a `DIRECTORY` output is merged into the destination.
+Narrower than TES, and what a caller will see:
 
-Done when: every refusal above has a test and a deliberate defect that breaks it; CI runs the listener in front of rootless podman and shows the step ran in the image, without the datasets, the agent's environment or a network, that the output is the agent's, that each refusal answers, and that the trail has the events with source `tes` and no secret.
+- One executor; `command` is a list of arguments.
+- Paths are `/work/<file>`, and the command runs in the workspace, so an argument that starts with `/work` is written as the workspace's path and a path inside a shell script is not.
+- `exit_code` is Snakemake's, not the tool's: a failure is 1 whatever the tool returned, and the tool's own message is in `stderr`.
+- Logs arrive when the task ends. A caller polling a running task sees no `stdout` or `stderr` until it finishes.
+- A caller sees only its own tasks.
+- A `DIRECTORY` output is merged into the destination, replacing plain files and refusing anything else.
+
+Done when: every refusal above has a test and a deliberate defect that breaks it; CI runs the listener in front of rootless podman and shows the step ran in the image, without the datasets, the agent's environment or a network, that the output is the agent's, that each refusal answers (a read directory used as an output and a write directory used as an input among them), that a listener started again on the same database still has the finished task and ends a task that was running, and that the trail has the events with source `tes` and no secret.
 
 ### 14.5 Installing the agent in a TRE that runs a TES server such as Funnel
 
@@ -667,8 +683,8 @@ The same agent can be installed three ways. Nothing in the agent changes between
 | What the operator must attest | Nothing | That Funnel gives a task no network and only its input; its `file://` access should also be limited to the staging directory | Nothing |
 | What the agent still checks | The network, at start | The image digest, an empty task, the digests of everything that comes back, the ownership of the files | The network at start; images, directories, tokens and the node's data on every task |
 | Isolation rule | Passes | Needs `BIOCHEF_REQUIRE_NETWORK_ISOLATION=false`, audited at every start | Passes |
-| The TRE has to provide | A container runtime the agent's user can use, as in 9 and 14.3 | A directory both can read and write at the same path; the helper and its sudo rule if Funnel runs as root; an image with the tools of 14.2; a token | A container runtime as in the first column; the engines pointed at the agent's URL with a token; the exchange directories |
-| Cost | Two systems share the machine with no shared limits: the agent's slots and step limits do not know Funnel's | The workspace is copied twice per step; output arrives at the end; every federated step waits in Funnel's queue | Whatever the TRE's tasks need beyond the narrow subset of 14.4 cannot run: several executors, `env`, volumes, resources, other storage schemes. One node, and tasks are forgotten on restart |
+| The TRE has to provide | A container runtime the agent's user can use, as in 9 and 14.3 | A directory both can read and write at the same path (the agent checks paths itself and does not rely on the TES server's directory checks); the helper and its sudo rule if Funnel runs as root; an image with the tools of 14.2; a token | A container runtime as in the first column; the engines pointed at the agent's URL with a token; the exchange directories |
+| Cost | Two systems share the machine with no shared limits: the agent's slots and step limits do not know Funnel's | The workspace is copied twice per step; output arrives at the end; every federated step waits in Funnel's queue | Whatever the TRE's tasks need beyond the narrow subset of 14.4 cannot run: several executors, `env`, volumes, resources, other storage schemes. One node, one listener per database, and a task a restart interrupted is lost (it is kept as `SYSTEM_ERROR`) |
 | Records | The agent's trail and Funnel's, separately | The agent's trail for the run and Funnel's for each task | One trail, with `"source": "tes"` on the TRE's tasks |
 | Fits when | The TRE keeps Funnel for its own work and the node must give federated steps the strongest guarantees the agent can check | The TRE wants one scheduler and one place for resource accounting, and accepts an operator's word about its isolation | The TRE's tasks are simple, and it wants them to run under the same guarantees as federated steps |
 
@@ -678,9 +694,9 @@ The first is the one that needs no decision about Funnel and loses no guarantee.
 
 Ask `jorgeMFS` before building anything that depends on these.
 
-1. Whether Funnel takes a `DIRECTORY` input and a `DIRECTORY` output over `file://`, filters its task list by `name_prefix`, and runs the first executor with the input directory writable at its `path`. The TES runner needs all three and has been tested only against a stand-in written from the TES 1.1 specification.
-2. A TES API with separate lists of directories to read from and to write to. Today one list serves both, so a task can write into a directory it reads from.
-3. A persistent task store for the TES API, so that a restart does not forget tasks. Today it is in memory, like the agent's runs.
-4. Client certificates for the TES runner and the TES API. Today the credential is a bearer token over https, or http on loopback.
-5. Whether the TES API may run several executors in one task, which needs a runner that can say which executor's output is which.
-6. A TES runner that mounts the workspace instead of copying it, for a TES server on the same host. It would save the two copies, and give the server access to the whole workspace.
+1. Funnel's own authentication. The Funnel job reaches it on the loopback with no authentication. Funnel accepts basic authentication and OIDC bearer tokens; the TES runner sends a bearer token, which Funnel accepts only in its OIDC mode, so a Funnel with basic authentication cannot be used by the runner, and the bearer path is tested against the stand-in only.
+2. Funnel v0.12.x has a tag and no published release or image, and its version string still reads `0.12.0-rc.1`. The job builds the commit of the tag. Moving to a published release when there is one removes the build from the job.
+3. Client certificates for the TES runner and the TES API. Today the credential is a bearer token over https, or http on loopback.
+4. Whether the TES API may run several executors in one task, which needs a runner that can say which executor's output is which.
+5. A TES runner that mounts the workspace instead of copying it, for a TES server on the same host. It would save the two copies, and give the server access to the whole workspace.
+6. More than one TES API listener on one database, or one listener in several processes. Today a second one started would end the first one's running tasks; telling a restart from a second listener needs a heartbeat or a lock.
