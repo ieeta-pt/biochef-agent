@@ -5,16 +5,23 @@ is set, the runner is one that can run the images listed, and, for a runner that
 claims to keep steps off the network, one step has shown it does.
 """
 
+import os
 import secrets
 import sys
 
 import uvicorn
+from dotenv import load_dotenv
 
-import audit
-from runner import ENFORCED, NetworkCheck, check_network, get_runner, require_network_isolation
-from tesapi import config as settings
-from tesapi.app import create_app
-from tesapi.tasks import SOURCE
+# Before the runner is imported, which reads its settings when it is. This process
+# does not import convert.py, the only other module that loads .env (SPEC.md, 2.4).
+load_dotenv()
+
+import audit  # noqa: E402
+from runner import (ENFORCED, check_network, get_runner,  # noqa: E402
+                    require_network_isolation)
+from tesapi import config as settings  # noqa: E402
+from tesapi.app import create_app  # noqa: E402
+from tesapi.tasks import SOURCE  # noqa: E402
 
 
 def new_token(name):
@@ -68,7 +75,6 @@ def main(argv):
         return new_token(argv[1]) if len(argv) == 2 else 2
     try:
         config = settings.load()
-        import os
         provider = get_runner(os.getenv("BIOCHEF_RUNNER", "subprocess"))
         prepare(config, provider)
     except (settings.ConfigError, ValueError) as refused:
