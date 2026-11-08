@@ -66,12 +66,14 @@ as_agent sudo -n "$HELPER" finish "$STAGING/run-a/step-1"
 echo "ok: the helper accepts a step directory of the agent's"
 sudo rm -rf "$STAGING/run-a" "$STAGING/shallow" "$STAGING/link-run" "/home/$AGENT/outside"
 
-head -c 24 /dev/urandom | base64 | tr -d '/+=\n' | sudo tee "$WORK/tes-token" >/dev/null
-sudo chown "$AGENT:$AGENT" "$WORK/tes-token"
-sudo chmod 0600 "$WORK/tes-token"
+# In a directory the agent can reach, which the runner's temp directory is not.
+TOKEN=/etc/biochef-agent/tes-token
+head -c 24 /dev/urandom | base64 | tr -d '/+=\n' | sudo tee "$TOKEN" >/dev/null
+sudo chown "$AGENT:$AGENT" "$TOKEN"
+sudo chmod 0600 "$TOKEN"
 sudo rm -f "$WORK/tes-ready"
 sudo -b python3 /srv/biochef-agent-src/tests/tes_support.py --allow "$STAGING" --mode docker \
-    --token-file "$WORK/tes-token" --ready-file "$WORK/tes-ready" \
+    --token-file "$TOKEN" --ready-file "$WORK/tes-ready" \
     >"$WORK/tes-server.log" 2>&1
 for _ in $(seq 1 50); do
     [ -s "$WORK/tes-ready" ] && break
@@ -80,7 +82,7 @@ done
 [ -s "$WORK/tes-ready" ] || { cat "$WORK/tes-server.log"; echo "FAIL: no server" >&2; exit 1; }
 {
     echo "BIOCHEF_TES_URL=$(cat "$WORK/tes-ready")"
-    echo "BIOCHEF_TES_TOKEN_FILE=$WORK/tes-token"
+    echo "BIOCHEF_TES_TOKEN_FILE=$TOKEN"
     echo "BIOCHEF_TES_STAGING=$STAGING"
     echo "BIOCHEF_TES_HELPER=$HELPER"
     echo "AGENT_USER=$AGENT"
