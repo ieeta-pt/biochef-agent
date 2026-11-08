@@ -741,6 +741,11 @@ AUDIT_ROWS = 50
 
 EVENT_LABELS = {
     "node.egress.notice": "Notice of a withheld result signed",
+    "node.runner.isolation_not_required": lambda event: (
+        f'Network isolation turned off for the {event.get("runner") or "runner"} runner'),
+    "node.runner.network_check": lambda event: (
+        f'{event.get("runner") or "Runner"} network check '
+        f'{"passed" if event.get("ok") else "failed"}'),
 }
 """Words for the events that are not a decision, a request check or a run state. A text
 or a function of the event. An event with no entry here is shown by `_humanise`, so
@@ -847,7 +852,7 @@ def _audit_row(session, event, undone=None):
     if undone is not None:
         kind, subject_id = undone.get("subject_type"), undone.get("subject_id")
     subject = (_subject_name(session, kind, subject_id) or subject_id
-               or event.get("request_id") or event.get("run_id")
+               or event.get("request_id") or event.get("run_id") or event.get("runner")
                or (f'decision {event["decision_id"]}' if event.get("decision_id")
                    else None) or "n/a")
     when = event.get("at")
