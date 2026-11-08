@@ -413,7 +413,15 @@ jobs:
             python /srv/biochef-agent-src/ci/tes_check.py
 
       - name: No container of the run that timed out is left
-        run: test -z "$(docker ps --quiet)"
+        # Funnel removes a cancelled task's container itself, a moment after the
+        # cancel, so this waits for it. What is left after the wait is named.
+        run: |
+          for _ in $(seq 1 30); do
+              [ -z "$(docker ps --quiet)" ] && exit 0
+              sleep 1
+          done
+          docker ps --format 'left: {{.Names}} {{.Image}} {{.Status}}'
+          exit 1
 
       - name: Funnel's log
         if: failure()
