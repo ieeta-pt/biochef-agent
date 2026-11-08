@@ -15,8 +15,9 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 import audit
+from store import db
 from bodylimit import BodySizeLimitMiddleware
-from tesapi import tasks
+from tesapi import records, tasks
 from tesapi.config import MAX_BODY_BYTES, Config, hash_token
 from tesapi.policy import Policy, Refused
 
@@ -45,13 +46,17 @@ class Throttle:
         return False, 0
 
 
-def create_app(config: Config, runner, start_checks=None) -> FastAPI:
+def create_app(config: Config, runner, start_checks=None, bind=None) -> FastAPI:
+    """`bind` is the database tasks are kept in; made from the configuration if absent."""
     policy = Policy(config)
-    engine = tasks.Engine(config, policy, runner)
+    if bind is None:
+        bind = db.make_engine(config.db_url)
+    engine = tasks.Engine(config, policy, runner, bind)
     throttle = Throttle()
 
     @asynccontextmanager
     async def lifespan(_app):
+        await asyncio.to_thread(engine.open)
         if start_checks is not None:
             await asyncio.to_thread(start_checks)
         yield
@@ -94,6 +99,11 @@ def create_app(config: Config, runner, start_checks=None) -> FastAPI:
         return JSONResponse(status_code=503, content={
             "msg": "the node cannot record this on its audit trail, so it will not do it"})
 
+    @app.exception_handler(records.RecordError)
+    async def record_error(request, exc):
+        return JSONResponse(status_code=503, content={
+            "msg": "the node cannot keep this task in its database, so it will not run it"})
+
     @app.get("/v1/service-info")
     async def service_info(who: str = Depends(caller)):
         return {"id": "org.biochef.agent.tes", "name": "biochef-agent TES API",
@@ -102,7 +112,8 @@ def create_app(config: Config, runner, start_checks=None) -> FastAPI:
                                "with the node's own runner",
                 "organization": {"name": "biochef-agent", "url": "https://biochef.app"},
                 "version": VERSION,
-                "storage": [f"file://{path}" for path in config.dirs]}
+                "storage": [f"file://{path}" for path in
+                            dict.fromkeys(config.read_dirs + config.write_dirs)]}
 
     @app.post("/v1/tasks")
     async def create(request: Request, who: str = Depends(caller)):

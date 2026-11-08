@@ -24,8 +24,8 @@ from sqlmodel import Field, Session, SQLModel
 
 from store.errors import ImmutableField
 from store.states import (Action, BindingSource, EgressState, MessageKind,
-                          RecipientsMode, RefusalCode, SubjectType, VersionState,
-                          Verdict)
+                          RecipientsMode, RefusalCode, SubjectType, TesState,
+                          VersionState, Verdict)
 
 # Named constraints, because SQLite can only alter a table by rebuilding it and
 # Alembic needs the names to do that.
@@ -270,6 +270,39 @@ class OutgoingMessage(SQLModel, table=True):
     sent_at: Optional[datetime] = _moment(nullable=True)
 
 
+class TesTask(SQLModel, table=True):
+    """A task of the TES API (SPEC.md, section 14.4), kept so a restart does not
+    forget it.
+
+    Written by the TES API process alone. It is what the caller was told, not what
+    the task read: the inline content of an input is not kept, only the URLs, and no
+    secret of the node's is ever in a task. A task that was running when the process
+    stopped is read back as SYSTEM_ERROR, because nothing is left of it to finish.
+    """
+
+    __tablename__ = "tes_task"
+    __table_args__ = (_one_of("state", TesState),)
+
+    id: str = Field(primary_key=True)
+    owner: str
+    name: str = ""
+    description: str = Field(default="", sa_column=Column(Text, nullable=False))
+    tags: Dict[str, Any] = _json(dict)
+    image: str
+    command: List[Any] = _json()
+    inputs: List[Any] = _json(list)
+    outputs: List[Any] = _json(list)
+    state: str
+    created_at: datetime = _moment(nullable=False)
+    started_at: Optional[datetime] = _moment(nullable=True)
+    ended_at: Optional[datetime] = _moment(nullable=True)
+    exit_code: Optional[int] = None
+    stdout: str = Field(default="", sa_column=Column(Text, nullable=False))
+    stderr: str = Field(default="", sa_column=Column(Text, nullable=False))
+    system_logs: List[Any] = _json(list)
+    sizes: List[Any] = _json(list)
+
+
 class FederationList(SQLModel, table=True):
     __tablename__ = "federation_list"
 
@@ -325,5 +358,5 @@ def _refuse_changes_to_immutable_fields(session, _context, _instances):
 
 
 __all__ = ["Decision", "DatasetBinding", "FederationList", "MemberKey",
-           "NodeStatus", "Request", "RunSummary", "Study", "StudyVersion",
+           "NodeStatus", "Request", "RunSummary", "Study", "StudyVersion", "TesTask",
            "UtcDateTime", "WorkflowVersion"]

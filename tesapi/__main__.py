@@ -19,7 +19,10 @@ load_dotenv()
 import audit  # noqa: E402
 from runner import (ENFORCED, check_network, get_runner,  # noqa: E402
                     require_network_isolation)
+from store import db  # noqa: E402
+from store.errors import StoreError  # noqa: E402
 from tesapi import config as settings  # noqa: E402
+from tesapi import records  # noqa: E402
 from tesapi.app import create_app  # noqa: E402
 from tesapi.tasks import SOURCE  # noqa: E402
 
@@ -65,7 +68,8 @@ def start_checks(config, provider):
                 raise RuntimeError(f"the network check failed: {result.detail}")
         audit.record("tes.start", source=SOURCE, runner=provider.name,
                      guarantees=provider.guarantees, images=list(config.images),
-                     dirs=list(config.dirs), max_concurrent=config.max_concurrent,
+                     read_dirs=list(config.read_dirs),
+                     write_dirs=list(config.write_dirs), max_concurrent=config.max_concurrent,
                      max_queued=config.max_queued)
     return run
 
@@ -77,10 +81,12 @@ def main(argv):
         config = settings.load()
         provider = get_runner(os.getenv("BIOCHEF_RUNNER", "subprocess"))
         prepare(config, provider)
-    except (settings.ConfigError, ValueError) as refused:
+        bind = db.make_engine(config.db_url)
+        records.check(bind)
+    except (settings.ConfigError, ValueError, StoreError, records.RecordError) as refused:
         print(refused, file=sys.stderr)
         return 1
-    app = create_app(config, provider, start_checks(config, provider))
+    app = create_app(config, provider, start_checks(config, provider), bind)
     options = {}
     if config.tls_cert:
         options = {"ssl_certfile": config.tls_cert, "ssl_keyfile": config.tls_key}

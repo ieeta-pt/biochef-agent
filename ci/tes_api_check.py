@@ -22,6 +22,7 @@ import secrets
 import socket
 import sys
 import tempfile
+from datetime import datetime, timezone
 import threading
 import time
 import urllib.error
@@ -32,6 +33,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
 import uvicorn  # noqa: E402
+
+from store import db, migrate  # noqa: E402
 
 from runner import PodmanRunner  # noqa: E402
 from tesapi import config as settings  # noqa: E402
@@ -78,7 +81,8 @@ def main():
     os.environ["BIOCHEF_PARITY_ENV_PROBE"] = SECRET
     root = Path(tempfile.mkdtemp(prefix="biochef-tesapi-"))
     exchange, datasets, runs, keys = (root / n for n in ("exchange", "datasets", "runs", "keys"))
-    for folder in (exchange, datasets / "cohort", runs, keys):
+    outbox = root / "outbox"
+    for folder in (exchange, outbox, datasets / "cohort", runs, keys):
         folder.mkdir(parents=True)
     (datasets / "cohort" / "patients.txt").write_text("synthetic patient 1\n")
     (exchange / "in.txt").write_text("alpha\n")
@@ -92,28 +96,35 @@ def main():
 
     config = settings.load({
         "BIOCHEF_AUDIT_LOG": str(trail), "BIOCHEF_TESAPI_TOKENS": str(tokens),
-        "BIOCHEF_TESAPI_IMAGES": IMAGE, "BIOCHEF_TESAPI_DIRS": str(exchange.resolve()),
+        "BIOCHEF_TESAPI_IMAGES": IMAGE, "BIOCHEF_TES_READ_DIRS": str(exchange.resolve()),
+        "BIOCHEF_TES_WRITE_DIRS": str(outbox.resolve()),
+        "BIOCHEF_DB_URL": f"sqlite:///{root}/agent.db",
         "BIOCHEF_LOCAL_ROOT": str(datasets), "BIOCHEF_RUN_ROOT": str(runs),
         "BIOCHEF_TESAPI_TIMEOUT": "300"})
     provider = PodmanRunner(image=f"docker://{IMAGE}", selinux="disable", mode="rootless",
                             pids="256", memory="1g")
     print("runner:", provider.describe(), provider.guarantees)
     prepare(config, provider)
-    app = create_app(config, provider, start_checks(config, provider))
+    migrate.upgrade(config.db_url)
+    bind = db.make_engine(config.db_url)
 
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port,
-                                           log_level="warning", proxy_headers=False))
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-    for _ in range(300):
-        if server.started:
-            break
-        time.sleep(0.1)
+    def serve(app):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port,
+                                               log_level="warning", proxy_headers=False))
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        for _ in range(300):
+            if server.started:
+                break
+            time.sleep(0.1)
+        return server, thread, f"http://127.0.0.1:{port}"
+
+    server, thread, base = serve(create_app(config, provider,
+                                            start_checks(config, provider), bind))
     check(server.started, "the listener started, after the network check passed through podman")
-    base = f"http://127.0.0.1:{port}"
 
     check(call(base, "GET", "/v1/service-info")[0] == 401, "no token, no answer")
     check(call(base, "GET", "/v1/service-info", token="wrong-token-123456")[0] == 401,
@@ -135,12 +146,12 @@ def main():
     status, created = call(base, "POST", "/v1/tasks", token=token, body=task(
         ["bash", "-c", script],
         inputs=[{"url": "file://" + str(exchange / "in.txt"), "path": "/work/in.txt"}],
-        outputs=[{"url": "file://" + str(exchange / "out.txt"), "path": "/work/out.txt"}]))
+        outputs=[{"url": "file://" + str(outbox / "out.txt"), "path": "/work/out.txt"}]))
     check(status == 200, f"a task was accepted ({status} {created})")
     done = finish(base, token, created["id"])
     check(done["state"] == "COMPLETE", f"the task completed ({done['state']} "
           f"{done['logs'][0]['system_logs']} {done['logs'][0]['logs']})")
-    lines = (exchange / "out.txt").read_text().split()
+    lines = (outbox / "out.txt").read_text().split()
     result = dict(line.split("=", 1) for line in lines if "=" in line)
     host_os = dict(l.split("=", 1) for l in Path("/etc/os-release").read_text().splitlines()
                    if "=" in l)["ID"]
@@ -149,7 +160,7 @@ def main():
     check(result["env"] == "clean", "the agent's environment is not there")
     check(result["routes"] == "0", "the step had no network route")
     check("ALPHA" in lines, "it read its input and wrote its output")
-    check((exchange / "out.txt").stat().st_uid == os.getuid(), "the output is the agent's")
+    check((outbox / "out.txt").stat().st_uid == os.getuid(), "the output is the agent's")
     check(not list(runs.iterdir()), "the workspace was removed")
 
     refusals = [
@@ -162,6 +173,10 @@ def main():
         ("a dataset", task(["true"], inputs=[
             {"url": "file://" + str(datasets / "cohort" / "patients.txt"),
              "path": "/work/x"}]), 403),
+        ("an input from a directory it may only write to", task(["true"], inputs=[
+            {"url": "file://" + str(outbox / "out.txt"), "path": "/work/x"}]), 403),
+        ("an output into a directory it may only read from", task(["true"], outputs=[
+            {"url": "file://" + str(exchange / "back.txt"), "path": "/work/x"}]), 403),
         ("an env", task(["true"], executors=[
             {"image": IMAGE, "command": ["true"], "env": {"K": "V"}}]), 400),
     ]
@@ -178,6 +193,26 @@ def main():
           f"the trail has the events ({sorted(kinds)})")
     text = trail.read_text()
     check(token not in text and SECRET not in text, "no token and no secret in the trail")
+    server.should_exit = True
+    thread.join(timeout=30)
+
+    # A restart: the listener is started again on the same database. The task that
+    # finished is there; one that was running when the first listener stopped is not
+    # still running, and says so.
+    from store.models import TesTask
+    with db.writing(bind) as session:
+        session.add(TesTask(id="lost" + "0" * 28, owner="ci", name="ci", image=IMAGE,
+                            command=["sleep", "999"], state="RUNNING",
+                            created_at=datetime.now(timezone.utc)))
+    server, thread, base = serve(create_app(config, provider, None, bind))
+    check(server.started, "the listener started again on the same database")
+    status, again = call(base, "GET", f"/v1/tasks/{created['id']}?view=FULL", token=token)
+    check(status == 200 and again["state"] == "COMPLETE",
+          f"the task that finished is still there after a restart ({status})")
+    status, lost = call(base, "GET", f"/v1/tasks/{'lost' + '0' * 28}?view=FULL", token=token)
+    check(status == 200 and lost["state"] == "SYSTEM_ERROR"
+          and "stopped" in " ".join(lost["logs"][0]["system_logs"]),
+          f"a task that was running when it stopped is SYSTEM_ERROR ({lost.get('state')})")
     server.should_exit = True
     print("all checks passed")
     return 0

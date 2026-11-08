@@ -10,6 +10,7 @@ slots of its own) and what it records (audit events with source "tes").
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -70,11 +71,23 @@ class RecordingRunner(SubprocessRunner):
         return {"network": self.network, "filesystem": NONE, "environment": NONE}
 
 
+@pytest.fixture(scope="session")
+def migrated_database(tmp_path_factory):
+    """The node's database at the current schema, made once and copied for each test."""
+    from store import migrate
+    path = tmp_path_factory.mktemp("template") / "agent.db"
+    migrate.upgrade(f"sqlite:///{path}")
+    return path
+
+
 @pytest.fixture
-def world(tmp_path, monkeypatch):
+def world(tmp_path, monkeypatch, migrated_database):
     """A node's directories, a token file, an audit trail, and a settings mapping."""
+    shutil.copy(migrated_database, tmp_path / "agent.db")
     exchange = tmp_path / "exchange"
     exchange.mkdir()
+    outbox = tmp_path / "outbox"
+    outbox.mkdir()
     data = tmp_path / "datasets"
     data.mkdir()
     (data / "cohort").mkdir()
@@ -92,7 +105,8 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setenv("BIOCHEF_AUDIT_LOG", str(trail))
     values = {
         "BIOCHEF_AUDIT_LOG": str(trail), "BIOCHEF_TESAPI_TOKENS": str(tokens),
-        "BIOCHEF_TESAPI_IMAGES": IMAGE, "BIOCHEF_TESAPI_DIRS": str(exchange),
+        "BIOCHEF_TESAPI_IMAGES": IMAGE, "BIOCHEF_TES_READ_DIRS": str(exchange),
+        "BIOCHEF_TES_WRITE_DIRS": str(outbox),
         "BIOCHEF_LOCAL_ROOT": str(data), "BIOCHEF_RUN_ROOT": str(runs),
         "BIOCHEF_TESAPI_TIMEOUT": "120", "BIOCHEF_DB_URL": f"sqlite:///{tmp_path}/agent.db",
     }
@@ -102,6 +116,7 @@ def world(tmp_path, monkeypatch):
 
     found = World()
     found.tmp, found.exchange, found.data, found.runs = tmp_path, exchange, data, runs
+    found.outbox = outbox
     found.tokens, found.trail, found.values = tokens, trail, values
     found.config = lambda **changes: settings.load({**values, **changes})
 
@@ -159,7 +174,8 @@ def wait(world, task_id, headers=None, timeout=90):
 
 
 @pytest.mark.parametrize("name", ["BIOCHEF_AUDIT_LOG", "BIOCHEF_TESAPI_TOKENS",
-                                  "BIOCHEF_TESAPI_IMAGES", "BIOCHEF_TESAPI_DIRS"])
+                                  "BIOCHEF_TESAPI_IMAGES", "BIOCHEF_TES_READ_DIRS",
+                                  "BIOCHEF_TES_WRITE_DIRS"])
 def test_nothing_that_decides_what_a_task_may_touch_has_a_default(world, name):
     with pytest.raises(settings.ConfigError, match=name):
         world.config(**{name: ""})
@@ -167,7 +183,8 @@ def test_nothing_that_decides_what_a_task_may_touch_has_a_default(world, name):
 
 def test_it_loads(world):
     config = world.config()
-    assert config.images == (IMAGE,) and config.dirs == (str(world.exchange.resolve()),)
+    assert config.images == (IMAGE,) and (config.read_dirs, config.write_dirs) == (
+        (str(world.exchange.resolve()),), (str(world.outbox.resolve()),))
     assert (config.host, config.port, config.max_concurrent) == ("127.0.0.1", 8082, 1)
 
 
@@ -226,16 +243,19 @@ def test_the_images_are_a_list(world):
 
 
 @pytest.mark.parametrize("path", ["relative/dir", "/", "/no/such/dir"])
-def test_a_directory_that_is_not_a_plain_directory_stops_it(world, path):
+@pytest.mark.parametrize("name", ["BIOCHEF_TES_READ_DIRS", "BIOCHEF_TES_WRITE_DIRS"])
+def test_a_directory_that_is_not_a_plain_directory_stops_it(world, name, path):
     with pytest.raises(settings.ConfigError):
-        world.config(BIOCHEF_TESAPI_DIRS=path)
+        world.config(**{name: path})
 
 
 def test_a_directory_named_through_a_symlink_stops_it(world):
     link = world.tmp / "link"
     link.symlink_to(world.exchange)
     with pytest.raises(settings.ConfigError, match="symlink"):
-        world.config(BIOCHEF_TESAPI_DIRS=str(link))
+        world.config(BIOCHEF_TES_READ_DIRS=str(link))
+    with pytest.raises(settings.ConfigError, match="symlink"):
+        world.config(BIOCHEF_TES_WRITE_DIRS=str(link))
 
 
 @pytest.mark.parametrize("name,where", [
@@ -249,14 +269,44 @@ def test_a_directory_named_through_a_symlink_stops_it(world):
 def test_no_directory_may_contain_or_lie_in_the_nodes_own_data(world, name, where):
     allowed = (world.tmp / where).resolve()
     with pytest.raises(settings.ConfigError, match="overlaps"):
-        world.config(BIOCHEF_TESAPI_DIRS=str(allowed))
+        world.config(BIOCHEF_TES_READ_DIRS=str(allowed))
+    with pytest.raises(settings.ConfigError, match="overlaps"):
+        world.config(BIOCHEF_TES_WRITE_DIRS=str(allowed))
 
 
 def test_a_directory_beside_the_datasets_is_fine(world):
     side = world.tmp / "datasets-public"
     side.mkdir()
-    assert world.config(BIOCHEF_TESAPI_DIRS=str(side.resolve())).dirs == (
+    assert world.config(BIOCHEF_TES_READ_DIRS=str(side.resolve())).read_dirs == (
         str(side.resolve()),)
+    assert world.config(BIOCHEF_TES_WRITE_DIRS=str(side.resolve())).write_dirs == (
+        str(side.resolve()),)
+
+
+def test_the_two_lists_may_share_no_directory(world):
+    a, b = world.exchange.resolve(), world.outbox.resolve()
+    inside = a / "deeper"
+    inside.mkdir()
+    for read, write in ((a, a), (a, inside), (inside, a), (a, f"{b},{a}")):
+        with pytest.raises(settings.ConfigError, match="share a directory"):
+            world.config(BIOCHEF_TES_READ_DIRS=str(read), BIOCHEF_TES_WRITE_DIRS=str(write))
+    sibling = world.tmp / "exchange-2"
+    sibling.mkdir()
+    config = world.config(BIOCHEF_TES_READ_DIRS=f"{a},{sibling.resolve()}",
+                          BIOCHEF_TES_WRITE_DIRS=str(b))
+    assert config.read_dirs == (str(a), str(sibling.resolve()))
+
+
+def test_the_old_single_list_is_refused_and_says_what_replaces_it(world):
+    with pytest.raises(settings.ConfigError, match="BIOCHEF_TES_READ_DIRS"):
+        world.config(BIOCHEF_TESAPI_DIRS=str(world.exchange))
+
+
+def test_the_default_database_is_a_place_no_task_may_use(world, monkeypatch):
+    """With BIOCHEF_DB_URL unset the agent uses the default file, so it is denied too."""
+    from store import db
+    default = db.DEFAULT_URL.split(":", 1)[1].lstrip("/")
+    assert ("BIOCHEF_DB_URL", os.path.realpath("/" + default)) in settings._denied({})
 
 
 def test_the_token_command_makes_a_line_the_file_accepts(world, capsys):
@@ -298,7 +348,8 @@ def test_there_are_no_open_pages(api, path):
 def test_the_token_works_and_service_info_says_what_it_is(api):
     info = api.client.get("/v1/service-info", headers=alice()).json()
     assert info["type"] == {"group": "org.ga4gh", "artifact": "tes", "version": "1.1.0"}
-    assert info["storage"] == [f"file://{api.exchange.resolve()}"]
+    assert info["storage"] == [f"file://{api.exchange.resolve()}",
+                               f"file://{api.outbox.resolve()}"]
 
 
 def test_refused_logins_are_recorded_and_batched(api):
@@ -404,31 +455,43 @@ def test_a_symlink_to_the_datasets_is_refused(api):
 def test_the_datasets_are_refused_by_name(api):
     refused(api, task(api, ["true"], inputs=[{"url": url(api.data / "cohort/patients.txt"),
                                               "path": "/work/p.txt"}]),
-            403, "not in a directory this node lets tasks use")
+            403, "not in a directory this node lets tasks read")
 
 
 def test_a_denied_path_is_refused_even_inside_an_allowed_directory(api):
     inner = api.exchange / "node-data"
     inner.mkdir()
     (inner / "keys.txt").write_text("synthetic")
-    config = api.config()._replace(denied=(str(inner.resolve()),))
+    inner_out = api.outbox / "node-data"
+    inner_out.mkdir()
+    config = api.config()._replace(denied=(str(inner.resolve()), str(inner_out.resolve())))
     policy = Policy(config)
     with pytest.raises(Refused, match="where the node keeps its own data"):
         policy.source(url(inner.resolve() / "keys.txt"))
     with pytest.raises(Refused, match="where the node keeps its own data"):
-        policy.destination(url(inner.resolve() / "new.txt"))
+        policy.destination(url(inner_out.resolve() / "new.txt"))
+
+
+def test_what_a_task_may_read_it_may_not_write_and_the_other_way_round(api):
+    (api.outbox / "written.txt").write_text("x")
+    refused(api, task(api, ["true"], inputs=[{"url": url(api.outbox / "written.txt"),
+                                              "path": "/work/x"}]),
+            403, "not in a directory this node lets tasks read")
+    refused(api, task(api, ["true"], outputs=[{"url": url(api.exchange / "back.txt"),
+                                               "path": "/work/x"}]),
+            403, "not in a directory this node lets tasks write")
 
 
 def test_an_output_must_land_in_an_existing_listed_directory(api):
-    refused(api, task(api, ["true"], outputs=[{"url": url(api.exchange / "no/such/out.txt"),
+    refused(api, task(api, ["true"], outputs=[{"url": url(api.outbox / "no/such/out.txt"),
                                                "path": "/work/out.txt"}]),
             400, "must be an existing directory")
 
 
 def test_an_output_that_is_a_symlink_is_refused(api):
-    (api.exchange / "target.txt").write_text("x")
-    (api.exchange / "out.txt").symlink_to(api.exchange / "target.txt")
-    refused(api, task(api, ["true"], outputs=[{"url": url(api.exchange / "out.txt"),
+    (api.outbox / "target.txt").write_text("x")
+    (api.outbox / "out.txt").symlink_to(api.outbox / "target.txt")
+    refused(api, task(api, ["true"], outputs=[{"url": url(api.outbox / "out.txt"),
                                                "path": "/work/out.txt"}]),
             403, "symbolic link")
 
@@ -514,7 +577,7 @@ def test_a_large_body_is_turned_away(api):
 
 def test_a_task_runs_and_its_output_is_where_it_asked(api):
     (api.exchange / "in.txt").write_text("alpha\n")
-    out = api.exchange / "out.txt"
+    out = api.outbox / "out.txt"
     created = api.client.post("/v1/tasks", headers=alice(), json=task(
         api, ["sh", "-c", "tr a-z A-Z < in.txt > out.txt; echo said-this; echo and-this >&2"],
         inputs=[{"url": url(api.exchange / "in.txt"), "path": "/work/in.txt"}],
@@ -541,7 +604,7 @@ def test_arguments_that_name_work_name_the_workspace(api):
     created = api.client.post("/v1/tasks", headers=alice(), json=task(
         api, ["sh", "-c", "cat /work/in.txt > /work/out.txt"],
         inputs=[{"url": url(api.exchange / "in.txt"), "path": "/work/in.txt"}],
-        outputs=[{"url": url(api.exchange / "out.txt"), "path": "/work/out.txt"}]))
+        outputs=[{"url": url(api.outbox / "out.txt"), "path": "/work/out.txt"}]))
     done = wait(api, created.json()["id"])
     # "sh -c" has one argument that is a script, and the script is the caller's:
     # only an argument that starts with /work is the workspace's path.
@@ -549,17 +612,17 @@ def test_arguments_that_name_work_name_the_workspace(api):
     created = api.client.post("/v1/tasks", headers=alice(), json=task(
         api, ["cp", "/work/in.txt", "/work/out.txt"],
         inputs=[{"url": url(api.exchange / "in.txt"), "path": "/work/in.txt"}],
-        outputs=[{"url": url(api.exchange / "out.txt"), "path": "/work/out.txt"}]))
+        outputs=[{"url": url(api.outbox / "out.txt"), "path": "/work/out.txt"}]))
     assert wait(api, created.json()["id"])["state"] == "COMPLETE"
-    assert (api.exchange / "out.txt").read_text() == "beta\n"
+    assert (api.outbox / "out.txt").read_text() == "beta\n"
 
 
 def test_braces_and_quotes_in_a_command_reach_the_tool_unchanged(api):
     created = api.client.post("/v1/tasks", headers=alice(), json=task(
         api, ["sh", "-c", "printf '%s' \"{a} {{b}} 'q' $(echo no)\" > out.txt"],
-        outputs=[{"url": url(api.exchange / "out.txt"), "path": "/work/out.txt"}]))
+        outputs=[{"url": url(api.outbox / "out.txt"), "path": "/work/out.txt"}]))
     assert wait(api, created.json()["id"])["state"] == "COMPLETE"
-    assert (api.exchange / "out.txt").read_text() == "{a} {{b}} 'q' no"
+    assert (api.outbox / "out.txt").read_text() == "{a} {{b}} 'q' no"
 
 
 def test_inline_content_and_directories_work(api):
@@ -567,7 +630,7 @@ def test_inline_content_and_directories_work(api):
     (source / "sub").mkdir(parents=True)
     (source / "one.txt").write_text("1")
     (source / "sub" / "two.txt").write_text("2")
-    target = api.exchange / "result"
+    target = api.outbox / "result"
     target.mkdir()
     created = api.client.post("/v1/tasks", headers=alice(), json=task(
         api, ["sh", "-c", "mkdir -p made/deep && cat bundle/one.txt bundle/sub/two.txt "
@@ -581,7 +644,7 @@ def test_inline_content_and_directories_work(api):
 
 
 def test_a_failing_command_writes_nothing(api):
-    out = api.exchange / "out.txt"
+    out = api.outbox / "out.txt"
     created = api.client.post("/v1/tasks", headers=alice(), json=task(
         api, ["sh", "-c", "echo partial > out.txt; echo why >&2; exit 4"],
         outputs=[{"url": url(out), "path": "/work/out.txt"}]))
@@ -593,7 +656,7 @@ def test_a_failing_command_writes_nothing(api):
 
 
 def test_an_output_the_task_did_not_make_is_a_system_error(api):
-    out = api.exchange / "out.txt"
+    out = api.outbox / "out.txt"
     created = api.client.post("/v1/tasks", headers=alice(), json=task(
         api, ["true"], outputs=[{"url": url(out), "path": "/work/out.txt"}]))
     done = wait(api, created.json()["id"])
@@ -614,17 +677,17 @@ def test_too_many_bytes_is_a_system_error(world):
 
 
 def test_an_output_destination_swapped_for_a_link_is_refused_at_the_end(api):
-    out = api.exchange / "out.txt"
+    out = api.outbox / "out.txt"
     plan = tasks.parse(task(api, ["true"], outputs=[
         {"url": url(out), "path": "/work/out.txt"}]), api.app.state.policy)
     workspace = api.tmp / "ws"
     workspace.mkdir()
     (workspace / "out.txt").write_text("produced")
-    (api.exchange / "elsewhere.txt").write_text("keep")
-    out.symlink_to(api.exchange / "elsewhere.txt")
+    (api.outbox / "elsewhere.txt").write_text("keep")
+    out.symlink_to(api.outbox / "elsewhere.txt")
     with pytest.raises(Refused, match="symbolic link"):
         tasks.stage_out(plan, str(workspace), tasks.Budget(1000), api.app.state.policy)
-    assert (api.exchange / "elsewhere.txt").read_text() == "keep"
+    assert (api.outbox / "elsewhere.txt").read_text() == "keep"
 
 
 def test_an_input_that_is_a_link_inside_a_directory_is_refused_at_the_start(api):
@@ -637,6 +700,149 @@ def test_an_input_that_is_a_link_inside_a_directory_is_refused_at_the_start(api)
     done = wait(api, created.json()["id"])
     assert done["state"] == "SYSTEM_ERROR"
     assert "is not a plain file" in done["logs"][0]["system_logs"][0]
+
+
+# --------------------------------------------------------------------------
+# tasks outlive the process that ran them
+
+
+def restarted(world, **changes):
+    """A second listener on the same database, as after a restart."""
+    app = create_app(world.config(**changes), RecordingRunner())
+    return TestClient(app)
+
+
+def stored(world):
+    from sqlmodel import select
+    from store import db
+    from store.models import TesTask
+    engine = db.make_engine(world.values["BIOCHEF_DB_URL"])
+    with db.reading(engine) as session:
+        return {row.id: row for row in session.exec(select(TesTask)).all()}
+
+
+def test_a_finished_task_is_still_there_after_a_restart(api):
+    (api.exchange / "in.txt").write_text("alpha\n")
+    created = api.client.post("/v1/tasks", headers=alice(), json=task(
+        api, ["sh", "-c", "echo said-this; echo and-this >&2; cp in.txt out.txt"],
+        name="kept", tags={"k": "v"}, description="d",
+        inputs=[{"url": url(api.exchange / "in.txt"), "path": "/work/in.txt"},
+                {"content": "inline-secret-looking-text", "path": "/work/note.txt"}],
+        outputs=[{"url": url(api.outbox / "out.txt"), "path": "/work/out.txt"}]))
+    task_id = created.json()["id"]
+    before = wait(api, task_id)
+    assert before["state"] == "COMPLETE"
+    with restarted(api) as client:
+        after = client.get(f"/v1/tasks/{task_id}?view=FULL", headers=alice())
+        assert after.status_code == 200
+        assert after.json() == before, "everything the caller was told is the same"
+        listed = client.get("/v1/tasks?name_prefix=ke", headers=alice()).json()["tasks"]
+        assert [t["id"] for t in listed] == [task_id]
+        assert client.get(f"/v1/tasks/{task_id}", headers=bob()).status_code == 404, \
+            "another caller's task is still not visible"
+
+
+def test_the_inline_content_of_an_input_is_not_kept(api):
+    created = api.client.post("/v1/tasks", headers=alice(), json=task(
+        api, ["true"], inputs=[{"content": "inline-secret-looking-text",
+                                "path": "/work/note.txt"}]))
+    wait(api, created.json()["id"])
+    row = stored(api)[created.json()["id"]]
+    assert row.inputs == []
+    import sqlite3
+    with sqlite3.connect(str(api.tmp / "agent.db")) as connection:
+        dump = "\n".join(connection.iterdump())
+    assert "inline-secret-looking-text" not in dump
+    assert TOKEN_A not in dump
+
+
+@pytest.mark.parametrize("was", ["QUEUED", "INITIALIZING", "RUNNING", "CANCELING"])
+def test_a_task_that_was_unfinished_at_a_restart_is_a_system_error(api, was):
+    from datetime import datetime, timezone
+    from store import db
+    from store.models import TesTask
+    engine = db.make_engine(api.values["BIOCHEF_DB_URL"])
+    lost = "lost" + was.lower().ljust(28, "0")
+    with db.writing(engine) as session:
+        session.add(TesTask(id=lost, owner="alice", name="lost", image=IMAGE,
+                            command=["sleep", "999"], state=was,
+                            created_at=datetime.now(timezone.utc)))
+    with restarted(api) as client:
+        view = client.get(f"/v1/tasks/{lost}?view=FULL", headers=alice()).json()
+    assert view["state"] == "SYSTEM_ERROR"
+    assert f"stopped while this task was {was}" in view["logs"][0]["system_logs"][0]
+    assert stored(api)[lost].state == "SYSTEM_ERROR" and stored(api)[lost].ended_at
+    event, = [e for e in api.events("tes.task.state") if e.get("task_id") == lost]
+    assert (event["state"], event["error"], event["was"], event["source"]) == (
+        "SYSTEM_ERROR", "restarted", was, "tes")
+
+
+def test_a_cancelled_task_stays_cancelled(api):
+    created = api.client.post("/v1/tasks", headers=alice(), json=task(
+        api, ["sleep", "30"]))
+    task_id = created.json()["id"]
+    for _ in range(100):
+        if api.client.get(f"/v1/tasks/{task_id}", headers=alice()).json()["state"] == "RUNNING":
+            break
+        time.sleep(0.1)
+    api.client.post(f"/v1/tasks/{task_id}:cancel", headers=alice())
+    assert wait(api, task_id)["state"] == "CANCELED"
+    with restarted(api) as client:
+        assert client.get(f"/v1/tasks/{task_id}", headers=alice()).json()["state"] == "CANCELED"
+
+
+def test_the_listener_writes_to_one_table_only(api):
+    created = api.client.post("/v1/tasks", headers=alice(), json=task(api, ["true"]))
+    wait(api, created.json()["id"])
+    import sqlite3
+    with sqlite3.connect(str(api.tmp / "agent.db")) as connection:
+        tables = [name for (name,) in connection.execute(
+            "select name from sqlite_master where type='table' and name not like "
+            "'sqlite_%' and name != 'alembic_version'")]
+        counts = {name: connection.execute(f"select count(*) from {name}").fetchone()[0]
+                  for name in tables}
+    assert counts.pop("tes_task") == 1
+    assert not any(counts.values()), counts
+
+
+def test_a_task_the_database_cannot_keep_does_not_run(api, monkeypatch):
+    from tesapi import records
+    def refuse(bind, task):
+        raise records.RecordError("the task could not be kept: OperationalError")
+    monkeypatch.setattr(records, "save", refuse)
+    answer = api.client.post("/v1/tasks", headers=alice(), json=task(api, ["true"]))
+    assert answer.status_code == 503 and "will not run it" in answer.json()["msg"]
+    assert api.runner.used == [], "nothing ran"
+    assert api.app.state.engine.active == 0, "and it holds no place in the queue"
+
+
+def test_a_database_at_an_older_schema_stops_the_listener(world, capsys, monkeypatch):
+    from store import migrate
+    from tesapi.__main__ import main
+    migrate.downgrade(world.values["BIOCHEF_DB_URL"], "0005")
+    for key, value in world.values.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("BIOCHEF_RUNNER", "subprocess")
+    monkeypatch.setenv("BIOCHEF_REQUIRE_NETWORK_ISOLATION", "false")
+    # prepare() would refuse the subprocess runner first; the schema is checked after
+    # it, so name a runner that passes it.
+    import tesapi.__main__ as entry
+    monkeypatch.setattr(entry, "get_runner", lambda name: RecordingRunner(network=ATTESTED))
+    assert main([]) == 1
+    assert "schema is not current" in capsys.readouterr().err
+
+
+def test_old_finished_tasks_are_forgotten_in_the_database_too(api, monkeypatch):
+    monkeypatch.setattr(tasks, "MAX_KEPT_TASKS", 2)
+    ids = []
+    for number in range(4):
+        created = api.client.post("/v1/tasks", headers=alice(), json=task(
+            api, ["true"], name=f"n{number}"))
+        ids.append(created.json()["id"])
+        wait(api, ids[-1])
+    assert set(stored(api)) == set(ids[-2:])
+    assert [t["id"] for t in api.client.get("/v1/tasks", headers=alice()).json()["tasks"]] == \
+        list(reversed(ids[-2:]))
 
 
 # --------------------------------------------------------------------------
@@ -745,19 +951,28 @@ def test_the_slots_are_not_the_agents(api):
     engine = api.app.state.engine
     assert engine.config.max_concurrent == 1
     code = ("import sys; import tesapi.app, tesapi.tasks, tesapi.__main__; "
-            "bad = [m for m in ('main', 'ui', 'node', 'store', 'runs', 'sqlmodel') "
+            "bad = [m for m in ('main', 'ui', 'node', 'runs') "
             "if m in sys.modules]; print(bad); sys.exit(1 if bad else 0)")
     done = subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT,
                           capture_output=True, text=True)
     assert done.returncode == 0, done.stdout + done.stderr
 
 
-def test_the_listener_never_opens_the_nodes_database_or_the_other_apps():
-    for source in (REPO_ROOT / "tesapi").glob("*.py"):
-        text = source.read_text()
-        for forbidden in (r"^\s*(from|import)\s+(store|node|ui|main|runs)\b",
-                          r"sqlmodel", r"sqlalchemy"):
-            assert not re.search(forbidden, text, re.M), (source.name, forbidden)
+def test_the_listener_opens_one_table_of_the_database_and_never_the_other_apps():
+    sources = {source.name: source.read_text()
+               for source in (REPO_ROOT / "tesapi").glob("*.py")}
+    for name, text in sources.items():
+        # Not the agent's API, the page, the node's logic or the federated run store.
+        assert not re.search(r"^\s*(from|import)\s+(node|ui|main|runs)\b", text, re.M), name
+        # The database is opened in records.py. Elsewhere only the engine is made
+        # (app.py, __main__.py) and the default URL is read (config.py).
+        if name != "records.py":
+            assert not re.search(r"sqlmodel|sqlalchemy|store\.models|store\.repo", text), name
+    records_text = sources["records.py"]
+    models = re.findall(r"from store\.models import ([^\n]+)", records_text)
+    assert models == ["TesTask"], "records.py reads and writes tes_task and no other table"
+    assert not re.search(r"store\.repo|RunSummary|Study|Request|Decision|DatasetBinding",
+                         records_text)
 
 
 # --------------------------------------------------------------------------

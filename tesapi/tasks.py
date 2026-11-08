@@ -34,6 +34,7 @@ from typing import List, NamedTuple, Optional
 from starlette.concurrency import run_in_threadpool
 
 import audit
+from tesapi import records
 from tesapi.config import MAX_KEPT_TASKS
 from tesapi.policy import WORKDIR, Policy, Refused
 from workspace import make_workspace
@@ -329,6 +330,27 @@ class Task:
         self.counted = False
         self.cancel = threading.Event()
 
+    @classmethod
+    def from_row(cls, row):
+        """A task read back from the database. It has no location to read from: only
+        what the caller was told, which is all a finished task is asked for."""
+        def items(entries):
+            return [Item(e["kind"], e["relative"], None, None, e.get("url"))
+                    for e in entries]
+
+        plan = Plan(row.name, row.description, dict(row.tags), row.image,
+                    list(row.command), items(row.inputs), items(row.outputs), {})
+        found = cls.__new__(cls)
+        found.id, found.owner, found.plan = row.id, row.owner, plan
+        found.state = row.state
+        found.created = records._text(row.created_at)
+        found.started, found.ended = records._text(row.started_at), records._text(row.ended_at)
+        found.stdout, found.stderr, found.exit_code = row.stdout, row.stderr, row.exit_code
+        found.system_logs, found.sizes = list(row.system_logs), list(row.sizes)
+        found.pgid, found.counted = None, False
+        found.cancel = threading.Event()
+        return found
+
     def view(self, level="BASIC"):
         if level == "MINIMAL":
             return {"id": self.id, "state": self.state}
@@ -368,15 +390,50 @@ class Engine:
     process of its own, so nothing here can reach one.
     """
 
-    def __init__(self, config, policy: Policy, runner):
+    def __init__(self, config, policy: Policy, runner, bind=None):
         self.config = config
         self.policy = policy
         self.runner = runner
+        self.bind = bind
         self.tasks: "OrderedDict[str, Task]" = OrderedDict()
         self.active = 0
         self._slots = None
         self._lock = threading.Lock()
         self._running = set()
+
+    def open(self):
+        """Read the tasks back, and end the ones a restart left unfinished.
+
+        A task that was queued or running when the process stopped has nothing left
+        to finish: its workspace, its runner and its place in the queue were in the
+        process. It is read back as SYSTEM_ERROR and the record says why, so a
+        caller who polls it learns that, and not that it is still running.
+        """
+        if self.bind is None:
+            return
+        records.check(self.bind)
+        for row in records.load(self.bind, MAX_KEPT_TASKS):
+            task = Task.from_row(row)
+            if task.state not in TERMINAL:
+                was = task.state
+                task.system_logs.append(
+                    f"the TES listener stopped while this task was {was}; "
+                    f"it did not finish and will not be resumed")
+                task.state, task.ended = "SYSTEM_ERROR", now()
+                records.save(self.bind, task)
+                self.audit("tes.task.state", task, state="SYSTEM_ERROR",
+                           error="restarted", was=was)
+            self.tasks[task.id] = task
+
+    def _keep(self, task, strict=True):
+        """Write the task down. A task that cannot be written down does not start."""
+        if self.bind is None:
+            return
+        try:
+            records.save(self.bind, task)
+        except records.RecordError:
+            if strict:
+                raise
 
     def _semaphore(self):
         if self._slots is None:
@@ -406,6 +463,11 @@ class Engine:
         except audit.AuditError:
             self._release(task)
             raise
+        try:
+            self._keep(task)
+        except records.RecordError:
+            self._release(task)
+            raise
         with self._lock:
             self.tasks[task.id] = task
             self._prune()
@@ -423,8 +485,15 @@ class Engine:
 
     def _prune(self):
         finished = [key for key, task in self.tasks.items() if task.state in TERMINAL]
+        dropped = False
         while len(self.tasks) > MAX_KEPT_TASKS and finished:
             self.tasks.pop(finished.pop(0), None)
+            dropped = True
+        if dropped and self.bind is not None:
+            try:
+                records.prune(self.bind, MAX_KEPT_TASKS)
+            except records.RecordError:
+                pass
 
     def get(self, owner, task_id) -> Optional[Task]:
         task = self.tasks.get(task_id)
@@ -439,12 +508,20 @@ class Engine:
         task.state = state
         if state in TERMINAL:
             task.ended = now()
+        failure = None
         try:
             self.audit("tes.task.state", task, state=state, **fields)
-        except audit.AuditError:
+        except audit.AuditError as error:
+            failure = error
+        # Written whether or not the audit trail took the event, so a restart does not
+        # read a finished task back as unfinished.
+        try:
+            self._keep(task)
+        except records.RecordError as error:
+            failure = failure or error
+        if failure is not None and state not in TERMINAL:
             # The run may not go on unrecorded, and may not stay unfinished.
-            if state not in TERMINAL:
-                raise
+            raise failure
 
     def cancel(self, task: Task):
         if task.state in TERMINAL or task.state == "CANCELING":
@@ -455,6 +532,7 @@ class Engine:
             self._release(task)
         else:
             task.state = "CANCELING"
+            self._keep(task, strict=False)
             if task.pgid is not None:
                 try:
                     os.killpg(task.pgid, signal.SIGKILL)

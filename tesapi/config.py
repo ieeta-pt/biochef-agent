@@ -12,6 +12,8 @@ import re
 import stat
 from typing import NamedTuple, Tuple
 
+from store import db
+
 IMAGE_SHAPE = re.compile(r"\A(?!.*//)[A-Za-z0-9][A-Za-z0-9._:/-]{0,250}@sha256:[0-9a-f]{64}\Z")
 NAME_SHAPE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 TOKEN_LINE = re.compile(r"\A(\S+)\s+sha256:([0-9a-f]{64})\Z")
@@ -33,7 +35,8 @@ class Config(NamedTuple):
     port: int
     tokens: Tuple[Tuple[str, str], ...]
     images: Tuple[str, ...]
-    dirs: Tuple[str, ...]
+    read_dirs: Tuple[str, ...]
+    write_dirs: Tuple[str, ...]
     denied: Tuple[str, ...]
     max_concurrent: int
     max_queued: int
@@ -42,6 +45,7 @@ class Config(NamedTuple):
     tls_cert: str
     tls_key: str
     run_root: str
+    db_url: str
 
 
 def hash_token(token: str) -> str:
@@ -112,11 +116,41 @@ def _denied(values):
         raw = (values.get(name) or "").strip()
         if raw:
             found.append((name, os.path.realpath(raw)))
-    url = (values.get("BIOCHEF_DB_URL") or "").strip()
+    url = (values.get("BIOCHEF_DB_URL") or "").strip() or db.DEFAULT_URL
     if url.startswith("sqlite:"):
         file = url.split(":", 1)[1].lstrip("/")
         if file and file != ":memory:":
             found.append(("BIOCHEF_DB_URL", os.path.realpath("/" + file)))
+    return tuple(found)
+
+
+def _directories(name, raw, denied):
+    """The directories one list names, each absolute, normal, real and not the node's."""
+    found = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not os.path.isabs(part):
+            raise ConfigError(f"{name}: {part!r} is not an absolute path")
+        real = os.path.realpath(part)
+        if real != os.path.normpath(part):
+            raise ConfigError(f"{name}: {part!r} is named through a symlink or is not "
+                              f"normal; give {real!r}")
+        if not os.path.isdir(real):
+            raise ConfigError(f"{name}: {part!r} is not a directory")
+        if real == "/":
+            raise ConfigError(f"{name}: / would allow everything")
+        for other_name, other in denied:
+            if overlaps(real, other):
+                raise ConfigError(
+                    f"{name}: {real} overlaps {other} ({other_name}), which "
+                    f"holds the node's own data. No task may read or write there, so "
+                    f"no directory that contains it or lies inside it can be allowed")
+        found.append(real)
+    if not found:
+        raise ConfigError(f"{name} lists no directory, and has no default: a task "
+                          f"reads and writes only where it is told")
     return tuple(found)
 
 
@@ -127,6 +161,8 @@ def settings_from_environment():
         "BIOCHEF_TESAPI_PORT": os.getenv("BIOCHEF_TESAPI_PORT", "8082"),
         "BIOCHEF_TESAPI_TOKENS": os.getenv("BIOCHEF_TESAPI_TOKENS", ""),
         "BIOCHEF_TESAPI_IMAGES": os.getenv("BIOCHEF_TESAPI_IMAGES", ""),
+        "BIOCHEF_TES_READ_DIRS": os.getenv("BIOCHEF_TES_READ_DIRS", ""),
+        "BIOCHEF_TES_WRITE_DIRS": os.getenv("BIOCHEF_TES_WRITE_DIRS", ""),
         "BIOCHEF_TESAPI_DIRS": os.getenv("BIOCHEF_TESAPI_DIRS", ""),
         "BIOCHEF_TESAPI_MAX_CONCURRENT": os.getenv("BIOCHEF_TESAPI_MAX_CONCURRENT", "1"),
         "BIOCHEF_TESAPI_MAX_QUEUED": os.getenv("BIOCHEF_TESAPI_MAX_QUEUED", "16"),
@@ -190,35 +226,27 @@ def load(values=None) -> Config:
                               f"digest (repository@sha256:<64 hex>)")
 
     denied = _denied(values)
-    dirs = []
-    for part in get("BIOCHEF_TESAPI_DIRS").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if not os.path.isabs(part):
-            raise ConfigError(f"BIOCHEF_TESAPI_DIRS: {part!r} is not an absolute path")
-        real = os.path.realpath(part)
-        if real != os.path.normpath(part):
-            raise ConfigError(f"BIOCHEF_TESAPI_DIRS: {part!r} is named through a "
-                              f"symlink or is not normal; give {real!r}")
-        if not os.path.isdir(real):
-            raise ConfigError(f"BIOCHEF_TESAPI_DIRS: {part!r} is not a directory")
-        if real == "/":
-            raise ConfigError("BIOCHEF_TESAPI_DIRS: / would allow everything")
-        for name, other in denied:
-            if overlaps(real, other):
+    if get("BIOCHEF_TESAPI_DIRS"):
+        raise ConfigError("BIOCHEF_TESAPI_DIRS is replaced by BIOCHEF_TES_READ_DIRS and "
+                          "BIOCHEF_TES_WRITE_DIRS: a task reads from one set of "
+                          "directories and writes to another, and they may not share "
+                          "any. Unset it and list the two")
+    read_dirs = _directories("BIOCHEF_TES_READ_DIRS", get("BIOCHEF_TES_READ_DIRS"), denied)
+    write_dirs = _directories("BIOCHEF_TES_WRITE_DIRS", get("BIOCHEF_TES_WRITE_DIRS"), denied)
+    for reading in read_dirs:
+        for writing in write_dirs:
+            if overlaps(reading, writing):
                 raise ConfigError(
-                    f"BIOCHEF_TESAPI_DIRS: {real} overlaps {other} ({name}), which "
-                    f"holds the node's own data. No task may read or write there, so "
-                    f"no directory that contains it or lies inside it can be allowed")
-        dirs.append(real)
-    if not dirs:
-        raise ConfigError("BIOCHEF_TESAPI_DIRS lists no directory, and has no "
-                          "default: a task reads and writes only there")
+                    f"BIOCHEF_TES_READ_DIRS and BIOCHEF_TES_WRITE_DIRS share a "
+                    f"directory: {reading} and {writing} are the same place or one is "
+                    f"inside the other. What a task may read and what it may write "
+                    f"are kept apart, so that nothing it wrote can be read back as an "
+                    f"input, and nothing it read can be overwritten")
     return Config(
-        host, port, tokens, images, tuple(dirs), tuple(path for _, path in denied),
+        host, port, tokens, images, read_dirs, write_dirs, tuple(path for _, path in denied),
         _integer("BIOCHEF_TESAPI_MAX_CONCURRENT", get("BIOCHEF_TESAPI_MAX_CONCURRENT", "1"), 1, 256),
         _integer("BIOCHEF_TESAPI_MAX_QUEUED", get("BIOCHEF_TESAPI_MAX_QUEUED", "16"), 0, 100000),
         _integer("BIOCHEF_TESAPI_MAX_BYTES", get("BIOCHEF_TESAPI_MAX_BYTES", str(1024 ** 3)), 1),
         _integer("BIOCHEF_TESAPI_TIMEOUT", get("BIOCHEF_TESAPI_TIMEOUT", "900"), 1),
-        cert, key, get("BIOCHEF_RUN_ROOT"))
+        cert, key, get("BIOCHEF_RUN_ROOT"),
+        get("BIOCHEF_DB_URL") or db.DEFAULT_URL)

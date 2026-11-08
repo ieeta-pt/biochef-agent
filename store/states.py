@@ -121,6 +121,18 @@ BUSY_RUN_STATES = frozenset({"INITIALIZING", "RUNNING", "CANCELING"})
 """A run holding a slot of BIOCHEF_MAX_CONCURRENT_RUNS."""
 
 
+class TesState(str, Enum):
+    """The states of a TES task (GA4GH TES 1.1), as the TES API keeps them."""
+    QUEUED = "QUEUED"
+    INITIALIZING = "INITIALIZING"
+    RUNNING = "RUNNING"
+    CANCELING = "CANCELING"
+    COMPLETE = "COMPLETE"
+    EXECUTOR_ERROR = "EXECUTOR_ERROR"
+    SYSTEM_ERROR = "SYSTEM_ERROR"
+    CANCELED = "CANCELED"
+
+
 class BindingSource(str, Enum):
     CONFIG = "config"
     PAGE = "page"

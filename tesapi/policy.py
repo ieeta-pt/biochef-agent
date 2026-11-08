@@ -52,13 +52,13 @@ class Policy(NamedTuple):
             raise Refused(f"{path[:120]!r} is not a normal absolute path")
         return path
 
-    def _allowed(self, path):
-        for root in self.config.dirs:
+    def _allowed(self, path, roots, what):
+        for root in roots:
             if within(path, root):
                 break
         else:
-            raise Refused(f"{path} is not in a directory this node lets tasks use; "
-                          f"they are {', '.join(self.config.dirs)}", 403)
+            raise Refused(f"{path} is not in a directory this node lets tasks {what}; "
+                          f"they are {', '.join(roots)}", 403)
         for other in self.config.denied:
             if overlaps(path, other):
                 raise Refused(f"{path} is where the node keeps its own data", 403)
@@ -70,7 +70,7 @@ class Policy(NamedTuple):
             raise Refused(f"{path} does not exist", 404)
         if os.path.realpath(path) != path:
             raise Refused(f"{path} is, or lies behind, a symbolic link", 403)
-        self._allowed(path)
+        self._allowed(path, self.config.read_dirs, "read")
         return path
 
     def destination(self, url) -> str:
@@ -81,7 +81,7 @@ class Policy(NamedTuple):
             raise Refused(f"{parent} must be an existing directory, behind no symlink")
         if os.path.islink(path):
             raise Refused(f"{path} is a symbolic link", 403)
-        self._allowed(path)
+        self._allowed(path, self.config.write_dirs, "write")
         return path
 
     def workspace_path(self, path, directory=False) -> str:
