@@ -16,6 +16,7 @@ root, which is the case tes-step-root exists for.
 so a test can corrupt, add or replace a file the way a bad server could.
 """
 
+import base64
 import json
 import os
 import shutil
@@ -39,10 +40,11 @@ def _path(url):
 
 class TesServer:
     def __init__(self, allowed, mode="subprocess", token=None, tamper=None,
-                 on_task=None):
+                 on_task=None, basic=None):
         self.allowed = [os.path.realpath(each) for each in allowed]
         self.mode = mode
         self.token = token
+        self.basic = basic          # (user, password), or None
         self.tamper = tamper
         self.on_task = on_task
         self.tasks = {}
@@ -67,10 +69,15 @@ class TesServer:
 
             def _authorised(self):
                 server.seen_headers.append(dict(self.headers))
-                if server.token is None:
+                if server.token is None and server.basic is None:
                     return True
-                if self.headers.get("Authorization") == f"Bearer {server.token}":
+                if (server.token is not None and self.headers.get("Authorization")
+                        == f"Bearer {server.token}"):
                     return True
+                if server.basic is not None:
+                    wanted = base64.b64encode(":".join(server.basic).encode()).decode()
+                    if self.headers.get("Authorization") == f"Basic {wanted}":
+                        return True
                 self._send(401, {"message": "unauthorised"})
                 return False
 

@@ -28,6 +28,7 @@ the script as a shell and a script cannot be tested the way a function can. Only
 the standard library, so that the script runs under whatever python3 the host has.
 """
 
+import base64
 import hashlib
 import json
 import os
@@ -62,12 +63,14 @@ state, and the workflow. A task cannot hand them back either."""
 
 ATTRIBUTES = ("BIOCHEF_TES_URL", "BIOCHEF_TES_IMAGE", "BIOCHEF_TES_AUTH",
               "BIOCHEF_TES_TOKEN_FILE", "BIOCHEF_TES_CA", "BIOCHEF_TES_STAGING",
-              "BIOCHEF_TES_HELPER")
+              "BIOCHEF_TES_HELPER", "BIOCHEF_TES_USER", "BIOCHEF_TES_PASSWORD_FILE")
 """What tes-step is given, by the runner, in Snakemake's environment."""
 
 _IMAGE_SHAPE = re.compile(r"\A(?!.*//)[A-Za-z0-9][A-Za-z0-9._:/-]{0,250}@sha256:[0-9a-f]{64}\Z")
 _RUN_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _TOKEN_SHAPE = re.compile(r"\A[A-Za-z0-9._~+/=-]{8,4096}\Z")
+_PASSWORD_SHAPE = re.compile(r"\A[\x21-\x7e]{8,4096}\Z")
+_USER_SHAPE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._@-]{0,127}\Z")
 _MANIFEST_LINE = re.compile(r"\A([0-9a-f]{64})  \./([^\x00-\x1f\x7f\\]+)\Z")
 LOOPBACK = ("localhost", "127.0.0.1", "::1")
 MAX_RESPONSE = 16 * 1024 * 1024
@@ -85,6 +88,8 @@ class Settings(NamedTuple):
     ca: Optional[str]
     staging: str
     helper: str
+    user: Optional[str] = None
+    password_file: Optional[str] = None
 
 
 def check_url(url: str) -> str:
@@ -126,18 +131,31 @@ def check_settings(values) -> Settings:
         return (values.get(name) or "").strip()
 
     auth = get("BIOCHEF_TES_AUTH")
-    if auth not in ("bearer", "none"):
-        raise TesError(f"BIOCHEF_TES_AUTH={auth!r} must be bearer or none, and has "
-                       f"no default")
+    if auth not in ("bearer", "basic", "none"):
+        raise TesError(f"BIOCHEF_TES_AUTH={auth!r} must be bearer, basic or none, and "
+                       f"has no default")
     token_file = get("BIOCHEF_TES_TOKEN_FILE") or None
+    user = get("BIOCHEF_TES_USER") or None
+    password_file = get("BIOCHEF_TES_PASSWORD_FILE") or None
     if auth == "bearer":
         if not token_file or not os.path.isabs(token_file):
             raise TesError("BIOCHEF_TES_AUTH=bearer needs BIOCHEF_TES_TOKEN_FILE, "
                            "the absolute path of a file holding the token")
         read_token(token_file)
     elif token_file:
-        raise TesError("BIOCHEF_TES_TOKEN_FILE is set but BIOCHEF_TES_AUTH=none, "
-                       "so the token would never be sent")
+        raise TesError(f"BIOCHEF_TES_TOKEN_FILE is set but BIOCHEF_TES_AUTH={auth}, "
+                       f"so the token would never be sent")
+    if auth == "basic":
+        if not user or not _USER_SHAPE.match(user):
+            raise TesError("BIOCHEF_TES_AUTH=basic needs BIOCHEF_TES_USER: letters, "
+                           "digits and . _ @ -, up to 128, with no colon")
+        if not password_file or not os.path.isabs(password_file):
+            raise TesError("BIOCHEF_TES_AUTH=basic needs BIOCHEF_TES_PASSWORD_FILE, "
+                           "the absolute path of a file holding the password")
+        read_password(password_file)
+    elif user or password_file:
+        raise TesError(f"BIOCHEF_TES_USER and BIOCHEF_TES_PASSWORD_FILE are set but "
+                       f"BIOCHEF_TES_AUTH={auth}, so they would never be sent")
     ca = get("BIOCHEF_TES_CA") or None
     if ca and not (os.path.isabs(ca) and os.path.isfile(ca)):
         raise TesError(f"BIOCHEF_TES_CA={ca!r} must be the absolute path of a file")
@@ -151,7 +169,7 @@ def check_settings(values) -> Settings:
                        f"tes-step-root as installed for sudo, and has no default")
     return Settings(check_url(get("BIOCHEF_TES_URL")),
                     check_image(get("BIOCHEF_TES_IMAGE")), auth, token_file, ca,
-                    staging, helper)
+                    staging, helper, user, password_file)
 
 
 def read_token(path: str) -> str:
@@ -170,6 +188,25 @@ def read_token(path: str) -> str:
     if not _TOKEN_SHAPE.match(token):
         raise TesError(f"BIOCHEF_TES_TOKEN_FILE={path!r} does not hold a token")
     return token
+
+
+def read_password(path: str) -> str:
+    """The password, from a file only the agent's user can read."""
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        raise TesError(f"BIOCHEF_TES_PASSWORD_FILE={path!r}: {error.strerror}") from None
+    if not stat.S_ISREG(info.st_mode):
+        raise TesError(f"BIOCHEF_TES_PASSWORD_FILE={path!r} is not a regular file")
+    if info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise TesError(f"BIOCHEF_TES_PASSWORD_FILE={path!r} must belong to the agent's "
+                       f"user and be readable by no one else (mode 0600)")
+    with open(path, encoding="utf-8") as stream:
+        password = stream.read(8192).strip()
+    if not _PASSWORD_SHAPE.match(password):
+        raise TesError(f"BIOCHEF_TES_PASSWORD_FILE={path!r} does not hold a password: "
+                       f"8 or more printable characters, no spaces")
+    return password
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -202,6 +239,9 @@ class Client:
             headers["Content-Type"] = "application/json"
         if self.settings.auth == "bearer":
             headers["Authorization"] = "Bearer " + read_token(self.settings.token_file)
+        elif self.settings.auth == "basic":
+            login = f"{self.settings.user}:{read_password(self.settings.password_file)}"
+            headers["Authorization"] = "Basic " + base64.b64encode(login.encode()).decode()
         request = urllib.request.Request(url, data=data, headers=headers,
                                          method=method)
         try:

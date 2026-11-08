@@ -82,6 +82,15 @@ def check(condition, message):
     print(f"ok: {message}")
 
 
+def refused(client):
+    """Whether a call to the server is answered 401 or 403."""
+    try:
+        client.get_list("biochef-")
+    except tes.TesError as error:
+        return "answered 401" in str(error) or "answered 403" in str(error)
+    return False
+
+
 def owner_of_returned_files(step_directory):
     seen = set()
     for top, dirs, files in os.walk(os.path.join(step_directory, "out")):
@@ -94,6 +103,18 @@ def main():
     os.environ["BIOCHEF_AUDIT_SECRET"] = SECRET
     runner = TesRunner()
     print("runner:", runner.describe())
+    if runner.settings.auth != "none":
+        # The server wants credentials: without them, or with the wrong ones, it
+        # must say no, or the runner's own token or password proves nothing.
+        bare = runner.settings._replace(auth="none", token_file=None, user=None,
+                                        password_file=None)
+        check(refused(tes.Client(bare)), "the server refuses a request with no credentials")
+        if runner.settings.auth == "basic":
+            wrong = Path(tempfile.mkdtemp(prefix="biochef-wrong-")) / "password"
+            wrong.write_text("not-the-synthetic-password\n")
+            wrong.chmod(0o600)
+            check(refused(tes.Client(runner.settings._replace(password_file=str(wrong)))),
+                  "and one with the wrong password")
     staging = Path(runner.settings.staging)
     runs = Path(tempfile.mkdtemp(prefix="biochef-run-"))
     neighbour = staging / "neighbour-run"

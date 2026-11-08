@@ -68,24 +68,43 @@ sudo rm -rf "$STAGING/run-a" "$STAGING/shallow" "$STAGING/link-run" "/home/$AGEN
 
 if [ "${TES_SERVER:-stand-in}" = funnel ]; then
     # The real thing: Funnel, built from FUNNEL_SRC, started as root with a config made
-    # from its own default. It has no token here: the job reaches it on the loopback,
-    # BIOCHEF_TES_AUTH=none, and Funnel's own authentication is not exercised.
+    # from its own default. With BIOCHEF_TES_AUTH=basic it is given a user and a
+    # password, which only the agent's user and Funnel's config can read; with none, it
+    # is reached on the loopback with nothing. Its OIDC mode is not exercised.
     FUNNEL_WORK=/srv/biochef-funnel
     sudo rm -rf "$FUNNEL_WORK"
     sudo install -d -o root -g root -m 0755 "$FUNNEL_WORK" "$FUNNEL_WORK/work"
-    python3 "$SRC/ci/funnel_config.py" "$FUNNEL_SRC/config/default-config.yaml" \
-        "$WORK/funnel.yml" "$FUNNEL_WORK/work" "$FUNNEL_WORK/funnel.db" "$STAGING"
+    LOGIN=()
+    if [ "${BIOCHEF_TES_AUTH:-none}" = basic ]; then
+        PASSWORD=/etc/biochef-agent/tes-password
+        head -c 24 /dev/urandom | base64 | tr -d '/+=\n' | sudo tee "$PASSWORD" >/dev/null
+        sudo chown "$AGENT:$AGENT" "$PASSWORD"
+        sudo chmod 0600 "$PASSWORD"
+        # The runner's user cannot read it, and the config needs it: read as root.
+        sudo cp "$PASSWORD" "$WORK/funnel-password"
+        sudo chmod 0600 "$WORK/funnel-password"
+        LOGIN=(biochef-agent "$WORK/funnel-password")
+    fi
+    sudo python3 "$SRC/ci/funnel_config.py" "$FUNNEL_SRC/config/default-config.yaml" \
+        "$WORK/funnel.yml" "$FUNNEL_WORK/work" "$FUNNEL_WORK/funnel.db" "$STAGING" \
+        "${LOGIN[@]}"
+    sudo rm -f "$WORK/funnel-password"
     sudo rm -f "$WORK/funnel.log"
     sudo -b sh -c "exec '$FUNNEL_SRC/funnel' server run --config '$WORK/funnel.yml' \
         >'$WORK/funnel.log' 2>&1"
+    # Up when it answers at all: with a password it answers 401 to a request without one.
+    up() { [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/v1/service-info)" != 000 ]; }
     for _ in $(seq 1 60); do
-        curl -sf http://127.0.0.1:8000/v1/service-info >/dev/null && break
+        up && break
         sleep 0.5
     done
-    curl -sf http://127.0.0.1:8000/v1/service-info >/dev/null || {
-        sudo cat "$WORK/funnel.log"; echo "FAIL: no Funnel" >&2; exit 1; }
+    up || { sudo cat "$WORK/funnel.log"; echo "FAIL: no Funnel" >&2; exit 1; }
     {
         echo "BIOCHEF_TES_URL=http://127.0.0.1:8000"
+        if [ "${BIOCHEF_TES_AUTH:-none}" = basic ]; then
+            echo "BIOCHEF_TES_USER=biochef-agent"
+            echo "BIOCHEF_TES_PASSWORD_FILE=$PASSWORD"
+        fi
         echo "BIOCHEF_TES_STAGING=$STAGING"
         echo "BIOCHEF_TES_HELPER=$HELPER"
         echo "AGENT_USER=$AGENT"

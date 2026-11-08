@@ -206,7 +206,7 @@ def test_the_isolation_rule_refuses_it_unless_turned_off_on_purpose(host, monkey
         monkeypatch.setenv(name, value)
     monkeypatch.setattr("runner.TES_STEP_CONF", str(host.conf))
     monkeypatch.setattr("runner.TesRunner.__init__.__defaults__",
-                        (None,) * 8 + (str(host.conf), os.getuid()))
+                        (None,) * 8 + (str(host.conf), os.getuid(), None, None))
     for unset in (None, "true"):
         if unset is None:
             monkeypatch.delenv("BIOCHEF_REQUIRE_NETWORK_ISOLATION")
@@ -292,6 +292,110 @@ def test_auth_none_sends_no_header(host):
     host.server.token = None
     host.make(auth="none", token_file="")
     assert all("Authorization" not in h for h in host.server.seen_headers)
+
+
+# --------------------------------------------------------------------------
+# basic authentication: a user, and a password in a file
+
+
+PASSWORD = "a-synthetic-password-0451"
+
+
+@pytest.fixture
+def basic(host):
+    """The server wants a user and a password, as Funnel does with BasicAuth."""
+    host.server.token, host.server.basic = None, ("agent-user", PASSWORD)
+    password = host.tmp / "password"
+    password.write_text(PASSWORD + "\n")
+    password.chmod(0o600)
+    host.password = password
+
+    def make(**changes):
+        return host.make(**{"auth": "basic", "token_file": "", "user": "agent-user",
+                            "password_file": str(password), **changes})
+
+    host.make_basic = make
+    return host
+
+
+def test_basic_sends_the_user_and_the_password_in_a_header(basic):
+    import base64
+    basic.make_basic()
+    wanted = "Basic " + base64.b64encode(f"agent-user:{PASSWORD}".encode()).decode()
+    assert {h.get("Authorization") for h in basic.server.seen_headers} == {wanted}
+
+
+def test_a_workflow_runs_through_a_server_that_wants_a_password(basic, monkeypatch):
+    runner = basic.make_basic()
+    code, out, err, workspace = run_step(basic, monkeypatch, "echo made > made.txt",
+                                         runner=runner)
+    assert code == 0, err
+    assert (workspace / "made.txt").read_text() == "made\n"
+
+
+def test_the_password_never_reaches_the_task_or_the_steps_environment(basic, monkeypatch):
+    runner = basic.make_basic()
+    run_step(basic, monkeypatch, "true", runner=runner)
+    assert PASSWORD not in json.dumps(basic.server.posted)
+    environment = runner.environment()
+    assert environment["BIOCHEF_TES_PASSWORD_FILE"] == str(basic.password)
+    assert environment["BIOCHEF_TES_USER"] == "agent-user"
+    assert PASSWORD not in json.dumps(environment), "the path, never the password"
+
+
+def test_a_wrong_password_stops_the_agent(basic):
+    basic.password.write_text("another-synthetic-password\n")
+    with pytest.raises(ValueError, match="401"):
+        basic.make_basic()
+
+
+def test_basic_needs_a_user_and_a_password_file(basic):
+    with pytest.raises(ValueError, match="needs BIOCHEF_TES_USER"):
+        basic.make_basic(user="")
+    with pytest.raises(ValueError, match="needs BIOCHEF_TES_PASSWORD_FILE"):
+        basic.make_basic(password_file="")
+
+
+@pytest.mark.parametrize("user", ["a:b", "has space", "-leading", "x" * 129, "new\nline"])
+def test_a_user_that_would_break_the_header_is_refused(basic, user):
+    with pytest.raises(ValueError, match="BIOCHEF_TES_USER"):
+        basic.make_basic(user=user)
+
+
+def test_a_password_others_can_read_is_refused(basic):
+    basic.password.chmod(0o640)
+    with pytest.raises(ValueError, match="readable by no one else"):
+        basic.make_basic()
+
+
+def test_a_password_that_is_a_link_is_refused(basic):
+    link = basic.tmp / "password-link"
+    link.symlink_to(basic.password)
+    with pytest.raises(ValueError, match="not a regular file"):
+        basic.make_basic(password_file=str(link))
+
+
+@pytest.mark.parametrize("text", ["short", "has a space in it", ""])
+def test_an_empty_or_odd_password_is_refused(basic, text):
+    basic.password.write_text(text + "\n")
+    with pytest.raises(ValueError, match="does not hold a password"):
+        basic.make_basic()
+
+
+def test_the_settings_of_one_kind_of_auth_are_refused_with_another(basic):
+    with pytest.raises(ValueError, match="so the token would never be sent"):
+        basic.make_basic(token_file=str(basic.token))
+    with pytest.raises(ValueError, match="would never be sent"):
+        basic.make(auth="bearer", user="agent-user")
+    with pytest.raises(ValueError, match="would never be sent"):
+        basic.make(auth="bearer", password_file=str(basic.password))
+    with pytest.raises(ValueError, match="would never be sent"):
+        basic.make(auth="none", token_file="", user="agent-user")
+
+
+def test_basic_over_plain_http_to_another_host_is_refused(basic):
+    with pytest.raises(ValueError, match="plain http to another host"):
+        basic.make_basic(url="http://tes.example:8000")
 
 
 def test_the_staging_directory_must_exist(host):
