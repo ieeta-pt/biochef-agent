@@ -1,0 +1,4 @@
+<span class="flex flex-wrap items-center gap-3">
+  <span class="text-[13px] text-bad">Remove the binding of {{ dataset_id }}? Requests that need it are refused until it is bound again.</span>
+  <button type="button" class="btn btn-danger" hx-post="/ui/_/datasets/{{ dataset_id }}/unbind" hx-target="#decision-error" hx-swap="innerHTML">Remove and sign</button>
+</span>
