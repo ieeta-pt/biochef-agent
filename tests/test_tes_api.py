@@ -845,6 +845,86 @@ def test_old_finished_tasks_are_forgotten_in_the_database_too(api, monkeypatch):
         list(reversed(ids[-2:]))
 
 
+def _row(identifier, state, minute, owner="alice"):
+    from datetime import datetime, timedelta, timezone
+    from store.models import TesTask
+    return TesTask(id=identifier, owner=owner, name=identifier, image=IMAGE,
+                   command=["true"], state=state,
+                   created_at=datetime(2026, 11, 8, 12, 0, tzinfo=timezone.utc)
+                   + timedelta(minutes=minute))
+
+
+def test_a_task_is_still_its_owners_after_a_restart(api):
+    from store import db
+    engine = db.make_engine(api.values["BIOCHEF_DB_URL"])
+    with db.writing(engine) as session:
+        session.add(_row("bobs-task-0000000000000000000000", "COMPLETE", 1, owner="bob"))
+    with restarted(api) as client:
+        assert client.get("/v1/tasks/bobs-task-0000000000000000000000",
+                          headers=bob()).status_code == 200
+        assert client.get("/v1/tasks/bobs-task-0000000000000000000000",
+                          headers=alice()).status_code == 404
+        assert client.get("/v1/tasks", headers=alice()).json()["tasks"] == []
+
+
+def test_pruning_never_drops_an_unfinished_task(world):
+    from store import db
+    from tesapi import records
+    engine = db.make_engine(world.values["BIOCHEF_DB_URL"])
+    with db.writing(engine) as session:
+        session.add(_row("a-running", "RUNNING", 0))
+        session.add(_row("b-done", "COMPLETE", 1))
+        session.add(_row("c-done", "COMPLETE", 2))
+        session.add(_row("d-done", "CANCELED", 3))
+    records.prune(engine, 2)
+    assert {row.id for row in records.load(engine, 10)} == {"a-running", "d-done"}, \
+        "the two oldest finished went; the oldest task of all, unfinished, stayed"
+    records.prune(engine, 1)
+    assert {row.id for row in records.load(engine, 10)} == {"a-running"}
+
+
+def test_the_newest_tasks_are_the_ones_read_back(world):
+    from store import db
+    from tesapi import records
+    engine = db.make_engine(world.values["BIOCHEF_DB_URL"])
+    with db.writing(engine) as session:
+        for minute in range(5):
+            session.add(_row(f"t{minute}", "COMPLETE", minute))
+    assert [row.id for row in records.load(engine, 3)] == ["t2", "t3", "t4"]
+
+
+def test_a_task_being_cancelled_is_written_down_as_such(api):
+    from store import db
+    from tesapi import records
+    from tesapi.tasks import Engine, Task, parse
+    engine = Engine(api.config(), api.app.state.policy, RecordingRunner(),
+                    db.make_engine(api.values["BIOCHEF_DB_URL"]))
+    live = Task("alice", parse(task(api, ["true"]), api.app.state.policy))
+    live.state = "RUNNING"
+    records.save(engine.bind, live)
+    engine.cancel(live)
+    assert [row.state for row in records.load(engine.bind, 5)] == ["CANCELING"]
+
+
+def test_the_database_refuses_a_state_that_is_not_a_tes_state(world):
+    from sqlalchemy.exc import IntegrityError
+    from store import db
+    engine = db.make_engine(world.values["BIOCHEF_DB_URL"])
+    with pytest.raises(IntegrityError):
+        with db.writing(engine) as session:
+            session.add(_row("odd", "PAUSED", 0))
+
+
+def test_a_listener_started_on_an_older_schema_does_not_take_requests(world):
+    from store import migrate
+    from tesapi import records
+    migrate.downgrade(world.values["BIOCHEF_DB_URL"], "0005")
+    app = create_app(world.config(), RecordingRunner())
+    with pytest.raises(records.RecordError, match="schema is not current"):
+        with TestClient(app):
+            pass
+
+
 # --------------------------------------------------------------------------
 # the audit trail
 
