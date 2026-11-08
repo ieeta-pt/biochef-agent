@@ -21,6 +21,7 @@ This is a stand-in for Funnel, not Funnel. It proves the exchange and what the
 agent does around it; it does not prove any particular server's behaviour.
 """
 
+import io
 import os
 import shutil
 import sys
@@ -134,12 +135,23 @@ def main():
           "the second step read what the first one wrote")
     check(not (staging / ws.name).exists(), "staging is cleared at the end")
 
+    # Snakemake runs tes-step as a child process, which this process cannot watch,
+    # so one step is run here, in this process, with the helper watched.
+    single = runs / "biochef-run-ci_3"
+    single.mkdir()
+    os.chdir(single)
+    code = tes.main(["-c", "echo made > made.txt"], environ=runner.environment(),
+                    out=io.StringIO(), err=io.StringIO())
+    check(code == 0 and (single / "made.txt").read_text() == "made\n",
+          "one step run in this process came back")
     if EXPECT_ROOT:
         before = set().union(*(pair[0] for pair in observed.values()))
         after = set().union(*(pair[1] for pair in observed.values()))
         check(before == {0}, f"the server returned files owned by root (owners {before})")
         check(after == {os.getuid()},
               f"the helper gave them back to the agent (owners {after})")
+    os.chdir(runs)
+    shutil.rmtree(single)
     foreign = [os.path.join(top, name) for top, dirs, files in os.walk(ws)
                for name in dirs + files
                if os.lstat(os.path.join(top, name)).st_uid != os.getuid()]
