@@ -251,7 +251,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_PASSPORT_VISA_ISSUERS` | *(unset)* | comma-separated issuers whose visas count |
 | `BIOCHEF_PASSPORT_REQUIRE_VISA` | *(unset)* | a visa type a caller must hold to be let in |
 | `BIOCHEF_PASSPORT_REQUIRE_VISA_VALUE` | *(unset)* | the exact value that visa must carry |
-| `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess`, `apptainer`, `singularity` or `podman` |
+| `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess`, `apptainer`, `singularity`, `podman` or `tes` |
 | `BIOCHEF_REQUIRE_NETWORK_ISOLATION` | `true` | refuses to start with a runner the agent does not itself keep off the network; `false` turns that off and is audited at start, see [What each runner guarantees](#what-each-runner-guarantees) |
 | `BIOCHEF_NETWORK_PROBE` | *(unset)* | `host:port` the agent can reach and a step must not, tried by the network check at start |
 | `BIOCHEF_PODMAN_MODE` | | `rootless` or `rootful`, required with `podman`, see [Running it](#running-it) |
@@ -259,6 +259,14 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_STEP_PIDS` | | the most processes a step may have, required with rootless `podman` |
 | `BIOCHEF_STEP_MEMORY` | | the most memory a step may use, such as `4g`, with no swap past it, required with rootless `podman` |
 | `BIOCHEF_PODMAN_HELPER` | | the absolute path of the installed `podman-step-root`, required with rootful `podman` |
+| `BIOCHEF_TES_URL` | | base URL of the TES server, required with `tes`: https, or http to this host only |
+| `BIOCHEF_TES_IMAGE` | | the image every step runs in, by digest (`repository@sha256:<64 hex>`), required with `tes` |
+| `BIOCHEF_TES_AUTH` | | `bearer` or `none`, required with `tes` |
+| `BIOCHEF_TES_TOKEN_FILE` | | the absolute path of a file (mode 0600) holding the bearer token, required with `bearer` |
+| `BIOCHEF_TES_CA` | | the absolute path of a CA bundle for the server's certificate, optional |
+| `BIOCHEF_TES_STAGING` | | a directory of the agent's, which the server can read and write, required with `tes` |
+| `BIOCHEF_TES_HELPER` | | the absolute path of the installed `tes-step-root`, required with `tes` |
+| `BIOCHEF_TES_ISOLATION` | | `attested` or `none`, required with `tes`: the operator's statement about the server, see [The TES runner](#the-tes-runner) |
 | `BIOCHEF_CONTAINER_IMAGE` | `docker://debian:stable-slim` | image each step runs in, under the `apptainer` runner |
 | `BIOCHEF_APPTAINER_BINARY` | | the absolute path of the apptainer or SingularityCE binary, required with `apptainer` and `singularity` |
 | `BIOCHEF_APPTAINER_CACHE` | `apptainer-cache` | where pulled container images are kept between runs |
@@ -402,6 +410,7 @@ Each runner says, for every step, whether the agent keeps it off the network, wh
 | `subprocess` | none | none, the host's | none, inherited |
 | `apptainer`, `singularity` | enforced with `--net --network none` in `BIOCHEF_APPTAINER_ARGS`, the default | enforced with `--contain` or `--containall` | enforced with `--cleanenv` or `--containall` |
 | `podman` | enforced | enforced | enforced |
+| `tes` | attested, if the operator says so | attested, if the operator says so | enforced |
 
 `BIOCHEF_REQUIRE_NETWORK_ISOLATION` is on unless set to `false`. On, the agent and the page refuse to start with a runner whose network guarantee is not `enforced`: `subprocess`, `apptainer` with the isolation flags removed, and any runner that only attests it. An attested isolation does not count, because the rule is for the case where nobody checks. So the default runner, `subprocess`, needs `BIOCHEF_REQUIRE_NETWORK_ISOLATION=false`, for development or a host with no container runtime. That choice is explicit, and the API process records it at every start as `node.runner.isolation_not_required` in the audit trail, with the runner it let in.
 
@@ -412,6 +421,30 @@ At start, the API process runs one step through a runner whose network guarantee
 With `--net --network none`, SingularityCE makes the network namespace and sets nothing up in it. A user who is not root may always ask for that network, and no other one unless `singularity.conf` allows it. The `.deb` installs a setuid starter. With `allow setuid = no` in `singularity.conf`, SingularityCE uses unprivileged user namespaces instead, which on Ubuntu 24.04 its AppArmor profile allows. CI runs the parity workflow and the network check through it both ways, as a user that is not root.
 
 `BIOCHEF_APPTAINER_ARGS` defaults to `--contain --cleanenv --net --network none`. The last two give each step a network namespace with only loopback in it, so a tool cannot send data anywhere. On a host where apptainer refuses them the run fails, because carrying on with the network would be the worse outcome. Without `--contain`, apptainer binds the host's `/tmp` into the container, and that is where a run's directory lives unless `BIOCHEF_RUN_ROOT` says otherwise. Without it, a containerised tool is walled off from `/usr` and `/etc` while still able to read **every other run's data**. Without `--cleanenv`, the tool process also inherits the Agent's environment. Emptying this variable turns both protections off deliberately.
+
+### The TES runner
+
+`BIOCHEF_RUNNER=tes` sends each step to a GA4GH Task Execution Service that already exists, such as Funnel, as one task. Snakemake stays on the host and uses the `tes-step` script as the shell its rules run under, as `podman-step` is for podman. The agent keeps what it can check for itself:
+
+- **The image is only ever given by digest.** `BIOCHEF_TES_IMAGE` must be `repository@sha256:<64 hex digits>`, with no scheme. A tag can point to another image tomorrow, and the agent refuses one. The image needs `bash`, `find`, `sha256sum`, `sort`, `comm` and `cp`, which the Debian image used in CI has.
+- **The task holds nothing of the agent's.** It is built from the step's command and the image alone: no `env`, no credential, no stdin. The server's token is `BIOCHEF_TES_TOKEN_FILE`, a file only the agent's user can read, and travels only in the `Authorization` header. A redirect is not followed, and the agent's proxy settings are not used, so the token goes to the configured server and nowhere else. The URL must be https, or http to this host.
+- **The server is shown a copy.** Each step gets a directory of its own, `BIOCHEF_TES_STAGING/<run>/<step>/in`, with a copy of the run's workspace except `Snakefile` and `.snakemake`. A link or a special file in the workspace stops the step, because a server running as root would follow it. The task sees the copy at `/work` and writes what the step changed to `/out`. On the server, allow `file://` for that directory only.
+- **What comes back is checked before it is placed.** The task hashes the workspace before and after the step and returns only the files that are new or changed, with a manifest of their SHA-256. The agent checks that every file is a plain file, that the manifest and the files agree exactly, and that no path leaves the workspace or names the agent's `Snakefile` or `.snakemake`. If one check fails, nothing from that step is placed. The manifest is written by the same task as the files, so it proves that nothing changed on the way back, not that the step was honest. A step that deletes a file does not delete it in the workspace. The step's output arrives when the task ends, not as it is written.
+- **The files come back owned by whoever the server runs as.** A server running as root returns files the agent can read and cannot delete. `tes-step-root` is called through one sudo rule and gives the step's directory back to the agent's user, as `podman-step-root` does for rootful podman:
+  1. Install it owned by root, in a directory owned by root, neither writable by anyone else:
+     `install -o root -g root -m 0755 tes-step-root /usr/local/libexec/biochef-agent/tes-step-root`
+  2. Write `/etc/biochef-agent/tes-step.conf`, owned by root and writable only by root, in a directory that is too. The path is fixed in the script. It has one line, `STAGING_ROOT=`, and that must be the agent's `BIOCHEF_TES_STAGING`, a directory the agent owns that others cannot enter, named by no symlink.
+  3. Allow the agent's user exactly that script in sudoers, and set `BIOCHEF_TES_HELPER` to the same path:
+     `biochef ALL=(root) NOPASSWD: /usr/local/libexec/biochef-agent/tes-step-root`
+
+  The script has one command, `finish <directory>`. It runs only on a directory two levels under `STAGING_ROOT`, named by no symlink and owned by the caller, and it only changes who owns the files. The agent refuses to start as root with this runner, and unless the file, the script and the sudo rule are as above.
+- **A killed run does not leave its task running.** The group kill reaches `tes-step` and not the server. When a run ends, the agent lists the server's tasks named `biochef-<run>-`, cancels those that have not finished, waits for them, and clears the run's staging. A `SIGTERM` to `tes-step` cancels its task too.
+
+The agent asks the server `GET /v1/service-info` at start and refuses to start on anything that does not answer as a TES service.
+
+`BIOCHEF_TES_ISOLATION` has no default, because it is the operator's statement and nobody else can make it. `attested` says the server gives every task no network and only its input directory. The agent cannot check that, so the network and filesystem guarantees are `attested`, and the environment guarantee is `enforced`, because the task is built here without it. `BIOCHEF_REQUIRE_NETWORK_ISOLATION` does not accept an attested isolation, so the runner starts only when that rule is turned off with an explicit `false`, which is audited at every start with the runner. `none` says the server gives no such thing, and both guarantees are then `none`.
+
+CI runs the runner against a TES server of its own that runs as root, starts each task in a docker container with no network, and returns files owned by root (`ci/tes_check.py`, `tests/tes_support.py`). It checks the image the steps ran in, that another run's directory and the agent's environment are not there, that the files came back owned by root and were the agent's after the helper, and that a run that times out has its container stopped through the server. That server is a stand-in for the exchange. No real Funnel is run in CI.
 
 ## The audit trail
 

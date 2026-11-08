@@ -53,7 +53,8 @@ class _Workspace:
 
 
 def test_both_providers_are_available():
-    assert set(PROVIDERS) == {"subprocess", "apptainer", "singularity", "podman"}
+    assert set(PROVIDERS) == {"subprocess", "apptainer", "singularity", "podman",
+                              "tes"}
     assert isinstance(get_runner("apptainer"), ApptainerRunner)
 
 

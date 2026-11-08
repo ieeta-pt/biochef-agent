@@ -294,6 +294,50 @@ jobs:
             python:3.13-bullseye@sha256:f58f33e0563f2ba81c7afe6259cd912f0c33413da93c75cc3a70a941c17afa8c \
             bash /src/ci/podman-rootful.sh
 
+  tes:
+    name: tes, against a server running as root
+    runs-on: ubuntu-24.04
+    env:
+      # By digest, because the runner refuses anything else. The index digest of
+      # debian:bookworm-slim, so it resolves on any architecture.
+      BIOCHEF_TES_IMAGE: "debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc"
+      BIOCHEF_TES_AUTH: bearer
+      BIOCHEF_TES_ISOLATION: attested
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      - name: Install the helper, the one sudo rule and a TES server running as root
+        # What the README says an operator sets up, by ci/tes-setup.sh. It checks
+        # that the rule allows the helper and nothing else, and that the helper
+        # refuses a directory outside STAGING_ROOT, a relative one, one a symlink
+        # names, one at the wrong depth and an unknown command.
+        #
+        # The server is tests/tes_support.py, not Funnel: it speaks the same
+        # exchange, runs each task in a docker container with no network, and as
+        # root it returns files owned by root. That proves the exchange and what the
+        # agent does around it, and nothing about any particular server.
+        run: |
+          docker pull "$BIOCHEF_TES_IMAGE"
+          bash ci/tes-setup.sh
+
+      - name: A workflow through TES
+        # From inside the steps: the image they ran in is not the host's, another
+        # run's directory and the agent's environment are not there. From the
+        # files: the server returned them owned by root, the helper gave them back,
+        # and retention can delete them. And a run that times out has its container
+        # stopped through the server.
+        env:
+          TES_CHECK_EXPECT_ROOT: "1"
+        run: python ci/tes_check.py
+
   catalogue:
     name: catalogue converts
     runs-on: ubuntu-latest

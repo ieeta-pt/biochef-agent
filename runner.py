@@ -23,12 +23,14 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import tempfile
 import threading
 import time
 from typing import List, NamedTuple
 
+import tes
 from steplogs import TailBuffer
 
 
@@ -823,11 +825,191 @@ class PodmanRunner(Runner):
             pass
 
 
+TES_ISOLATION = ("attested", "none")
+TES_STEP_CONF = "/etc/biochef-agent/tes-step.conf"
+"""tes-step-root's configuration, at a path fixed in that script, for the reason
+PODMAN_STEP_CONF is: the agent is not trusted to point root's helper elsewhere."""
+
+
+def _read_tes_conf(path, owner):
+    """STAGING_ROOT, read with the rules tes-step-root applies."""
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise ValueError(f"{path} is missing; the tes runner needs it, see the README")
+    if not _owned_by(path, owner):
+        raise ValueError(f"{path} and its directory must be owned by root and "
+                         f"writable by no one else")
+    root = None
+    with open(path, encoding="utf-8") as stream:
+        for line in stream.read().splitlines():
+            if not line or line.startswith("#"):
+                continue
+            key, equals, value = line.partition("=")
+            if not equals or key != "STAGING_ROOT":
+                raise ValueError(f"{path}: not a known KEY=value line: {line!r}")
+            if root is not None:
+                raise ValueError(f"{path}: STAGING_ROOT appears twice")
+            root = value
+    if root is None or not _ROOT_SHAPE.match(root):
+        raise ValueError(f"{path}: STAGING_ROOT is missing or not valid")
+    return root
+
+
+class TesRunner(Runner):
+    """Every step as a GA4GH TES task, sent to a server that already exists.
+
+    Snakemake has no TES mode, so the seam is the shell its rules run under, as
+    it is for podman: the preamble makes tes-step that shell, and the step's
+    command goes to the server from there. Snakemake stays on the host.
+
+    What the agent keeps, it keeps itself (tes.py): the image is only ever given
+    by digest, the task holds no environment and no credential, and what comes
+    back is checked by SHA-256 against a manifest the task wrote before it is
+    placed in the workspace. A server that runs as root returns files owned by
+    root, and tes-step-root, called through one sudo rule, gives them back.
+
+    What it cannot keep is the sandbox: whether a task has a network or sees more
+    than its input is the server's configuration. BIOCHEF_TES_ISOLATION has no
+    default, because it is the operator's statement and nobody else can make it.
+    `attested` says the server gives every task no network and only its input,
+    and the network and filesystem guarantees are then `attested`, which
+    BIOCHEF_REQUIRE_NETWORK_ISOLATION does not accept. `none` says it does not.
+    The environment guarantee is `enforced` either way, because the task is built
+    here from the command and the image alone.
+    """
+
+    name = "tes"
+
+    def __init__(self, url: str = None, image: str = None, auth: str = None,
+                 token_file: str = None, ca: str = None, staging: str = None,
+                 helper: str = None, isolation: str = None,
+                 step_conf: str = TES_STEP_CONF, trusted_owner: int = 0):
+        def given(value, name):
+            return os.getenv(name, "") if value is None else value
+
+        self.settings = tes.check_settings({
+            "BIOCHEF_TES_URL": given(url, "BIOCHEF_TES_URL"),
+            "BIOCHEF_TES_IMAGE": given(image, "BIOCHEF_TES_IMAGE"),
+            "BIOCHEF_TES_AUTH": given(auth, "BIOCHEF_TES_AUTH"),
+            "BIOCHEF_TES_TOKEN_FILE": given(token_file, "BIOCHEF_TES_TOKEN_FILE"),
+            "BIOCHEF_TES_CA": given(ca, "BIOCHEF_TES_CA"),
+            "BIOCHEF_TES_STAGING": given(staging, "BIOCHEF_TES_STAGING"),
+            "BIOCHEF_TES_HELPER": given(helper, "BIOCHEF_TES_HELPER"),
+        })
+        self.image = self.settings.image
+        self.isolation = given(isolation, "BIOCHEF_TES_ISOLATION").strip()
+        if self.isolation not in TES_ISOLATION:
+            raise ValueError(
+                f"BIOCHEF_TES_ISOLATION={self.isolation!r}: it must be attested or "
+                f"none, and has no default. attested is the operator's statement "
+                f"that the TES server gives every task no network and only its "
+                f"input; the agent cannot check it. none says it does not"
+            )
+        if os.geteuid() == 0:
+            raise ValueError(
+                "the agent must not run as root under the tes runner: it reaches "
+                "root only through tes-step-root, and sudo gives it nothing to "
+                "hand back to when it already is root"
+            )
+        staging = self.settings.staging
+        info = os.stat(staging, follow_symlinks=False) if os.path.lexists(staging) else None
+        if (info is None or not stat.S_ISDIR(info.st_mode)
+                or os.path.realpath(staging) != staging):
+            raise ValueError(
+                f"BIOCHEF_TES_STAGING={staging!r} must be an existing directory, "
+                f"named by no symlink")
+        if info.st_uid != os.getuid() or info.st_mode & 0o007:
+            raise ValueError(
+                f"BIOCHEF_TES_STAGING={staging!r} must belong to the agent's user "
+                f"and not be accessible to others: it holds the workspaces the "
+                f"server reads, and what it returns")
+        helper = self.settings.helper
+        if (os.path.islink(helper) or not os.path.isfile(helper)
+                or not _owned_by(helper, trusted_owner)):
+            raise ValueError(
+                f"BIOCHEF_TES_HELPER={helper!r} must be a file owned by root, in a "
+                f"directory owned by root, neither writable by anyone else, or the "
+                f"agent could change what runs as root"
+            )
+        root = _read_tes_conf(step_conf, trusted_owner)
+        if root != staging:
+            raise ValueError(
+                f"BIOCHEF_TES_STAGING={staging!r} is not STAGING_ROOT={root!r} of "
+                f"{step_conf}: tes-step-root hands back only what is under that"
+            )
+        try:
+            allowed = subprocess.run(["sudo", "-n", "-l", helper],
+                                     capture_output=True, timeout=30, check=False)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise ValueError(f"the tes runner needs sudo: {error}") from None
+        if allowed.returncode != 0:
+            raise ValueError(
+                f"sudo does not let this user run {helper} without a password; "
+                f"the tes runner needs exactly that rule, see the README"
+            )
+        try:
+            info = tes.Client(self.settings).service_info()
+        except tes.TesError as error:
+            raise ValueError(f"BIOCHEF_TES_URL={self.settings.url!r}: the TES server "
+                             f"did not answer as one: {error}") from None
+        self.server = " ".join(str(info[key]) for key in ("name", "version")
+                               if isinstance(info.get(key), (str, int, float))) or "?"
+
+    @property
+    def guarantees(self) -> dict:
+        said = ATTESTED if self.isolation == "attested" else NONE
+        return {"network": said, "filesystem": said, "environment": ENFORCED}
+
+    def describe(self) -> str:
+        return (f"{self.name} ({self.settings.url}, {self.server}, "
+                f"{self.image.split('@sha256:')[0]}@sha256:{self.image[-64:][:12]})")
+
+    def environment(self):
+        """Snakemake's environment, with what tes-step is to be given.
+
+        The task never gets any of it. tes-step builds the task from the command
+        and the image alone, and the token stays in its file.
+        """
+        values = self.settings._asdict()
+        names = dict(zip(tes.ATTRIBUTES, ("url", "image", "auth", "token_file", "ca",
+                                          "staging", "helper")))
+        return {**os.environ,
+                **{name: values[field] or "" for name, field in names.items()}}
+
+    def snakefile_preamble(self) -> str:
+        step = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tes-step")
+        return (f"shell.executable({json.dumps(step)})\n"
+                f"shell.prefix(\"set -euo pipefail; \")\n")
+
+    def command(self, ws) -> List[str]:
+        return ["snakemake", "--cores", "4",
+                "-s", os.path.join(ws.path, "Snakefile"),
+                "-d", ws.path]
+
+    def after_run(self, ws) -> None:
+        """Cancel what a killed run left on the server, then clear its staging.
+
+        The group kill reaches tes-step and not the server, so a task that was
+        running goes on running until it is cancelled here.
+        """
+        try:
+            name = tes.run_name(ws.path)
+        except tes.TesError:
+            return
+        try:
+            tes.cancel_run(self.settings, name)
+        except tes.TesError:
+            # A server that cannot be reached cannot be told, and the run has its
+            # result. What it holds is its own to expire.
+            pass
+        tes.clean_run(self.settings, name)
+
+
 PROVIDERS = {
     SubprocessRunner.name: SubprocessRunner,
     ApptainerRunner.name: ApptainerRunner,
     SingularityRunner.name: SingularityRunner,
     PodmanRunner.name: PodmanRunner,
+    TesRunner.name: TesRunner,
 }
 
 
