@@ -427,6 +427,38 @@ jobs:
         if: failure()
         run: sudo cat "${RUNNER_TEMP:-/tmp}/funnel.log" | tail -80 | cut -c1-400
 
+  tes-api:
+    name: tes api, in front of rootless podman
+    runs-on: ubuntu-24.04
+    env:
+      BIOCHEF_TESAPI_IMAGE: "debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      - name: Check podman
+        # Preinstalled on the runner image, as in the parity job.
+        run: podman --version
+
+      - name: Tasks sent to the listener
+        # The listener is started in the check, on loopback, with the podman runner
+        # and a task image by digest. From inside the steps: the image they ran in
+        # is not the host's, and the datasets, the agent's environment and the
+        # network are not there. From the files: the output is the agent's. From
+        # the requests: no token, an unlisted image, a URL that is not file://, a
+        # path outside the listed directories, a dataset and an env are refused.
+        # From the trail: each event has "source": "tes", and no secret is in it.
+        run: |
+          podman pull "docker://${BIOCHEF_TESAPI_IMAGE}"
+          python ci/tes_api_check.py
+
   catalogue:
     name: catalogue converts
     runs-on: ubuntu-latest
