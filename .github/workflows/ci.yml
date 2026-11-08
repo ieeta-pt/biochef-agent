@@ -328,15 +328,24 @@ jobs:
           docker pull "$BIOCHEF_TES_IMAGE"
           bash ci/tes-setup.sh
 
-      - name: A workflow through TES
+      - name: A workflow through TES, as the agent's user
+        # The agent is biochefagent, which can sudo the helper and nothing else.
         # From inside the steps: the image they ran in is not the host's, another
-        # run's directory and the agent's environment are not there. From the
-        # files: the server returned them owned by root, the helper gave them back,
-        # and retention can delete them. And a run that times out has its container
-        # stopped through the server.
-        env:
-          TES_CHECK_EXPECT_ROOT: "1"
-        run: python ci/tes_check.py
+        # run's directory and the agent's environment are not there. From the files:
+        # the server returned them owned by root, the helper gave them back, and
+        # retention can delete them. And a run that times out is cancelled through
+        # the server.
+        run: |
+          sudo -u "$AGENT_USER" -H env \
+            "PATH=$PATH" "TES_CHECK_EXPECT_ROOT=1" "BIOCHEF_TES_URL=$BIOCHEF_TES_URL" \
+            "BIOCHEF_TES_IMAGE=$BIOCHEF_TES_IMAGE" "BIOCHEF_TES_AUTH=$BIOCHEF_TES_AUTH" \
+            "BIOCHEF_TES_TOKEN_FILE=$BIOCHEF_TES_TOKEN_FILE" \
+            "BIOCHEF_TES_STAGING=$BIOCHEF_TES_STAGING" "BIOCHEF_TES_HELPER=$BIOCHEF_TES_HELPER" \
+            "BIOCHEF_TES_ISOLATION=$BIOCHEF_TES_ISOLATION" \
+            python /srv/biochef-agent-src/ci/tes_check.py
+
+      - name: The container of the run that timed out is gone
+        run: test -z "$(docker ps --quiet --filter name=tes-)"
 
   catalogue:
     name: catalogue converts

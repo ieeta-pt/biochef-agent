@@ -10,7 +10,8 @@ files:
   - another run's directory is not there, and the agent's environment is not
   - what the server returned was owned by root, and was the agent's after the
     helper had run, so retention can delete it
-  - a run that times out has its container stopped through the server
+  - a run that times out has its task cancelled through the server (the workflow
+    then checks that no container is left)
 
 Not checked, because it is the server's and not the runner's: that the container
 has no network. The stand-in starts its containers with --network none and says so;
@@ -22,7 +23,6 @@ agent does around it; it does not prove any particular server's behaviour.
 
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -154,9 +154,6 @@ def main():
     result = runner.run(Workspace(slow), timeout_s=20)
     check(result.returncode != 0, "a run that times out fails")
     check(time.monotonic() - started < 120, "and does not wait for its task")
-    listed = subprocess.run(["docker", "ps", "--quiet", "--filter", "name=tes-"],
-                            capture_output=True, text=True, check=True).stdout.split()
-    check(not listed, "its container was stopped through the server")
     check(not (staging / slow.name).exists(), "and its staging was cleared")
     shutil.rmtree(runs, ignore_errors=True)
     print("all checks passed")
