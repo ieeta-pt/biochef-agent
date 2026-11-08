@@ -34,6 +34,9 @@ if [ "${1:-}" = "--dev" ]; then
     export BIOCHEF_NODE_SIGNING_KEY="$DEV_HOME/keys/node-signing.pem"
     export BIOCHEF_NODE_ENCRYPTION_KEY="$DEV_HOME/keys/node-encryption.pem"
     export BIOCHEF_EGRESS_MODE="${BIOCHEF_EGRESS_MODE:-airlock}"
+    # A laptop runs steps on the host, which the isolation rule refuses unless it
+    # is turned off; dev mode turns it off, and the agent audits that at start.
+    export BIOCHEF_REQUIRE_NETWORK_ISOLATION="${BIOCHEF_REQUIRE_NETWORK_ISOLATION:-false}"
     export BIOCHEF_LOCAL_ROOT="${BIOCHEF_LOCAL_ROOT:-$DEV_HOME/data}"
     export BIOCHEF_DATA_SOURCES="${BIOCHEF_DATA_SOURCES:-upload,spooled,handedover,localpath}"
     export BIOCHEF_DATASET_BINDINGS_FROM_UI="${BIOCHEF_DATASET_BINDINGS_FROM_UI:-true}"

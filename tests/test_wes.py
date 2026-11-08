@@ -333,11 +333,12 @@ def test_wes_capacity_refusal_happens_before_staging(service, staging, monkeypat
 def test_wes_audit_refusal_happens_before_staging(service, staging, monkeypatch):
     import audit
 
-    def unavailable(event):
+    def unavailable(event, **fields):
         raise audit.AuditError("audit unavailable")
 
-    monkeypatch.setattr(audit, "record", unavailable)
     with TestClient(main.app, raise_server_exceptions=False) as client:
+        # After start, which records the isolation choice in the same trail.
+        monkeypatch.setattr(audit, "record", unavailable)
         assert _submit_wes(client).status_code == 500
     assert service.all() == []
     assert list(staging.iterdir()) == []

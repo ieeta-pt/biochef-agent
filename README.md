@@ -252,7 +252,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_PASSPORT_REQUIRE_VISA` | *(unset)* | a visa type a caller must hold to be let in |
 | `BIOCHEF_PASSPORT_REQUIRE_VISA_VALUE` | *(unset)* | the exact value that visa must carry |
 | `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess`, `apptainer` or `podman` |
-| `BIOCHEF_REQUIRE_NETWORK_ISOLATION` | `false` | `true` refuses to start with a runner the agent does not itself keep off the network, see [What each runner guarantees](#what-each-runner-guarantees) |
+| `BIOCHEF_REQUIRE_NETWORK_ISOLATION` | `true` | refuses to start with a runner the agent does not itself keep off the network; `false` turns that off and is audited at start, see [What each runner guarantees](#what-each-runner-guarantees) |
 | `BIOCHEF_NETWORK_PROBE` | *(unset)* | `host:port` the agent can reach and a step must not, tried by the network check at start |
 | `BIOCHEF_PODMAN_MODE` | | `rootless` or `rootful`, required with `podman`, see [Running it](#running-it) |
 | `BIOCHEF_PODMAN_SELINUX` | | `disable` or `keep`, required with rootless `podman` |
@@ -402,7 +402,7 @@ Each runner says, for every step, whether the agent keeps it off the network, wh
 | `apptainer` | enforced with `--net --network none` in `BIOCHEF_APPTAINER_ARGS`, the default | enforced with `--contain` or `--containall` | enforced with `--cleanenv` or `--containall` |
 | `podman` | enforced | enforced | enforced |
 
-`BIOCHEF_REQUIRE_NETWORK_ISOLATION=true` makes the agent and the page refuse to start with a runner whose network guarantee is not `enforced`: `subprocess`, `apptainer` with the isolation flags removed, and any runner that only attests it. An attested isolation does not count, because the rule is for the case where nobody checks.
+`BIOCHEF_REQUIRE_NETWORK_ISOLATION` is on unless set to `false`. On, the agent and the page refuse to start with a runner whose network guarantee is not `enforced`: `subprocess`, `apptainer` with the isolation flags removed, and any runner that only attests it. An attested isolation does not count, because the rule is for the case where nobody checks. So the default runner, `subprocess`, needs `BIOCHEF_REQUIRE_NETWORK_ISOLATION=false`, for development or a host with no container runtime. That choice is explicit, and the API process records it at every start as `node.runner.isolation_not_required` in the audit trail, with the runner it let in.
 
 At start, the API process runs one step through a runner whose network guarantee is `enforced`, the way every step runs. The step counts the IPv4 routes and IPv6 addresses on anything but loopback, read from its own network namespace, which must be none. With `BIOCHEF_NETWORK_PROBE=host:port`, the agent first connects to it itself, and the step then tries to as well, which must fail. Without the probe, only the interfaces are checked. The result goes to the audit trail as `node.runner.network_check` and, on a node, to the Node screen. If the step finds the network, the agent does not start. This catches a host where the isolation flag is accepted and has no effect.
 

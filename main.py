@@ -36,7 +36,8 @@ from steplogs import (LiveLog, Progress, clamp, failing_steps,
                       make_step_log_names, read_node_logs)
 from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
 from evidence_verification import EvidenceVerificationError
-from runner import SubprocessRunner, check_network, get_runner
+from runner import (SubprocessRunner, check_network, get_runner,
+                    require_network_isolation)
 from signing import SignatureError
 
 
@@ -48,6 +49,7 @@ async def _node_lifespan(_app):
     Before anything, a runner that says it keeps steps off the network shows it
     does, with one step, and the agent does not start if it does not.
     """
+    record_isolation_choice()
     await asyncio.to_thread(check_runner_network)
     worker = start_node_worker()
     yield
@@ -831,6 +833,20 @@ def retention_keep_seconds():
 
 
 EVENT_NETWORK_CHECK = "node.runner.network_check"
+EVENT_ISOLATION_NOT_REQUIRED = "node.runner.isolation_not_required"
+
+
+def record_isolation_choice():
+    """At start, put a deployment that turned the isolation rule off on the record.
+
+    BIOCHEF_REQUIRE_NETWORK_ISOLATION is on unless set to false, so this is
+    always someone's explicit choice, and the trail says which runner it let in.
+    """
+    if require_network_isolation():
+        return None
+    return audit.record(EVENT_ISOLATION_NOT_REQUIRED, runner=RUNNER.name,
+                        network=RUNNER.guarantees["network"],
+                        setting="BIOCHEF_REQUIRE_NETWORK_ISOLATION=false")
 
 
 class NetworkCheckFailed(RuntimeError):

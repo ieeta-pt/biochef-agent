@@ -787,13 +787,18 @@ def get_runner(name: str) -> Runner:
 
 
 def require_network_isolation(value: str = None) -> bool:
-    """BIOCHEF_REQUIRE_NETWORK_ISOLATION: true, false, or unset for false."""
+    """BIOCHEF_REQUIRE_NETWORK_ISOLATION: true, false, or unset for true.
+
+    On by default: a step that can reach the network is the thing a TRE exists to
+    prevent, so running one has to be asked for, with `false`, and the agent
+    records that it was (main.record_isolation_choice).
+    """
     raw = (os.getenv("BIOCHEF_REQUIRE_NETWORK_ISOLATION", "") if value is None
            else value).strip()
-    if raw in ("", "false"):
-        return False
-    if raw == "true":
+    if raw in ("", "true"):
         return True
+    if raw == "false":
+        return False
     raise ValueError(f"BIOCHEF_REQUIRE_NETWORK_ISOLATION={raw!r} must be true or false")
 
 

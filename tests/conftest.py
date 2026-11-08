@@ -53,3 +53,9 @@ except ImportError:
     sys.modules["fastapi"] = fastapi
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# The isolation rule is on by default and refuses the subprocess runner, which
+# is what nearly every test uses. Off here, explicitly, as a deployment would
+# have to; the tests of the rule itself set or remove it.
+import os  # noqa: E402
+os.environ.setdefault("BIOCHEF_REQUIRE_NETWORK_ISOLATION", "false")
