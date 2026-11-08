@@ -4,11 +4,13 @@ import json
 from datetime import timedelta
 
 import pytest
+from sqlmodel import select
 
 import audit
 from node import decisions, review
 from store import db, repo, seed
 from store.fixtures import mock
+from store.models import Decision
 from store.states import Action, SubjectType
 from tests.store_support import NOW, add_version, fresh_database
 from tests.ui_support import KEYS, client_for, dev_settings
@@ -242,3 +244,111 @@ def test_the_check_only_reads(bare, trail):
     before = trail.read_text()
     web(bare).get("/ui/node")
     assert trail.read_text() == before
+
+
+# --------------------------------------------------------------------------
+# the words of the trail: names a person knows, for every kind of event
+
+
+
+def audit_text(engine):
+    page = web(engine).get("/ui/node").text
+    start = page.index("Append only")
+    return page[start:]
+
+
+def test_a_version_is_named_in_the_trail_and_not_numbered(engine, trail):
+    with db.reading(engine) as session:
+        study = repo.get_study_version(session, 3)
+        workflow = repo.get_workflow_version(session, 4)
+    with db.writing(engine) as session:
+        review.approve_study(session, KEYS, node="n", version_id=study.id,
+                             user="j.silva", dac_confirmed=True, now=NOW)
+        decisions.decide(session, KEYS, node="n", subject_type=SubjectType.WORKFLOW_VERSION,
+                         subject_id=workflow.id, action=Action.APPROVE, user="j.silva", at=NOW)
+    text = audit_text(engine)
+    assert "cardio-pt · CARDIO-PT cohort · v3" in text
+    assert "gwas-qc · 1.4.0" in text
+    assert f'<td class="mono">{study.id}</td>' not in text
+    assert f'<td class="mono">{workflow.id}</td>' not in text
+
+
+def test_a_version_the_trail_names_that_is_gone_is_shown_by_its_number(engine, trail):
+    with db.writing(engine) as session:
+        decide(session, subject_id=9999, action=Action.APPROVE)
+    assert '<td class="mono">9999</td>' in audit_text(engine)
+
+
+def test_an_undo_names_the_subject_it_took_back(bare, trail):
+    with db.writing(bare) as session:
+        version = add_version(session)
+        decision = review.approve_study(session, KEYS, node="n", version_id=version.id,
+                                         user="j.silva", dac_confirmed=True, now=NOW).id
+    with db.writing(bare) as session:
+        review.undo(session, decision, user="j.silva")
+    text = audit_text(bare)
+    assert "Decision undone" in text
+    assert text.count("st-01 · A study · v1") == 2, "the decision and the undo name it"
+    assert f'<td class="mono">decision {decision}</td>' not in text
+
+
+def test_an_undo_with_no_decision_event_before_it_still_has_a_subject(bare, trail):
+    audit.record("node.decision.undone", decision_id=41, user="j.silva")
+    assert '<td class="mono">decision 41</td>' in audit_text(bare)
+
+
+@pytest.mark.parametrize("name,words", [
+    ("node.egress.notice", "Notice of a withheld result signed"),
+    ("node.something.new_kind", "Node something new kind"),
+    ("a_plain_name", "A plain name"),
+])
+def test_every_event_is_in_words(engine, trail, name, words):
+    audit.record(name, run_id="run_x")
+    text = audit_text(engine)
+    assert words in text
+    assert f"<td>{name}</td>" not in text
+
+
+def test_a_demo_trail_has_no_raw_event_names(engine, trail):
+    written = seed.write_audit(engine)
+    assert written > 10
+    text = audit_text(engine)
+    for raw in ("node.decision<", "node.request.checked<", "run.state<", ">node."):
+        assert raw not in text, raw
+    assert "Study version approved" in text and "Request refused" in text
+    assert "Run COMPLETE" in text and "Run RUNNING" in text
+
+
+def test_a_demo_trail_passes_its_own_check(engine, trail):
+    seed.write_audit(engine)
+    assert orphans(engine) == []
+    assert "✓ Every decision event in the audit trail has its decision." in (
+        web(engine).get("/ui/node").text)
+
+
+def test_a_demo_trail_is_in_time_order_and_every_decision_has_one_event(engine, trail):
+    seed.write_audit(engine)
+    events = audit.read()
+    stamps = [event["at"] for event in events]
+    assert stamps == sorted(stamps)
+    with db.reading(engine) as session:
+        ids = {row.id for row in session.exec(select(Decision))}
+    assert sorted(e["decision_id"] for e in events if e["event"] == "node.decision") == \
+        sorted(ids)
+
+
+def test_no_trail_means_no_demo_events(engine, monkeypatch):
+    monkeypatch.delenv("BIOCHEF_AUDIT_LOG")
+    assert seed.write_audit(engine) == 0
+
+
+def test_a_demo_event_carries_the_time_of_what_it_records(engine, trail):
+    seed.write_audit(engine)
+    approvals = [e for e in audit.read()
+                 if e["event"] == "node.decision" and e["action"] == "approve"
+                 and e["subject_type"] == "study_version"]
+    assert approvals, "the seed approves study versions"
+    with db.reading(engine) as session:
+        for event in approvals:
+            row = session.get(Decision, event["decision_id"])
+            assert event["at"] == row.at.isoformat()
