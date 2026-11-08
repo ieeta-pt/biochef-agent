@@ -882,7 +882,8 @@ class TesRunner(Runner):
     def __init__(self, url: str = None, image: str = None, auth: str = None,
                  token_file: str = None, ca: str = None, staging: str = None,
                  helper: str = None, isolation: str = None,
-                 step_conf: str = TES_STEP_CONF, trusted_owner: int = 0):
+                 step_conf: str = TES_STEP_CONF, trusted_owner: int = 0,
+                 user: str = None, password_file: str = None):
         def given(value, name):
             return os.getenv(name, "") if value is None else value
 
@@ -894,6 +895,8 @@ class TesRunner(Runner):
             "BIOCHEF_TES_CA": given(ca, "BIOCHEF_TES_CA"),
             "BIOCHEF_TES_STAGING": given(staging, "BIOCHEF_TES_STAGING"),
             "BIOCHEF_TES_HELPER": given(helper, "BIOCHEF_TES_HELPER"),
+            "BIOCHEF_TES_USER": given(user, "BIOCHEF_TES_USER"),
+            "BIOCHEF_TES_PASSWORD_FILE": given(password_file, "BIOCHEF_TES_PASSWORD_FILE"),
         })
         self.image = self.settings.image
         self.isolation = given(isolation, "BIOCHEF_TES_ISOLATION").strip()
@@ -971,7 +974,8 @@ class TesRunner(Runner):
         """
         values = self.settings._asdict()
         names = dict(zip(tes.ATTRIBUTES, ("url", "image", "auth", "token_file", "ca",
-                                          "staging", "helper")))
+                                          "staging", "helper", "user",
+                                          "password_file")))
         return {**os.environ,
                 **{name: values[field] or "" for name, field in names.items()}}
 
