@@ -264,8 +264,6 @@ def test_a_directory_named_through_a_symlink_stops_it(world):
     ("BIOCHEF_RUN_ROOT", "runs"),
     ("BIOCHEF_AUDIT_LOG", "."),
     ("BIOCHEF_TESAPI_TOKENS", "secrets"),
-    ("BIOCHEF_TES_TOKEN_FILE", "secrets"),
-    ("BIOCHEF_TES_PASSWORD_FILE", "secrets"),
     ("BIOCHEF_DB_URL", "."),
 ])
 def test_no_directory_may_contain_or_lie_in_the_nodes_own_data(world, name, where):
@@ -1110,6 +1108,176 @@ def test_a_database_that_cannot_be_reached_for_most_of_the_lease_loses_the_place
     asyncio.run(asyncio.wait_for(engine.heartbeat(interval=0.05), timeout=10))
     assert engine.lost
     assert "could not be reached" in api.events("tes.lock.lost")[0]["reason"]
+
+
+def test_only_the_holder_can_give_the_place_up(world):
+    from store import db
+    from tesapi import records
+    engine = db.make_engine(world.values["BIOCHEF_DB_URL"])
+    records.acquire(engine, "one")
+    records.release(engine, "someone-else")
+    assert records.current(engine) is not None, "another listener's release changed nothing"
+    records.release(engine, "one")
+    assert records.current(engine) is None
+
+
+def test_a_failure_to_renew_now_and_then_does_not_lose_the_place(api, monkeypatch):
+    import asyncio
+    from tesapi import records
+    real, failures = records.beat, {"left": 2}
+
+    def flaky(bind, holder, now=None):
+        if failures["left"]:
+            failures["left"] -= 1
+            raise records.RecordError("the lease could not be renewed: OperationalError")
+        return real(bind, holder, now)
+
+    async def run():
+        task = asyncio.create_task(api.app.state.engine.heartbeat(interval=0.05))
+        await asyncio.sleep(0.6)
+        task.cancel()
+
+    monkeypatch.setattr(records, "beat", flaky)
+    monkeypatch.setattr(records, "LEASE_S", 0.5)
+    asyncio.run(run())
+    assert failures["left"] == 0 and not api.app.state.engine.lost
+
+
+def test_a_listener_that_keeps_renewing_keeps_its_place_past_the_lease(api, monkeypatch):
+    import asyncio
+    from tesapi import records
+
+    async def run():
+        task = asyncio.create_task(api.app.state.engine.heartbeat(interval=0.05))
+        await asyncio.sleep(0.8)
+        task.cancel()
+
+    monkeypatch.setattr(records, "LEASE_S", 0.3)
+    asyncio.run(run())
+    assert not api.app.state.engine.lost
+
+
+def test_the_running_listener_starts_its_heartbeat(world, monkeypatch):
+    from tesapi import records
+    monkeypatch.setattr(records, "BEAT_S", 0.05)
+    with TestClient(create_app(world.config(), RecordingRunner())):
+        first = lease_row(world)[0].heartbeat_at
+        time.sleep(0.5)
+        assert lease_row(world)[0].heartbeat_at > first
+
+
+@pytest.mark.parametrize("name", ["BIOCHEF_TES_TOKEN_FILE", "BIOCHEF_TES_PASSWORD_FILE"])
+def test_the_runners_credential_files_are_places_no_task_may_use(world, name):
+    """Set on its own, in a directory of its own, so no other setting hides a miss."""
+    place = world.tmp / "runner-credentials"
+    place.mkdir()
+    (place / "file").write_text("synthetic-credential\n")
+    values = {k: v for k, v in world.values.items()
+              if k not in ("BIOCHEF_TESAPI_TOKENS", "BIOCHEF_LOCAL_ROOT", "BIOCHEF_RUN_ROOT")}
+    values.update({name: str(place / "file"), "BIOCHEF_LOCAL_ROOT": str(world.data),
+                   "BIOCHEF_RUN_ROOT": str(world.runs)})
+    values["BIOCHEF_TESAPI_TOKENS"] = world.values["BIOCHEF_TESAPI_TOKENS"]
+    with pytest.raises(settings.ConfigError, match=f"overlaps .*\\({name}\\)"):
+        settings.load({**values, "BIOCHEF_TESAPI_READ_DIRS": str(place.resolve())})
+    with pytest.raises(settings.ConfigError, match=f"overlaps .*\\({name}\\)"):
+        settings.load({**values, "BIOCHEF_TESAPI_WRITE_DIRS": str(place.resolve())})
+
+
+def test_a_lost_race_for_the_place_is_a_refusal_not_a_crash(world, monkeypatch):
+    from contextlib import contextmanager
+    from sqlalchemy.exc import IntegrityError
+    from store import db
+    from tesapi import records
+    engine = db.make_engine(world.values["BIOCHEF_DB_URL"])
+    real = db.writing
+
+    @contextmanager
+    def second_row(bind):
+        with real(bind):
+            raise IntegrityError("insert", {}, Exception("UNIQUE constraint failed"))
+        yield
+
+    monkeypatch.setattr(db, "writing", second_row)
+    with pytest.raises(records.Held, match="same moment"):
+        records.acquire(engine, "late")
+
+
+def test_the_place_is_taken_only_if_it_is_as_it_was_read(world, monkeypatch):
+    """Another listener renews the place between the read and the write."""
+    from contextlib import contextmanager
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy import update
+    from store import db
+    from store.models import TesListener
+    from tesapi import records
+    engine = db.make_engine(world.values["BIOCHEF_DB_URL"])
+    old = datetime.now(timezone.utc) - timedelta(seconds=records.LEASE_S + 60)
+    records.acquire(engine, "dead", now=old)
+    real = db.writing
+
+    @contextmanager
+    def interfering(bind):
+        with real(bind) as session:
+            class Session:
+                def __getattr__(self, name):
+                    return getattr(session, name)
+
+                def get(self, *args):
+                    row = session.get(*args)
+                    session.execute(update(TesListener).where(TesListener.id == 1)
+                                    .values(heartbeat_at=row.heartbeat_at + timedelta(seconds=1))
+                                    .execution_options(synchronize_session=False))
+                    return row
+            yield Session()
+
+    monkeypatch.setattr(db, "writing", interfering)
+    with pytest.raises(records.Held, match="same moment"):
+        records.acquire(engine, "me")
+
+
+def test_a_listener_that_lost_its_place_writes_nothing_more(api, monkeypatch):
+    from tesapi import records, tasks as task_module
+    engine = api.app.state.engine
+    engine.lost = True
+    monkeypatch.setattr(records, "save", lambda *a: pytest.fail("wrote after losing the place"))
+    live = task_module.Task("alice", task_module.parse(task(api, ["true"]),
+                                                       api.app.state.policy))
+    engine._keep(live)
+
+
+def test_a_good_renewal_resets_the_clock_for_the_next_failure(api, monkeypatch):
+    import asyncio
+    from tesapi import records
+    real, calls = records.beat, {"n": 0}
+
+    def late_trouble(bind, holder, now=None):
+        calls["n"] += 1
+        if 13 <= calls["n"] <= 14:
+            raise records.RecordError("the lease could not be renewed: OperationalError")
+        return real(bind, holder, now)
+
+    async def run():
+        task = asyncio.create_task(api.app.state.engine.heartbeat(interval=0.05))
+        await asyncio.sleep(1.0)
+        task.cancel()
+
+    monkeypatch.setattr(records, "beat", late_trouble)
+    monkeypatch.setattr(records, "LEASE_S", 0.5)
+    asyncio.run(run())
+    assert calls["n"] > 14 and not api.app.state.engine.lost
+
+
+def test_the_database_holds_at_most_one_lease(world):
+    from sqlalchemy.exc import IntegrityError
+    from datetime import datetime, timezone
+    from store import db
+    from store.models import TesListener
+    engine = db.make_engine(world.values["BIOCHEF_DB_URL"])
+    now = datetime.now(timezone.utc)
+    with pytest.raises(IntegrityError):
+        with db.writing(engine) as session:
+            session.add(TesListener(id=2, holder="x", host="h", pid=1,
+                                    started_at=now, heartbeat_at=now))
 
 
 def test_a_listener_started_against_a_held_database_is_refused_with_a_message(
