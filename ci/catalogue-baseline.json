@@ -31,6 +31,7 @@
     "bedtools.slop": "sha256: d21a8635e97c4bac",
     "bedtools.sort": "sha256: 71a84eb9ef31b294",
     "bedtools.subtract": "sha256: 8b17237f51ba6d77",
+    "bhtsne.embed": "sha256: 3b923a1f152f53ae",
     "cgranges.bedcov": "sha256: 4f29adf023e4a16d",
     "coreutils.basename": "sha256: c25498566286790d",
     "coreutils.cat": "sha256: 1ebcd2bb534e5863",
