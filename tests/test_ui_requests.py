@@ -26,6 +26,12 @@ def test_everything_listed_is_inside_24_hours_newest_first(client):
         "req_8e90", "req_8f40", "req_8f33", "req_8f21", "req_7c03"]
 
 
+def test_the_intro_links_to_the_studies_that_list_every_request(client):
+    """Mock 04 links "Each study's page"; the Studies screen is where it goes."""
+    text = client.get("/ui/requests").text
+    assert '<a href="/ui/studies">Each study\'s page</a> lists all of its requests.' in text
+
+
 def test_the_filters_and_their_counts(client):
     text = client.get("/ui/requests").text
     assert "All 5" in text and "Accepted 3" in text and "Refused 2" in text
