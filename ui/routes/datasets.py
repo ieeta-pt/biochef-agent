@@ -39,6 +39,17 @@ def edit(request: Request, dataset_id: str):
                     button="Save and sign", field=f"edit-{dataset_id}")
 
 
+@router.get("/ui/_/datasets/{dataset_id}/unbind")
+def unbind_confirm(request: Request, dataset_id: str):
+    """The question, in the page, before a binding goes: as Withdraw asks."""
+    _require_page_bindings(request)
+    with db.reading(bind_of(request)) as session:
+        row = repo.dataset_binding(session, dataset_id)
+    if row is None or row.source != "page":
+        raise HTTPException(status_code=404)
+    return fragment(request, "partials/unbind_confirm.html", dataset_id=dataset_id)
+
+
 @router.post("/ui/_/datasets/bind")
 def bind(request: Request, dataset_id: str = Form(...),
          location: Optional[str] = Form(None),
