@@ -57,9 +57,14 @@ def create_app(config: Config, runner, start_checks=None, bind=None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app):
         await asyncio.to_thread(engine.open)
-        if start_checks is not None:
-            await asyncio.to_thread(start_checks)
-        yield
+        beating = asyncio.create_task(engine.heartbeat())
+        try:
+            if start_checks is not None:
+                await asyncio.to_thread(start_checks)
+            yield
+        finally:
+            beating.cancel()
+            await asyncio.to_thread(engine.close)
 
     app = FastAPI(title="TES", docs_url=None, redoc_url=None, openapi_url=None,
                   lifespan=lifespan)
@@ -128,6 +133,12 @@ def create_app(config: Config, runner, start_checks=None, bind=None) -> FastAPI:
             audit.record("tes.task.refused", source=tasks.SOURCE, caller=who,
                          reason=refusal.reason[:300], status=refusal.status)
             raise HTTPException(status_code=refusal.status, detail=refusal.reason)
+        except tasks.Lost:
+            audit.record("tes.task.refused", source=tasks.SOURCE, caller=who,
+                         reason="lost the database", status=503)
+            raise HTTPException(status_code=503, detail="this TES listener lost its "
+                                "place in the database and takes no task; another "
+                                "listener holds it")
         except tasks.Full:
             audit.record("tes.task.refused", source=tasks.SOURCE, caller=who,
                          reason="queue full", status=503)

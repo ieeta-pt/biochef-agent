@@ -83,6 +83,7 @@ def main(argv):
         prepare(config, provider)
         bind = db.make_engine(config.db_url)
         records.check(bind)
+        records.preflight(bind)
     except (settings.ConfigError, ValueError, StoreError, records.RecordError) as refused:
         print(refused, file=sys.stderr)
         return 1

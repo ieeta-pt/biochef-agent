@@ -105,8 +105,8 @@ def world(tmp_path, monkeypatch, migrated_database):
     monkeypatch.setenv("BIOCHEF_AUDIT_LOG", str(trail))
     values = {
         "BIOCHEF_AUDIT_LOG": str(trail), "BIOCHEF_TESAPI_TOKENS": str(tokens),
-        "BIOCHEF_TESAPI_IMAGES": IMAGE, "BIOCHEF_TES_READ_DIRS": str(exchange),
-        "BIOCHEF_TES_WRITE_DIRS": str(outbox),
+        "BIOCHEF_TESAPI_IMAGES": IMAGE, "BIOCHEF_TESAPI_READ_DIRS": str(exchange),
+        "BIOCHEF_TESAPI_WRITE_DIRS": str(outbox),
         "BIOCHEF_LOCAL_ROOT": str(data), "BIOCHEF_RUN_ROOT": str(runs),
         "BIOCHEF_TESAPI_TIMEOUT": "120", "BIOCHEF_DB_URL": f"sqlite:///{tmp_path}/agent.db",
     }
@@ -174,8 +174,8 @@ def wait(world, task_id, headers=None, timeout=90):
 
 
 @pytest.mark.parametrize("name", ["BIOCHEF_AUDIT_LOG", "BIOCHEF_TESAPI_TOKENS",
-                                  "BIOCHEF_TESAPI_IMAGES", "BIOCHEF_TES_READ_DIRS",
-                                  "BIOCHEF_TES_WRITE_DIRS"])
+                                  "BIOCHEF_TESAPI_IMAGES", "BIOCHEF_TESAPI_READ_DIRS",
+                                  "BIOCHEF_TESAPI_WRITE_DIRS"])
 def test_nothing_that_decides_what_a_task_may_touch_has_a_default(world, name):
     with pytest.raises(settings.ConfigError, match=name):
         world.config(**{name: ""})
@@ -243,7 +243,7 @@ def test_the_images_are_a_list(world):
 
 
 @pytest.mark.parametrize("path", ["relative/dir", "/", "/no/such/dir"])
-@pytest.mark.parametrize("name", ["BIOCHEF_TES_READ_DIRS", "BIOCHEF_TES_WRITE_DIRS"])
+@pytest.mark.parametrize("name", ["BIOCHEF_TESAPI_READ_DIRS", "BIOCHEF_TESAPI_WRITE_DIRS"])
 def test_a_directory_that_is_not_a_plain_directory_stops_it(world, name, path):
     with pytest.raises(settings.ConfigError):
         world.config(**{name: path})
@@ -253,9 +253,9 @@ def test_a_directory_named_through_a_symlink_stops_it(world):
     link = world.tmp / "link"
     link.symlink_to(world.exchange)
     with pytest.raises(settings.ConfigError, match="symlink"):
-        world.config(BIOCHEF_TES_READ_DIRS=str(link))
+        world.config(BIOCHEF_TESAPI_READ_DIRS=str(link))
     with pytest.raises(settings.ConfigError, match="symlink"):
-        world.config(BIOCHEF_TES_WRITE_DIRS=str(link))
+        world.config(BIOCHEF_TESAPI_WRITE_DIRS=str(link))
 
 
 @pytest.mark.parametrize("name,where", [
@@ -264,22 +264,24 @@ def test_a_directory_named_through_a_symlink_stops_it(world):
     ("BIOCHEF_RUN_ROOT", "runs"),
     ("BIOCHEF_AUDIT_LOG", "."),
     ("BIOCHEF_TESAPI_TOKENS", "secrets"),
+    ("BIOCHEF_TES_TOKEN_FILE", "secrets"),
+    ("BIOCHEF_TES_PASSWORD_FILE", "secrets"),
     ("BIOCHEF_DB_URL", "."),
 ])
 def test_no_directory_may_contain_or_lie_in_the_nodes_own_data(world, name, where):
     allowed = (world.tmp / where).resolve()
     with pytest.raises(settings.ConfigError, match="overlaps"):
-        world.config(BIOCHEF_TES_READ_DIRS=str(allowed))
+        world.config(BIOCHEF_TESAPI_READ_DIRS=str(allowed))
     with pytest.raises(settings.ConfigError, match="overlaps"):
-        world.config(BIOCHEF_TES_WRITE_DIRS=str(allowed))
+        world.config(BIOCHEF_TESAPI_WRITE_DIRS=str(allowed))
 
 
 def test_a_directory_beside_the_datasets_is_fine(world):
     side = world.tmp / "datasets-public"
     side.mkdir()
-    assert world.config(BIOCHEF_TES_READ_DIRS=str(side.resolve())).read_dirs == (
+    assert world.config(BIOCHEF_TESAPI_READ_DIRS=str(side.resolve())).read_dirs == (
         str(side.resolve()),)
-    assert world.config(BIOCHEF_TES_WRITE_DIRS=str(side.resolve())).write_dirs == (
+    assert world.config(BIOCHEF_TESAPI_WRITE_DIRS=str(side.resolve())).write_dirs == (
         str(side.resolve()),)
 
 
@@ -289,16 +291,16 @@ def test_the_two_lists_may_share_no_directory(world):
     inside.mkdir()
     for read, write in ((a, a), (a, inside), (inside, a), (a, f"{b},{a}")):
         with pytest.raises(settings.ConfigError, match="share a directory"):
-            world.config(BIOCHEF_TES_READ_DIRS=str(read), BIOCHEF_TES_WRITE_DIRS=str(write))
+            world.config(BIOCHEF_TESAPI_READ_DIRS=str(read), BIOCHEF_TESAPI_WRITE_DIRS=str(write))
     sibling = world.tmp / "exchange-2"
     sibling.mkdir()
-    config = world.config(BIOCHEF_TES_READ_DIRS=f"{a},{sibling.resolve()}",
-                          BIOCHEF_TES_WRITE_DIRS=str(b))
+    config = world.config(BIOCHEF_TESAPI_READ_DIRS=f"{a},{sibling.resolve()}",
+                          BIOCHEF_TESAPI_WRITE_DIRS=str(b))
     assert config.read_dirs == (str(a), str(sibling.resolve()))
 
 
 def test_the_old_single_list_is_refused_and_says_what_replaces_it(world):
-    with pytest.raises(settings.ConfigError, match="BIOCHEF_TES_READ_DIRS"):
+    with pytest.raises(settings.ConfigError, match="BIOCHEF_TESAPI_READ_DIRS"):
         world.config(BIOCHEF_TESAPI_DIRS=str(world.exchange))
 
 
@@ -707,7 +709,11 @@ def test_an_input_that_is_a_link_inside_a_directory_is_refused_at_the_start(api)
 
 
 def restarted(world, **changes):
-    """A second listener on the same database, as after a restart."""
+    """A second listener on the same database, as after a restart: the first has
+    stopped and given its place up, which is what a clean shutdown does."""
+    first = world.app.state.engine
+    first.close()
+    first.lost = True       # it takes no further part: no write, no new task
     app = create_app(world.config(**changes), RecordingRunner())
     return TestClient(app)
 
@@ -791,7 +797,7 @@ def test_a_cancelled_task_stays_cancelled(api):
         assert client.get(f"/v1/tasks/{task_id}", headers=alice()).json()["state"] == "CANCELED"
 
 
-def test_the_listener_writes_to_one_table_only(api):
+def test_the_listener_writes_to_two_tables_only(api):
     created = api.client.post("/v1/tasks", headers=alice(), json=task(api, ["true"]))
     wait(api, created.json()["id"])
     import sqlite3
@@ -801,7 +807,7 @@ def test_the_listener_writes_to_one_table_only(api):
             "'sqlite_%' and name != 'alembic_version'")]
         counts = {name: connection.execute(f"select count(*) from {name}").fetchone()[0]
                   for name in tables}
-    assert counts.pop("tes_task") == 1
+    assert counts.pop("tes_task") == 1 and counts.pop("tes_listener") == 1
     assert not any(counts.values()), counts
 
 
@@ -926,6 +932,199 @@ def test_a_listener_started_on_an_older_schema_does_not_take_requests(world):
 
 
 # --------------------------------------------------------------------------
+# one listener per database
+
+
+def lease_row(world):
+    from sqlmodel import select
+    from store import db
+    from store.models import TesListener
+    engine = db.make_engine(world.values["BIOCHEF_DB_URL"])
+    with db.reading(engine) as session:
+        return session.exec(select(TesListener)).all()
+
+
+def test_a_second_listener_on_the_same_database_refuses_to_start(api):
+    from tesapi import records
+    second = create_app(api.config(), RecordingRunner())
+    with pytest.raises(records.Held, match="another TES listener holds this database"):
+        with TestClient(second):
+            pass
+    row, = lease_row(api)
+    assert row.pid == os.getpid() and row.holder == api.app.state.engine.holder
+    # The first goes on as it was: its tasks are not ended, and it takes new ones.
+    created = api.client.post("/v1/tasks", headers=alice(), json=task(api, ["true"]))
+    assert wait(api, created.json()["id"])["state"] == "COMPLETE"
+    assert [e["state"] for e in api.events("tes.task.state")
+            if e.get("error") == "restarted"] == []
+
+
+def test_the_refusal_says_who_holds_it_and_until_when(api):
+    from tesapi import records
+    with pytest.raises(records.Held) as refused:
+        records.preflight(api.app.state.engine.bind)
+    message = str(refused.value)
+    assert f"pid {os.getpid()}" in message and "wait until" in message
+    assert "end the first one's running tasks" in message
+
+
+def test_a_clean_stop_gives_the_place_up_at_once(api):
+    from tesapi import records
+    api.app.state.engine.close()
+    assert lease_row(api) == []
+    with TestClient(create_app(api.config(), RecordingRunner())):
+        assert records.current(api.app.state.engine.bind) is not None
+
+
+def test_a_listener_that_was_killed_is_replaced_when_its_place_expires(api):
+    from datetime import datetime, timedelta, timezone
+    from store import db
+    from store.models import TesListener, TesTask
+    from tesapi import records
+    first = api.app.state.engine
+    first.lost = True                       # killed: no release, no more writes
+    engine = db.make_engine(api.values["BIOCHEF_DB_URL"])
+    long_ago = datetime.now(timezone.utc) - timedelta(seconds=records.LEASE_S + 5)
+    with db.writing(engine) as session:
+        row = session.get(TesListener, 1)
+        row.heartbeat_at = long_ago
+        session.add(row)
+        session.add(_row("orphan-0000000000000000000000000", "RUNNING", 0))
+    with pytest.raises(records.Held):       # not yet expired, for a listener that is alive
+        records.preflight(engine, now=long_ago + timedelta(seconds=records.LEASE_S - 1))
+    with TestClient(create_app(api.config(), RecordingRunner())) as client:
+        view = client.get("/v1/tasks/orphan-0000000000000000000000000", headers=alice())
+        assert view.json()["state"] == "SYSTEM_ERROR"
+    taken, = [e for e in api.events("tes.lock.acquired") if e["took_over_from"]]
+    assert taken["took_over_from"]["pid"] == os.getpid()
+
+
+def test_the_place_expires_exactly_when_the_lease_has_run_out(world):
+    from datetime import datetime, timedelta, timezone
+    from store import db
+    from tesapi import records
+    engine = db.make_engine(world.values["BIOCHEF_DB_URL"])
+    start = datetime(2026, 11, 8, 12, 0, tzinfo=timezone.utc)
+    records.acquire(engine, "one", now=start)
+    for seconds, free in ((records.LEASE_S - 1, False), (records.LEASE_S, True),
+                          (records.LEASE_S + 1, True)):
+        moment = start + timedelta(seconds=seconds)
+        assert (records.current(engine, now=moment) is None) is free
+    with pytest.raises(records.Held):
+        records.acquire(engine, "two", now=start + timedelta(seconds=records.LEASE_S - 1))
+    assert records.acquire(engine, "two", now=start + timedelta(seconds=records.LEASE_S)) \
+        is not None, "and it says whose place it took"
+
+
+def test_the_holder_may_take_its_own_place_again(world):
+    from store import db
+    from tesapi import records
+    engine = db.make_engine(world.values["BIOCHEF_DB_URL"])
+    assert records.acquire(engine, "one") is None
+    assert records.acquire(engine, "one") is None
+
+
+def test_listeners_that_start_together_cannot_both_win(world):
+    import threading
+    from store import db
+    from tesapi import records
+    engine = db.make_engine(world.values["BIOCHEF_DB_URL"])
+    results, barrier = [], threading.Barrier(8)
+
+    def start(number):
+        barrier.wait()
+        try:
+            records.acquire(engine, f"listener-{number}")
+            results.append("won")
+        except records.Held:
+            results.append("held")
+
+    threads = [threading.Thread(target=start, args=(n,)) for n in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert results.count("won") == 1 and results.count("held") == 7
+
+
+def test_a_heartbeat_renews_the_place_and_only_for_its_holder(world):
+    from datetime import datetime, timedelta, timezone
+    from store import db
+    from tesapi import records
+    engine = db.make_engine(world.values["BIOCHEF_DB_URL"])
+    start = datetime(2026, 11, 8, 12, 0, tzinfo=timezone.utc)
+    records.acquire(engine, "one", now=start)
+    assert records.beat(engine, "one", now=start + timedelta(seconds=10)) is True
+    assert records.beat(engine, "someone-else", now=start + timedelta(seconds=11)) is False
+    assert records.current(engine, now=start + timedelta(seconds=10 + records.LEASE_S - 1))
+    assert records.current(engine, now=start + timedelta(seconds=10 + records.LEASE_S)) is None
+
+
+def test_a_running_listener_renews_its_place(api, monkeypatch):
+    import asyncio
+    engine = api.app.state.engine
+    before = lease_row(api)[0].heartbeat_at
+
+    async def beats():
+        task = asyncio.create_task(engine.heartbeat(interval=0.05))
+        await asyncio.sleep(0.4)
+        task.cancel()
+
+    time.sleep(0.01)
+    asyncio.run(beats())
+    assert lease_row(api)[0].heartbeat_at > before and not engine.lost
+
+
+def test_a_listener_that_finds_its_place_taken_stops_taking_tasks(api):
+    import asyncio
+    from store import db
+    from store.models import TesListener
+    engine = api.app.state.engine
+    created = api.client.post("/v1/tasks", headers=alice(), json=task(
+        api, ["sleep", "30"]))
+    task_id = created.json()["id"]
+    for _ in range(100):
+        if api.client.get(f"/v1/tasks/{task_id}", headers=alice()).json()["state"] == "RUNNING":
+            break
+        time.sleep(0.1)
+    with db.writing(db.make_engine(api.values["BIOCHEF_DB_URL"])) as session:
+        row = session.get(TesListener, 1)
+        row.holder = "another-listener"
+        session.add(row)
+    asyncio.run(asyncio.wait_for(engine.heartbeat(interval=0.05), timeout=10))
+    assert engine.lost
+    assert api.events("tes.lock.lost")[0]["reason"] == "another listener holds the database"
+    answer = api.client.post("/v1/tasks", headers=alice(), json=task(api, ["true"]))
+    assert answer.status_code == 503 and "lost its place" in answer.json()["msg"]
+    assert wait(api, task_id)["state"] == "CANCELED", "and what it was running was ended"
+
+
+def test_a_database_that_cannot_be_reached_for_most_of_the_lease_loses_the_place(api, monkeypatch):
+    import asyncio
+    from tesapi import records
+    def unreachable(bind, holder, now=None):
+        raise records.RecordError("the lease could not be renewed: OperationalError")
+    monkeypatch.setattr(records, "beat", unreachable)
+    monkeypatch.setattr(records, "LEASE_S", 0.3)
+    engine = api.app.state.engine
+    asyncio.run(asyncio.wait_for(engine.heartbeat(interval=0.05), timeout=10))
+    assert engine.lost
+    assert "could not be reached" in api.events("tes.lock.lost")[0]["reason"]
+
+
+def test_a_listener_started_against_a_held_database_is_refused_with_a_message(
+        api, capsys, monkeypatch):
+    from tesapi.__main__ import main
+    for key, value in api.values.items():
+        monkeypatch.setenv(key, value)
+    import tesapi.__main__ as entry
+    monkeypatch.setattr(entry, "get_runner", lambda name: RecordingRunner(network=ATTESTED))
+    monkeypatch.setenv("BIOCHEF_REQUIRE_NETWORK_ISOLATION", "false")
+    assert main([]) == 1
+    assert "another TES listener holds this database" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
 # the audit trail
 
 
@@ -1038,7 +1237,7 @@ def test_the_slots_are_not_the_agents(api):
     assert done.returncode == 0, done.stdout + done.stderr
 
 
-def test_the_listener_opens_one_table_of_the_database_and_never_the_other_apps():
+def test_the_listener_opens_two_tables_of_the_database_and_never_the_other_apps():
     sources = {source.name: source.read_text()
                for source in (REPO_ROOT / "tesapi").glob("*.py")}
     for name, text in sources.items():
@@ -1050,7 +1249,8 @@ def test_the_listener_opens_one_table_of_the_database_and_never_the_other_apps()
             assert not re.search(r"sqlmodel|sqlalchemy|store\.models|store\.repo", text), name
     records_text = sources["records.py"]
     models = re.findall(r"from store\.models import ([^\n]+)", records_text)
-    assert models == ["TesTask"], "records.py reads and writes tes_task and no other table"
+    assert models == ["TesListener, TesTask"], \
+        "records.py reads and writes tes_task and tes_listener and no other table"
     assert not re.search(r"store\.repo|RunSummary|Study|Request|Decision|DatasetBinding",
                          records_text)
 

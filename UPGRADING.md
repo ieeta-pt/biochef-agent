@@ -33,7 +33,7 @@ Choose one:
 ### Also at start
 
 - A runner whose network isolation is enforced now runs one step when the API process starts, to show that the step has no network. If the step finds a route or an address besides loopback, or cannot read its routes, the agent does not start, and the audit trail says why (`node.runner.network_check`). With `BIOCHEF_NETWORK_PROBE=host:port`, the step also tries to reach a host the agent itself can reach.
-- On a node, run `python -m store migrate` after updating, for migration 0005, and for 0006 if you run the TES API (`python -m tesapi` stops at start against a database without it).
+- On a node, run `python -m store migrate` after updating, for migration 0005, and for 0006 and 0007 if you run the TES API (`python -m tesapi` stops at start against a database without it).
 
 ## Apptainer needs the path of its binary
 

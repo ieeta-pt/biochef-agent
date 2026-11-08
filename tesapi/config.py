@@ -112,7 +112,7 @@ def _denied(values):
                  "BIOCHEF_NODE_SIGNING_KEY", "BIOCHEF_NODE_ENCRYPTION_KEY",
                  "BIOCHEF_TES_STAGING", "BIOCHEF_APPTAINER_CACHE",
                  "BIOCHEF_TESAPI_TOKENS", "BIOCHEF_TESAPI_TLS_KEY",
-                 "BIOCHEF_TES_TOKEN_FILE"):
+                 "BIOCHEF_TES_TOKEN_FILE", "BIOCHEF_TES_PASSWORD_FILE"):
         raw = (values.get(name) or "").strip()
         if raw:
             found.append((name, os.path.realpath(raw)))
@@ -161,8 +161,8 @@ def settings_from_environment():
         "BIOCHEF_TESAPI_PORT": os.getenv("BIOCHEF_TESAPI_PORT", "8082"),
         "BIOCHEF_TESAPI_TOKENS": os.getenv("BIOCHEF_TESAPI_TOKENS", ""),
         "BIOCHEF_TESAPI_IMAGES": os.getenv("BIOCHEF_TESAPI_IMAGES", ""),
-        "BIOCHEF_TES_READ_DIRS": os.getenv("BIOCHEF_TES_READ_DIRS", ""),
-        "BIOCHEF_TES_WRITE_DIRS": os.getenv("BIOCHEF_TES_WRITE_DIRS", ""),
+        "BIOCHEF_TESAPI_READ_DIRS": os.getenv("BIOCHEF_TESAPI_READ_DIRS", ""),
+        "BIOCHEF_TESAPI_WRITE_DIRS": os.getenv("BIOCHEF_TESAPI_WRITE_DIRS", ""),
         "BIOCHEF_TESAPI_DIRS": os.getenv("BIOCHEF_TESAPI_DIRS", ""),
         "BIOCHEF_TESAPI_MAX_CONCURRENT": os.getenv("BIOCHEF_TESAPI_MAX_CONCURRENT", "1"),
         "BIOCHEF_TESAPI_MAX_QUEUED": os.getenv("BIOCHEF_TESAPI_MAX_QUEUED", "16"),
@@ -180,6 +180,7 @@ def settings_from_environment():
         "BIOCHEF_TES_STAGING": os.getenv("BIOCHEF_TES_STAGING", ""),
         "BIOCHEF_APPTAINER_CACHE": os.getenv("BIOCHEF_APPTAINER_CACHE", ""),
         "BIOCHEF_TES_TOKEN_FILE": os.getenv("BIOCHEF_TES_TOKEN_FILE", ""),
+        "BIOCHEF_TES_PASSWORD_FILE": os.getenv("BIOCHEF_TES_PASSWORD_FILE", ""),
     }
 
 
@@ -227,17 +228,17 @@ def load(values=None) -> Config:
 
     denied = _denied(values)
     if get("BIOCHEF_TESAPI_DIRS"):
-        raise ConfigError("BIOCHEF_TESAPI_DIRS is replaced by BIOCHEF_TES_READ_DIRS and "
-                          "BIOCHEF_TES_WRITE_DIRS: a task reads from one set of "
+        raise ConfigError("BIOCHEF_TESAPI_DIRS is replaced by BIOCHEF_TESAPI_READ_DIRS and "
+                          "BIOCHEF_TESAPI_WRITE_DIRS: a task reads from one set of "
                           "directories and writes to another, and they may not share "
                           "any. Unset it and list the two")
-    read_dirs = _directories("BIOCHEF_TES_READ_DIRS", get("BIOCHEF_TES_READ_DIRS"), denied)
-    write_dirs = _directories("BIOCHEF_TES_WRITE_DIRS", get("BIOCHEF_TES_WRITE_DIRS"), denied)
+    read_dirs = _directories("BIOCHEF_TESAPI_READ_DIRS", get("BIOCHEF_TESAPI_READ_DIRS"), denied)
+    write_dirs = _directories("BIOCHEF_TESAPI_WRITE_DIRS", get("BIOCHEF_TESAPI_WRITE_DIRS"), denied)
     for reading in read_dirs:
         for writing in write_dirs:
             if overlaps(reading, writing):
                 raise ConfigError(
-                    f"BIOCHEF_TES_READ_DIRS and BIOCHEF_TES_WRITE_DIRS share a "
+                    f"BIOCHEF_TESAPI_READ_DIRS and BIOCHEF_TESAPI_WRITE_DIRS share a "
                     f"directory: {reading} and {writing} are the same place or one is "
                     f"inside the other. What a task may read and what it may write "
                     f"are kept apart, so that nothing it wrote can be read back as an "

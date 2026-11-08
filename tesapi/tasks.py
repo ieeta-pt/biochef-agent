@@ -382,6 +382,10 @@ class Full(Exception):
     """The queue is full."""
 
 
+class Lost(Exception):
+    """This listener no longer holds the database, and takes no task."""
+
+
 class Engine:
     """Tasks, their separate queue and their separate slots.
 
@@ -395,6 +399,8 @@ class Engine:
         self.policy = policy
         self.runner = runner
         self.bind = bind
+        self.holder = uuid.uuid4().hex
+        self.lost = False
         self.tasks: "OrderedDict[str, Task]" = OrderedDict()
         self.active = 0
         self._slots = None
@@ -412,6 +418,11 @@ class Engine:
         if self.bind is None:
             return
         records.check(self.bind)
+        took_over = records.acquire(self.bind, self.holder)
+        self.audit("tes.lock.acquired",
+                   took_over_from=None if took_over is None else {
+                       "pid": took_over.pid, "host": took_over.host,
+                       "last_heard_from": took_over.heartbeat_at.isoformat()})
         for row in records.load(self.bind, MAX_KEPT_TASKS):
             task = Task.from_row(row)
             if task.state not in TERMINAL:
@@ -425,9 +436,47 @@ class Engine:
                            error="restarted", was=was)
             self.tasks[task.id] = task
 
+    async def heartbeat(self, interval=None):
+        """Renew the place while the listener runs, and lose it loudly.
+
+        A listener that cannot renew it, because another has it or because the
+        database cannot be reached for most of the lease, stops taking tasks and
+        cancels the ones it has: after that another listener may end them anyway,
+        and what this one wrote down would overwrite what that one did.
+        """
+        interval = records.BEAT_S if interval is None else interval
+        last = time.monotonic()
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                kept = await asyncio.to_thread(records.beat, self.bind, self.holder)
+            except records.RecordError:
+                kept = None
+            if kept:
+                last = time.monotonic()
+            elif kept is False or time.monotonic() - last > records.LEASE_S - interval:
+                self._lose("another listener holds the database" if kept is False
+                           else "the database could not be reached for most of the lease")
+                return
+
+    def _lose(self, reason):
+        self.lost = True
+        try:
+            self.audit("tes.lock.lost", reason=reason)
+        except audit.AuditError:
+            pass
+        for task in list(self.tasks.values()):
+            if task.state not in TERMINAL:
+                self.cancel(task)
+
+    def close(self):
+        """Give the place up, so the next listener need not wait for it to expire."""
+        if self.bind is not None and not self.lost:
+            records.release(self.bind, self.holder)
+
     def _keep(self, task, strict=True):
         """Write the task down. A task that cannot be written down does not start."""
-        if self.bind is None:
+        if self.bind is None or self.lost:
             return
         try:
             records.save(self.bind, task)
@@ -447,6 +496,8 @@ class Engine:
         audit.record(event, source=SOURCE, **fields)
 
     def submit(self, owner: str, plan: Plan) -> Task:
+        if self.lost:
+            raise Lost()
         with self._lock:
             if self.active >= self.config.max_queued + self.config.max_concurrent:
                 raise Full()

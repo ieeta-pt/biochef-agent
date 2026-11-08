@@ -16,7 +16,7 @@ from store import db, migrate
 
 TABLES = {"study", "study_version", "member_key", "workflow_version", "decision",
           "request", "run_summary", "dataset_binding", "federation_list",
-          "node_status", "outgoing_message", "tes_task"}
+          "node_status", "outgoing_message", "tes_task", "tes_listener"}
 
 
 def test_upgrade_creates_every_table(tmp_path):

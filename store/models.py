@@ -303,6 +303,26 @@ class TesTask(SQLModel, table=True):
     sizes: List[Any] = _json(list)
 
 
+class TesListener(SQLModel, table=True):
+    """Which TES API listener holds this database, as a lease (SPEC.md, section 14.4).
+
+    One row. A listener takes it at start and renews `heartbeat_at` while it runs;
+    another that finds it held and not expired refuses to start, because starting
+    would end the first one's running tasks as SYSTEM_ERROR. A listener that stops
+    cleanly deletes the row, and one that was killed leaves it to expire.
+    """
+
+    __tablename__ = "tes_listener"
+    __table_args__ = (CheckConstraint("id = 1", name="single_row"),)
+
+    id: int = Field(default=1, primary_key=True)
+    holder: str
+    host: str
+    pid: int
+    started_at: datetime = _moment(nullable=False)
+    heartbeat_at: datetime = _moment(nullable=False)
+
+
 class FederationList(SQLModel, table=True):
     __tablename__ = "federation_list"
 
@@ -358,5 +378,6 @@ def _refuse_changes_to_immutable_fields(session, _context, _instances):
 
 
 __all__ = ["Decision", "DatasetBinding", "FederationList", "MemberKey",
-           "NodeStatus", "Request", "RunSummary", "Study", "StudyVersion", "TesTask",
+           "NodeStatus", "Request", "RunSummary", "Study", "StudyVersion", "TesListener",
+           "TesTask",
            "UtcDateTime", "WorkflowVersion"]

@@ -96,8 +96,8 @@ def main():
 
     config = settings.load({
         "BIOCHEF_AUDIT_LOG": str(trail), "BIOCHEF_TESAPI_TOKENS": str(tokens),
-        "BIOCHEF_TESAPI_IMAGES": IMAGE, "BIOCHEF_TES_READ_DIRS": str(exchange.resolve()),
-        "BIOCHEF_TES_WRITE_DIRS": str(outbox.resolve()),
+        "BIOCHEF_TESAPI_IMAGES": IMAGE, "BIOCHEF_TESAPI_READ_DIRS": str(exchange.resolve()),
+        "BIOCHEF_TESAPI_WRITE_DIRS": str(outbox.resolve()),
         "BIOCHEF_DB_URL": f"sqlite:///{root}/agent.db",
         "BIOCHEF_LOCAL_ROOT": str(datasets), "BIOCHEF_RUN_ROOT": str(runs),
         "BIOCHEF_TESAPI_TIMEOUT": "300"})
@@ -193,8 +193,18 @@ def main():
           f"the trail has the events ({sorted(kinds)})")
     text = trail.read_text()
     check(token not in text and SECRET not in text, "no token and no secret in the trail")
+    # A second listener on the same database is refused while the first runs, and
+    # the first gives its place up when it stops, so that the next can start.
+    from tesapi import records
+    try:
+        records.preflight(bind)
+        refused = False
+    except records.Held as held:
+        refused = "another TES listener holds this database" in str(held)
+    check(refused, "a second listener on the same database is refused while the first runs")
     server.should_exit = True
     thread.join(timeout=30)
+    check(records.current(bind) is None, "and the first one gave its place up when it stopped")
 
     # A restart: the listener is started again on the same database. The task that
     # finished is there; one that was running when the first listener stopped is not
