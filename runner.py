@@ -779,9 +779,12 @@ def get_runner(name: str) -> Runner:
     network = chosen.guarantees["network"]
     if require_network_isolation() and network != ENFORCED:
         raise ValueError(
-            f"BIOCHEF_REQUIRE_NETWORK_ISOLATION=true refuses BIOCHEF_RUNNER={name}: "
-            f"the agent does not itself keep its steps off the network (network "
-            f"isolation is {network}). An attested isolation does not count"
+            f"BIOCHEF_REQUIRE_NETWORK_ISOLATION, on unless set to false, refuses "
+            f"BIOCHEF_RUNNER={name}: the agent does not itself keep its steps off "
+            f"the network (network isolation is {network}), and an attested "
+            f"isolation does not count. Use a runner that isolates the network, or "
+            f"set BIOCHEF_REQUIRE_NETWORK_ISOLATION=false, which is audited at every "
+            f"start. See UPGRADING.md"
         )
     return chosen
 

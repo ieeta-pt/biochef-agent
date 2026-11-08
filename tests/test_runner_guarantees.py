@@ -411,3 +411,15 @@ def test_the_choice_is_audited_when_the_api_starts(api, monkeypatch):
         pass
     events = [json.loads(line)["event"] for line in trail.read_text().splitlines()]
     assert "node.runner.isolation_not_required" in events
+
+
+def test_the_upgrade_note_quotes_the_message_the_agent_gives(monkeypatch):
+    """UPGRADING.md tells an operator what they will see; it must be what they see."""
+    import re
+    note = (Path(__file__).resolve().parent.parent / "UPGRADING.md").read_text()
+    quoted = re.search(r"```\n(.+?), \.\.\.\n```", note).group(1)
+    monkeypatch.delenv("BIOCHEF_REQUIRE_NETWORK_ISOLATION")
+    with pytest.raises(ValueError) as refused:
+        get_runner("subprocess")
+    assert str(refused.value).startswith(quoted)
+    assert "UPGRADING.md" in str(refused.value)
