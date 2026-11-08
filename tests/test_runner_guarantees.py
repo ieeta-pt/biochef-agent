@@ -46,7 +46,7 @@ from runner import (ATTESTED, ENFORCED, NONE, PROVIDERS, ApptainerRunner,
 
 @pytest.fixture(autouse=True)
 def no_rule(monkeypatch):
-    monkeypatch.delenv("BIOCHEF_REQUIRE_NETWORK_ISOLATION", raising=False)
+    monkeypatch.setenv("BIOCHEF_REQUIRE_NETWORK_ISOLATION", "false")
     monkeypatch.delenv("BIOCHEF_NETWORK_PROBE", raising=False)
     monkeypatch.setenv("BIOCHEF_PODMAN_MODE", "rootless")
     monkeypatch.setenv("BIOCHEF_PODMAN_SELINUX", "disable")
@@ -102,8 +102,9 @@ def test_an_attested_network_is_not_isolation():
 # BIOCHEF_REQUIRE_NETWORK_ISOLATION
 
 
-@pytest.mark.parametrize("value,expected", [("", False), ("false", False),
-                                            ("true", True), (" true ", True)])
+@pytest.mark.parametrize("value,expected", [("", True), ("false", False),
+                                            ("true", True), (" true ", True),
+                                            (" false ", False)])
 def test_the_rule_is_true_or_false(value, expected):
     assert require_network_isolation(value) is expected
 
@@ -114,8 +115,37 @@ def test_anything_else_stops_the_agent(value):
         require_network_isolation(value)
 
 
-def test_without_the_rule_any_runner_starts():
+def test_turned_off_any_runner_starts():
     assert isinstance(get_runner("subprocess"), SubprocessRunner)
+
+
+def test_the_rule_is_on_when_unset(monkeypatch):
+    monkeypatch.delenv("BIOCHEF_REQUIRE_NETWORK_ISOLATION")
+    assert require_network_isolation() is True
+    with pytest.raises(ValueError, match="refuses BIOCHEF_RUNNER=subprocess"):
+        get_runner("subprocess")
+    assert get_runner("apptainer").isolates_network
+
+
+def test_turning_it_off_is_audited_at_start(api, monkeypatch):
+    main, trail = api
+    monkeypatch.setattr(main, "RUNNER", SubprocessRunner())
+    main.record_isolation_choice()
+    event = json.loads(trail.read_text())
+    assert event["event"] == "node.runner.isolation_not_required"
+    assert event["runner"] == "subprocess" and event["network"] == "none"
+    assert event["setting"] == "BIOCHEF_REQUIRE_NETWORK_ISOLATION=false"
+
+
+@pytest.mark.parametrize("value", [None, "true"])
+def test_with_the_rule_on_nothing_is_audited(api, monkeypatch, value):
+    main, trail = api
+    if value is None:
+        monkeypatch.delenv("BIOCHEF_REQUIRE_NETWORK_ISOLATION")
+    else:
+        monkeypatch.setenv("BIOCHEF_REQUIRE_NETWORK_ISOLATION", value)
+    assert main.record_isolation_choice() is None
+    assert not trail.exists()
 
 
 def test_the_rule_refuses_subprocess(monkeypatch):
@@ -371,3 +401,13 @@ def test_on_a_node_the_check_reaches_the_node_screen(api, monkeypatch, tmp_path)
         assert status.network_check_ok is False
         assert "3 routes or addresses" in status.network_check_detail
         assert status.network_checked_at is not None
+
+
+def test_the_choice_is_audited_when_the_api_starts(api, monkeypatch):
+    from fastapi.testclient import TestClient
+    main, trail = api
+    monkeypatch.setattr(main, "RUNNER", SubprocessRunner())
+    with TestClient(main.app):
+        pass
+    events = [json.loads(line)["event"] for line in trail.read_text().splitlines()]
+    assert "node.runner.isolation_not_required" in events
