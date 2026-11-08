@@ -278,8 +278,22 @@ def _seed_runs(session, now):
                           "ended_at": None}],
                   log_stdout="fixture log\n")
 
+    # The run of req_7c04 waits for the agent's own review, the state a node with
+    # egress `manual` shows, as run_8f21 waits for the airlock of one with `airlock`.
+    review_start = now - mock.hours(29)
+    review_end = review_start + timedelta(minutes=sum(mock.STEP_MINUTES.values()))
+    repo.save_run(session, "run_7c04", state="COMPLETE", request_id="req_7c04",
+                  steps=[{"id": name, "state": "COMPLETE"} for name in mock.STEP_MINUTES],
+                  started_at=review_start, ended_at=review_end, exit_code=0,
+                  workspace_path="/var/lib/biochef/runs/run_7c04",
+                  manifest_path="/var/lib/biochef/runs/run_7c04/run.json",
+                  log_stdout="fixture log\n", egress_files=list(mock.OUTPUT_FILES))
+    _finish_egress(session, "run_7c04", EgressState.RULES_PENDING,
+                   EgressState.AWAITING_REVIEW)
+
+    seeded_above = ("run_8f21", "run_8e90", "run_7c04")
     finished = [(row[0], row[9]) for row in mock.REQUESTS
-                if row[9] and row[9] not in ("run_8f21", "run_8e90")]
+                if row[9] and row[9] not in seeded_above]
     finished += [(f"req_{run[4:]}", run) for run in _generated_runs(session)]
     for request_id, run_id in finished:
         ended = now - mock.hours(19)

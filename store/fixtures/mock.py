@@ -114,9 +114,12 @@ WORKFLOWS = (
 )
 
 # (id, study, version, workflow key, member, received, verdict, failed check,
-#  repeats, run). Mock 04 lists the first five, mock 02 adds the last two. Mock 04
+#  repeats, run). Mock 04 lists the first five, mock 02 adds the others. Mock 04
 #  had a sixth row for a repeat; a repeat is the same request_id, so it is now the
-#  count on req_8f21 (section 6.3).
+#  count on req_8f21 (section 6.3). req_7c04 is not in the mock: it is the run that
+#  waits for the agent's own review, which a node with no airlock shows (egress
+#  `manual`), as req_8f21 is the one that waits for the airlock. It is older than 24
+#  hours so that the Requests screen keeps the five rows of mock 04.
 REQUESTS = (
     ("req_8e90", SEPSIS, 1, "sepsis-cohort", "Marta Reis", hours(1), "accepted",
      None, 0, "run_8e90"),
@@ -128,6 +131,8 @@ REQUESTS = (
      None, 1, "run_8f21"),
     ("req_7c03", CARDIO, 2, "gwas-maf01", "Ana Costa", hours(20), "accepted",
      None, 0, "run_7c03"),
+    ("req_7c04", CARDIO, 2, "gwas-maf05", "Ana Costa", hours(30), "accepted",
+     None, 0, "run_7c04"),
     ("req_7b88", CARDIO, 2, "cohort", "Ana Costa", days(4), "accepted", None,
      0, "run_7b88"),
     ("req_7a10", CARDIO, 2, "gwas-maf01", "Rui Matos", days(5), "refused",
