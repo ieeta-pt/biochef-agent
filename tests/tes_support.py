@@ -206,15 +206,18 @@ class TesServer:
         if self.mode == "subprocess":
             # No container: /work and /out are the two directories, named here.
             if len(command) > 2:
-                command[2] = command[2].replace("/work", work).replace("/out", out)
+                command[2] = (command[2].replace("/in/.", work + "/.")
+                                         .replace("/out", out))
             argv, kwargs = command, {"cwd": work, "env": {
                 "PATH": os.environ["PATH"], "HOME": work}}
         else:
             name = f"tes-{record['id']}"
             record["container"] = name
             argv = ["docker", "run", "--rm", "--name", name, "--network", "none",
-                    "-v", f"{work}:/work", "-v", f"{out}:/out", "-w",
-                    executor.get("workdir") or "/work", executor["image"], *command]
+                    "--read-only", "--tmpfs", "/tmp",
+                    "-v", f"{work}:/in:ro", "-v", f"{out}:/out",
+                    *(["-w", executor["workdir"]] if executor.get("workdir") else []),
+                    executor["image"], *command]
             kwargs = {}
         process = subprocess.Popen(argv, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True,

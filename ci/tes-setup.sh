@@ -66,6 +66,34 @@ as_agent sudo -n "$HELPER" finish "$STAGING/run-a/step-1"
 echo "ok: the helper accepts a step directory of the agent's"
 sudo rm -rf "$STAGING/run-a" "$STAGING/shallow" "$STAGING/link-run" "/home/$AGENT/outside"
 
+if [ "${TES_SERVER:-stand-in}" = funnel ]; then
+    # The real thing: Funnel, built from FUNNEL_SRC, started as root with a config made
+    # from its own default. It has no token here: the job reaches it on the loopback,
+    # BIOCHEF_TES_AUTH=none, and Funnel's own authentication is not exercised.
+    FUNNEL_WORK=/srv/biochef-funnel
+    sudo rm -rf "$FUNNEL_WORK"
+    sudo install -d -o root -g root -m 0755 "$FUNNEL_WORK" "$FUNNEL_WORK/work"
+    python3 "$SRC/ci/funnel_config.py" "$FUNNEL_SRC/config/default-config.yaml" \
+        "$WORK/funnel.yml" "$FUNNEL_WORK/work" "$FUNNEL_WORK/funnel.db" "$STAGING"
+    sudo rm -f "$WORK/funnel.log"
+    sudo -b sh -c "exec '$FUNNEL_SRC/funnel' server run --config '$WORK/funnel.yml' \
+        >'$WORK/funnel.log' 2>&1"
+    for _ in $(seq 1 60); do
+        curl -sf http://127.0.0.1:8000/v1/service-info >/dev/null && break
+        sleep 0.5
+    done
+    curl -sf http://127.0.0.1:8000/v1/service-info >/dev/null || {
+        sudo cat "$WORK/funnel.log"; echo "FAIL: no Funnel" >&2; exit 1; }
+    {
+        echo "BIOCHEF_TES_URL=http://127.0.0.1:8000"
+        echo "BIOCHEF_TES_STAGING=$STAGING"
+        echo "BIOCHEF_TES_HELPER=$HELPER"
+        echo "AGENT_USER=$AGENT"
+    } >> "${GITHUB_ENV:-/dev/stdout}"
+    echo "ok: Funnel running as root at http://127.0.0.1:8000"
+    exit 0
+fi
+
 # In a directory the agent can reach, which the runner's temp directory is not.
 TOKEN=/etc/biochef-agent/tes-token
 head -c 24 /dev/urandom | base64 | tr -d '/+=\n' | sudo tee "$TOKEN" >/dev/null

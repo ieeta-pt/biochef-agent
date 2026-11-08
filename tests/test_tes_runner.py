@@ -376,8 +376,8 @@ def test_the_task_is_built_from_the_command_and_the_image_alone():
     assert executor["command"] == ["bash", "-c", tes.WRAPPER, "biochef-step",
                                    "echo $(id) \"'; rm -rf /\""]
     assert "rm -rf" not in tes.WRAPPER, "the command is an argument, never spliced in"
-    assert set(executor) == {"image", "command", "workdir"}, "no env, no stdin"
-    assert task["inputs"] == [{"url": "file:///stage/in", "path": "/work",
+    assert set(executor) == {"image", "command"}, "no env, no stdin"
+    assert task["inputs"] == [{"url": "file:///stage/in", "path": "/in",
                                "type": "DIRECTORY"}]
     assert task["outputs"] == [{"url": "file:///stage/out", "path": "/out",
                                 "type": "DIRECTORY"}]

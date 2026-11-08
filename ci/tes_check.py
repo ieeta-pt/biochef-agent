@@ -45,7 +45,7 @@ rule all:
 rule where:
     output: "where.txt"
     shell:
-        "( . /etc/os-release; echo os=$ID ) > where.txt; "
+        "( . /etc/os-release; echo os=$ID-$VERSION_ID ) > where.txt; "
         "echo user=$(id -u) >> where.txt; "
         "if [ -e {neighbour} ]; then echo neighbour=visible; else echo neighbour=hidden; fi >> where.txt; "
         "if env | grep -q {secret}; then echo env=inherited; else echo env=clean; fi >> where.txt"
@@ -120,13 +120,15 @@ def main():
         + WORKFLOW.replace("{neighbour}", str(neighbour / "secret.txt"))
         .replace("{secret}", SECRET))
     result = runner.run(Workspace(ws), timeout_s=600)
-    check(result.returncode == 0, f"the workflow ran through TES (exit {result.returncode})")
     if result.returncode != 0:
         print(result.stdout, result.stderr)
+    check(result.returncode == 0, f"the workflow ran through TES (exit {result.returncode})")
     where = dict(line.split("=", 1) for line in (ws / "where.txt").read_text().split())
     release = Path("/etc/os-release")
-    host_os = (dict(line.split("=", 1) for line in release.read_text().splitlines()
-                    if "=" in line)["ID"] if release.exists() else sys.platform)
+    fields = (dict(line.split("=", 1) for line in release.read_text().splitlines()
+                   if "=" in line) if release.exists() else {})
+    host_os = (f"{fields['ID']}-{fields.get('VERSION_ID', '').strip(chr(34))}"
+               if "ID" in fields else sys.platform)
     check(where["os"] != host_os, f"the step ran in the image ({where['os']}), not on "
                                   f"the host ({host_os})")
     check(where["neighbour"] == "hidden", "another run's directory is not there")
@@ -167,6 +169,19 @@ def main():
     check(result.returncode != 0, "a run that times out fails")
     check(time.monotonic() - started < 120, "and does not wait for its task")
     check(not (staging / slow.name).exists(), "and its staging was cleared")
+
+    # The server's own view, through the filter the runner cancels by.
+    client = tes.Client(runner.settings)
+    mine = client.get_list(tes.task_prefix(slow.name))
+    check(mine and all(task.get("state") == "CANCELED" for task in mine),
+          f"the server lists the timed-out run's task as CANCELED by name_prefix "
+          f"({[task.get('state') for task in mine]})")
+    check(client.get_list(tes.task_prefix("biochef-run-nothing_9")) == [],
+          "a prefix that matches nothing lists nothing")
+    first = client.get_list(tes.task_prefix("biochef-run-ci_1"))
+    check(first and all(task.get("id") not in {each.get("id") for each in mine}
+                        for task in first),
+          "and another run's tasks are not in the timed-out run's list")
     shutil.rmtree(runs, ignore_errors=True)
     print("all checks passed")
 

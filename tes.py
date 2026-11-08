@@ -45,8 +45,9 @@ import urllib.parse
 import urllib.request
 from typing import List, NamedTuple, Optional
 
-WORKDIR = "/work"
-"""Where the task sees the step's workspace, writable and its own copy."""
+INDIR = "/in"
+"""Where the task sees the step's workspace. Read-only: Funnel mounts every input so,
+and the task copies it to a scratch directory before it runs the step."""
 OUTDIR = "/out"
 """Where the task puts what the step changed, and the manifest of it."""
 MANIFEST = ".biochef-manifest"
@@ -247,21 +248,25 @@ class Client:
     def cancel(self, task_id: str) -> None:
         self._call("POST", f"/v1/tasks/{urllib.parse.quote(task_id)}:cancel")
 
-    def active(self, name_prefix: str) -> List[str]:
-        """The ids of this run's tasks that have not finished."""
+    def get_list(self, name_prefix: str) -> List[dict]:
+        """Every task of the name prefix, finished or not, as the server lists them."""
         found, token = [], None
         for _ in range(50):
             query = {"view": "MINIMAL", "page_size": 100, "name_prefix": name_prefix}
             if token:
                 query["page_token"] = token
             page = self._call("GET", "/v1/tasks", query=query)
-            for task in page.get("tasks") or []:
-                if task.get("state") not in TERMINAL and isinstance(task.get("id"), str):
-                    found.append(task["id"])
+            found.extend(task for task in page.get("tasks") or []
+                         if isinstance(task, dict))
             token = page.get("next_page_token")
             if not token:
                 break
         return found
+
+    def active(self, name_prefix: str) -> List[str]:
+        """The ids of this run's tasks that have not finished."""
+        return [task["id"] for task in self.get_list(name_prefix)
+                if task.get("state") not in TERMINAL and isinstance(task.get("id"), str)]
 
     def wait(self, task_id: str, sleep=time.sleep) -> dict:
         """Poll until the task has finished. A few failed polls are not an end."""
@@ -299,21 +304,24 @@ def task_prefix(name: str) -> str:
 # find -exec sha256sum, sort and comm are in busybox as well as GNU coreutils.
 WRAPPER = r'''set -euo pipefail
 export LC_ALL=C
-cd /work
-find . -type f -exec sha256sum {} + | sort > /tmp/before
+T=$(mktemp -d)
+mkdir "$T/work"
+cp -a /in/. "$T/work/"
+cd "$T/work"
+find . -type f -exec sha256sum {} + | sort > "$T/before"
 rc=0
 bash -c "$1" || rc=$?
 if [ "$rc" -ne 0 ]; then exit "$rc"; fi
-find . -type f -exec sha256sum {} + | sort > /tmp/after
+find . -type f -exec sha256sum {} + | sort > "$T/after"
 mkdir -p /out
-comm -13 /tmp/before /tmp/after | while IFS= read -r line; do
+comm -13 "$T/before" "$T/after" | while IFS= read -r line; do
     p=${line#* }
     p=${p# }
     mkdir -p "/out/$(dirname "$p")"
     cp "$p" "/out/$p"
 done
-(cd /out && find . -type f -exec sha256sum {} +) > /tmp/manifest
-mv /tmp/manifest /out/.biochef-manifest
+(cd /out && find . -type f -exec sha256sum {} +) > "$T/manifest"
+mv "$T/manifest" /out/.biochef-manifest
 '''
 
 
@@ -327,9 +335,8 @@ def build_task(image: str, command: str, name: str, step: str, in_url: str,
         "executors": [{
             "image": image,
             "command": ["bash", "-c", WRAPPER, "biochef-step", command],
-            "workdir": WORKDIR,
         }],
-        "inputs": [{"url": in_url, "path": WORKDIR, "type": "DIRECTORY"}],
+        "inputs": [{"url": in_url, "path": INDIR, "type": "DIRECTORY"}],
         "outputs": [{"url": out_url, "path": OUTDIR, "type": "DIRECTORY"}],
     }
 
