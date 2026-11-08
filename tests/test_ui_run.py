@@ -54,6 +54,28 @@ def test_the_steps_strip(engine):
     assert "COMPLETE · 47 min" in text
 
 
+def test_the_steps_are_joined_by_arrows(engine):
+    """Mock 05 draws an arrow from each step to the next, and none before the first."""
+    client = web(engine)
+    four = client.get("/ui/runs/run_8f21").text
+    assert four.count('<svg width="28" height="10"') == len(mock.STEP_MINUTES) - 1
+    assert four.index('<svg width="28"') > four.index("qc_samples")
+    assert four.index('<svg width="28"') < four.index("qc_variants")
+    one = client.get("/ui/runs/run_8e90").text
+    assert "<svg width=\"28\"" not in one, "one step has nothing to point to"
+
+
+def test_the_seed_has_a_run_waiting_for_the_agents_own_review(engine):
+    """A node with no airlock must be demonstrable without editing the database."""
+    manual = web(engine, "manual")
+    text = manual.get("/ui/runs/run_7c04").text
+    assert "Waiting for your review" in text
+    assert "Release 2 files and sign" in text and "Withhold and sign" in text
+    # And the airlock one is where it was: the manual node has no button there.
+    assert "Release 2 files" not in manual.get("/ui/runs/run_8f21").text
+    assert "Waiting for the TRE&#39;s decision" in web(engine).get("/ui/runs/run_8f21").text
+
+
 def test_the_airlock_stages(engine):
     text = web(engine).get("/ui/runs/run_8f21").text
     assert "2 · TRE airlock" in text and "Handed to the airlock" in text
