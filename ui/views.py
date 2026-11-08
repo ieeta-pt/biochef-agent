@@ -14,7 +14,8 @@ from node.keys import short_fingerprint
 from store import repo
 from store.errors import NotFound
 from store.models import Decision
-from store.states import Action, MessageKind, SubjectType, Verdict, VersionState
+from store.states import (TES_LEASE_SECONDS, TES_STATES, Action, MessageKind,
+                          SubjectType, Verdict, VersionState)
 from ui import compare, format as fmt
 
 UNKNOWN_MEMBER = "unknown member"
@@ -746,6 +747,15 @@ EVENT_LABELS = {
     "node.runner.network_check": lambda event: (
         f'{event.get("runner") or "Runner"} network check '
         f'{"passed" if event.get("ok") else "failed"}'),
+    "tes.start": "TES API started",
+    "tes.task.created": "TES task created",
+    "tes.task.state": lambda event: f'TES task {str(event.get("state") or "?").lower()}',
+    "tes.task.refused": "TES task refused",
+    "tes.auth.refused": "TES API call refused, no valid token",
+    "tes.lock.acquired": lambda event: (
+        "TES API took the database over from a stopped listener"
+        if event.get("took_over_from") else "TES API took the database"),
+    "tes.lock.lost": "TES API lost the database",
 }
 """Words for the events that are not a decision, a request check or a run state. A text
 or a function of the event. An event with no entry here is shown by `_humanise`, so
@@ -853,6 +863,7 @@ def _audit_row(session, event, undone=None):
         kind, subject_id = undone.get("subject_type"), undone.get("subject_id")
     subject = (_subject_name(session, kind, subject_id) or subject_id
                or event.get("request_id") or event.get("run_id") or event.get("runner")
+               or event.get("task_id")
                or (f'decision {event["decision_id"]}' if event.get("decision_id")
                    else None) or "n/a")
     when = event.get("at")
@@ -907,6 +918,47 @@ def events_without_decision(session, events):
     return missing
 
 
+TES_PILLS = {"COMPLETE": "ok", "EXECUTOR_ERROR": "bad", "SYSTEM_ERROR": "bad",
+             "CANCELED": "mute", "CANCELING": "warn", "RUNNING": "info",
+             "INITIALIZING": "info", "QUEUED": "mute"}
+TES_TASKS_SHOWN = 10
+
+
+def _tes_card(session, now):
+    """The TES API as the database tells it: is it there, and what has it been sent.
+
+    Read only, and only what a list needs. A task's command and logs are not read at
+    all: they belong to whoever sent it, and the node's page is not where they go.
+    """
+    lease = repo.tes_listener(session)
+    alive = (lease is not None and
+             now < lease.heartbeat_at + timedelta(seconds=TES_LEASE_SECONDS))
+    if lease is None:
+        headline, kind = "Not running", "mute"
+        lines = ["No TES API has held this database."]
+    elif alive:
+        headline, kind = "Running", "ok"
+        lines = [f"Since {fmt.minute(lease.started_at)} · pid {lease.pid} on {lease.host}",
+                 f"Last heard from {fmt.ago(lease.heartbeat_at, now)}"]
+    else:
+        headline, kind = "Not running", "bad"
+        lines = [f"Last held by pid {lease.pid} on {lease.host}, since "
+                 f"{fmt.minute(lease.started_at)}",
+                 f"Last heard from {fmt.minute(lease.heartbeat_at)}"]
+    counts = repo.tes_task_counts(session)
+    tasks = []
+    for row in repo.latest_tes_tasks(session, TES_TASKS_SHOWN):
+        name, _, digest = row.image.partition("@")
+        tasks.append({"when": fmt.minute(row.created_at), "id": row.id[:8],
+                      "name": row.name, "owner": row.owner,
+                      "image": f"{name}@{fmt.short_digest(digest)}" if digest else name,
+                      "state": row.state, "pill": TES_PILLS.get(row.state, "mute")})
+    return {"headline": headline, "kind": kind, "lines": lines,
+            "counts": [(state, counts[state], TES_PILLS[state])
+                       for state in TES_STATES if counts.get(state)],
+            "total": sum(counts.values()), "tasks": tasks}
+
+
 def node_page(session, settings, keys, events, now):
     orphans = events_without_decision(session, events)
     rows = _audit_rows(session, events)
@@ -932,6 +984,7 @@ def node_page(session, settings, keys, events, now):
         "retention": (f"Kept {_span(settings.keep_outputs_seconds)}, at most "
                       f"{settings.max_retained_runs} runs, then deleted"),
         "signatures": SIGNING_TEXT.get(settings.signing_mode, settings.signing_mode),
+        "tes": _tes_card(session, now),
         "events": list(reversed(rows))[:AUDIT_ROWS],
         "orphans": [_audit_row(session, event) for event in orphans],
         "orphan_ids": [event.get("decision_id") for event in orphans],

@@ -22,8 +22,9 @@ from sqlmodel import select
 
 from store import db, migrate
 from store.models import TesListener, TesTask
+from store.states import TES_LEASE_SECONDS
 
-LEASE_S = 30
+LEASE_S = TES_LEASE_SECONDS
 """How long a listener's place stays its own without a heartbeat. A listener killed
 without releasing it is replaced after this long."""
 
