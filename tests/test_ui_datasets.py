@@ -90,7 +90,25 @@ def test_the_table_of_the_mock(engine, root):
 
 def test_a_locked_row_has_no_controls(engine, root):
     text = client(engine, root).get("/ui/datasets").text
-    assert text.count(">Edit</button>") == 1 and text.count(">Remove</button>") == 1
+    assert text.count(">Remove</button>") == 1
+    assert text.count(">Edit</button>") == 0, "nothing names the one page binding of the mock"
+
+
+def test_edit_is_offered_only_where_a_study_names_the_dataset(engine, root):
+    """The page refuses to rebind a dataset no study names, so it does not offer to."""
+    web = client(engine, root)
+    with db.writing(engine) as session:
+        repo.bind_dataset(session, dataset_id=mock.RARE_DATASET, source=BindingSource.PAGE,
+                          type="localpath", location="rare/pilot_v1", bound_by="j.silva")
+    text = web.get("/ui/datasets").text
+    assert text.count(">Edit</button>") == 1, "the pending study names the rare dataset"
+    assert f'/ui/_/datasets/{mock.RARE_DATASET}/edit' in text
+    assert f'/ui/_/datasets/{mock.MICROBIOME_DATASET}/edit' not in text
+    assert text.count(">Remove</button>") == 2, "an unused binding can still be removed"
+    # The rule itself is where it was.
+    refused = post(web, "/ui/_/datasets/bind", dataset_id=mock.MICROBIOME_DATASET,
+                   location="micro/16s_2023/")
+    assert refused.status_code == 409 and "No pending or approved study" in refused.text
 
 
 def test_the_waiting_card_of_the_mock(engine, root):
@@ -116,6 +134,7 @@ def test_the_switch_also_closes_the_routes(engine, root):
                 location="rare/pilot_v1").status_code == 403
     assert post(web, f"/ui/_/datasets/{mock.MICROBIOME_DATASET}/unbind").status_code == 403
     assert web.get(f"/ui/_/datasets/{mock.MICROBIOME_DATASET}/edit").status_code == 403
+    assert web.get(f"/ui/_/datasets/{mock.MICROBIOME_DATASET}/unbind").status_code == 403
 
 
 def test_binding_from_the_page(engine, root):
@@ -173,6 +192,28 @@ def test_edit_offers_the_current_folder(engine, root):
 def test_a_config_row_cannot_be_edited(engine, root):
     web = client(engine, root)
     assert web.get(f"/ui/_/datasets/{mock.CARDIO_DATASET}/edit").status_code == 404
+
+
+def test_remove_asks_first_and_in_the_page(engine, root):
+    web = client(engine, root)
+    text = web.get("/ui/datasets").text
+    assert f'hx-get="/ui/_/datasets/{mock.MICROBIOME_DATASET}/unbind"' in text
+    assert f'hx-post="/ui/_/datasets/{mock.MICROBIOME_DATASET}/unbind"' not in text, \
+        "the button no longer removes on the first click"
+    question = web.get(f"/ui/_/datasets/{mock.MICROBIOME_DATASET}/unbind").text
+    assert f"Remove the binding of {mock.MICROBIOME_DATASET}?" in question
+    assert "Requests that need it are refused until it is bound again." in question
+    assert f'hx-post="/ui/_/datasets/{mock.MICROBIOME_DATASET}/unbind"' in question
+    assert ">Remove and sign</button>" in question
+    with db.reading(engine) as session:
+        assert repo.dataset_binding(session, mock.MICROBIOME_DATASET) is not None, \
+            "asking removed nothing"
+
+
+def test_the_question_is_not_asked_of_a_config_row_or_an_unbound_one(engine, root):
+    web = client(engine, root)
+    assert web.get(f"/ui/_/datasets/{mock.CARDIO_DATASET}/unbind").status_code == 404
+    assert web.get("/ui/_/datasets/EGAD00000000000/unbind").status_code == 404
 
 
 def test_remove(engine, root):

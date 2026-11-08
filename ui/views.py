@@ -518,6 +518,9 @@ def dataset_page(session):
     rows = [{"id": row.dataset_id, "type": row.type, "location": row.location,
              "visa_value": row.visa_value,
              "used_by": _used_by(session, row.dataset_id, versions),
+             # Only a dataset a pending or approved study names can be bound or
+             # rebound from the page (node.datasets.bind), so only then is Edit offered.
+             "named": any(row.dataset_id in version.datasets for version in versions),
              "locked": row.source == "config", "bound_by": row.bound_by}
             for row in bound]
     known = {row.dataset_id for row in bound}
