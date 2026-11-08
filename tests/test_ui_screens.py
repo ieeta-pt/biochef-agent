@@ -458,7 +458,8 @@ def test_the_study_list_puts_approved_first(client):
 
 def test_the_cards_of_the_mock(client):
     text = client.get("/ui/studies").text
-    assert "3 workflows · 14 requests" in text and "1 workflow · 6 requests" in text
+    assert "3 workflows approved · 1 waiting · 14 requests" in text
+    assert "1 workflow approved · 6 requests" in text, "nothing waiting, nothing said"
     assert "v3 in Inbox" in text and ", kept for the audit log" in text
 
 
