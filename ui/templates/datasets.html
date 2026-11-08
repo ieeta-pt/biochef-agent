@@ -28,8 +28,8 @@
           {{ pill('info', 'this page · ' ~ row.bound_by) }}
           {% if settings.bindings_from_ui %}
           <span id="row-{{ loop.index }}" class="ml-2 inline-flex gap-3">
-            <button type="button" class="btn-link" hx-get="/ui/_/datasets/{{ row.id }}/edit" hx-target="#row-{{ loop.index }}" hx-swap="innerHTML">Edit</button>
-            <button type="button" class="btn-link text-bad" hx-post="/ui/_/datasets/{{ row.id }}/unbind" hx-target="#decision-error" hx-swap="innerHTML">Remove</button>
+            {% if row.named %}<button type="button" class="btn-link" hx-get="/ui/_/datasets/{{ row.id }}/edit" hx-target="#row-{{ loop.index }}" hx-swap="innerHTML">Edit</button>{% endif %}
+            <button type="button" class="btn-link text-bad" hx-get="/ui/_/datasets/{{ row.id }}/unbind" hx-target="#row-{{ loop.index }}" hx-swap="innerHTML">Remove</button>
           </span>
           {% endif %}{% endif %}
         </td>
