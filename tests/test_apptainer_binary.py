@@ -126,3 +126,15 @@ def test_the_rule_accepts_singularity(monkeypatch, singularity):
 def test_other_runners_get_the_agents_environment():
     from runner import SubprocessRunner
     assert SubprocessRunner().environment() is None
+
+
+def test_the_upgrade_note_quotes_the_message_the_agent_gives(monkeypatch):
+    import re
+    from pathlib import Path
+    note = (Path(__file__).resolve().parent.parent / "UPGRADING.md").read_text()
+    section = note[note.index("## Apptainer needs the path of its binary"):]
+    quoted = re.search(r"```\n(.+?)\n```", section).group(1)
+    monkeypatch.delenv("BIOCHEF_APPTAINER_BINARY")
+    with pytest.raises(ValueError) as refused:
+        ApptainerRunner()
+    assert str(refused.value) == quoted
