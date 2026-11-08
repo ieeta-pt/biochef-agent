@@ -414,3 +414,25 @@ def test_a_demo_event_carries_the_time_of_what_it_records(engine, trail):
         for event in approvals:
             row = session.get(Decision, event["decision_id"])
             assert event["at"] == row.at.isoformat()
+
+
+def test_the_runners_events_are_in_words_and_name_the_runner(engine, trail):
+    audit.record("node.runner.isolation_not_required", runner="subprocess", network="none",
+                 setting="BIOCHEF_REQUIRE_NETWORK_ISOLATION=false")
+    audit.record("node.runner.network_check", runner="podman", ok=True,
+                 detail="no route or address but loopback")
+    audit.record("node.runner.network_check", runner="podman", ok=False, detail="a route")
+    text = audit_text(engine)
+    assert "Network isolation turned off for the subprocess runner" in text
+    assert "podman network check passed" in text and "podman network check failed" in text
+    assert '<td class="mono">subprocess</td>' in text
+    assert text.count('<td class="mono">podman</td>') == 2
+    assert "node.runner" not in text
+
+
+def test_a_runner_event_without_its_fields_still_reads(engine, trail):
+    audit.record("node.runner.network_check")
+    audit.record("node.runner.isolation_not_required")
+    text = audit_text(engine)
+    assert "Runner network check failed" in text
+    assert "Network isolation turned off for the runner runner" in text
