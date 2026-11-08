@@ -649,6 +649,10 @@ A study version lists each member's keys next to an LS Login ID token. `node/ide
 
 The nonce that ties the token to the member's keys cannot be checked yet, because how the editor builds it is not defined. Until it is, a member whose token passes everything else still counts as not verified, with that reason shown on the page, so no real study version can be approved.
 
+## Upgrading
+
+`UPGRADING.md` says what an existing deployment has to change, and why, and `CHANGELOG.md` lists the changes. Read both before updating an agent that is already installed: since `BIOCHEF_REQUIRE_NETWORK_ISOLATION` became on by default, an agent that runs `subprocess` stops at start until its configuration says what it wants.
+
 ## Before deploying this
 
 **It is not ready to be exposed.** Several open issues describe defects reachable
