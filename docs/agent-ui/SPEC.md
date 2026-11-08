@@ -544,3 +544,143 @@ Still open. Ask `jorgeMFS` before building anything that depends on these.
 8. Formats the coordinator's agent API has to settle, assumed until then and listed in `node/verify.py` and `node/federation.py`: what a member's signature covers, what `payload_digest` covers, the payload's shape, and the signature and shape of the node list.
 9. Sending what waits in `outgoing_message` is part 8, and so is telling the requester which rules were not verified, if `ieeta-pt/biochef-coordinator#6` gets a field for it. `Partial` signs the statement but not its `decision`, so a withheld result is told apart by its empty `subject`.
 10. Member names from the `name` claim (7.3). This depends on `ieeta-pt/biochef-coordinator#6` carrying `binding_token` as it does now, and on the test with the mock AAI: the editor has to request the `profile` scope for the token to carry `name`.
+
+## 14. Runners, and how the agent meets a TRE's task engine
+
+Part 9 gave the agent runners. This section says what each one guarantees to the step it runs, adds a runner that hands steps to a Task Execution Service the TRE already has, adds an API that lets the TRE's own engines hand tasks to the agent, and compares the three ways of installing the agent in a TRE that runs a TES server such as Funnel. It names no TRE: what a TRE's TES server is configured to do is the operator's to say, and the agent never reads it.
+
+### 14.1 What each runner guarantees (part 9c)
+
+A runner says, for every step, three things, each with one of three values.
+
+| Aspect | Question |
+|---|---|
+| `network` | Can the step reach anything beyond loopback? |
+| `filesystem` | Can it see more than its own workspace and image? |
+| `environment` | Does it inherit the agent's environment? |
+
+| Value | Meaning |
+|---|---|
+| `enforced` | The agent applies it to every step, and a step it cannot apply it to fails |
+| `attested` | The operator says the backend applies it, and the agent cannot check |
+| `none` | Nobody applies it |
+
+| Runner | Network | Filesystem | Environment |
+|---|---|---|---|
+| `subprocess` | none | none | none |
+| `apptainer`, `singularity` | enforced by `--net --network none` in `BIOCHEF_APPTAINER_ARGS` | enforced by `--contain` or `--containall` | enforced by `--cleanenv` or `--containall` |
+| `podman` | enforced | enforced | enforced |
+| `tes` | attested, if `BIOCHEF_TES_ISOLATION=attested`, else none | the same | enforced |
+
+Rules:
+
+1. **`BIOCHEF_REQUIRE_NETWORK_ISOLATION`** is `true` when unset. On, the agent and the page refuse to start with a runner whose network is not `enforced`. An attested network does not count, because the rule exists for the case where nobody checks. Turning it off needs an explicit `false`, which the API process records at every start as `node.runner.isolation_not_required`, with the runner.
+2. **A network check runs at start** for a runner whose network is `enforced`: one step counts the routes and addresses besides loopback, read from `/proc/net` of its own network namespace, and there must be none. With `BIOCHEF_NETWORK_PROBE=host:port`, the agent first connects to it itself, and the step then tries as well, which must fail. The result is audited as `node.runner.network_check` and stored in `node_status`. A failed check stops the agent.
+3. **The Node screen** (8.7) shows the three values, the check at start (passed, failed, not yet) and whether isolation is required. This replaces the "Network isolation: off" text of 8.7 once the guarantees are read from the runner.
+
+Done when: a runner that is not `enforced` for the network does not start with the rule on, and a host where the flag is accepted and does nothing is found by the check, in CI, through every runner that claims it.
+
+### 14.2 The TES runner (part 9e)
+
+`BIOCHEF_RUNNER=tes` sends each step to a GA4GH TES server as one task. Snakemake stays on the agent's host. Snakemake has no TES mode, so `tes-step` is the shell its rules run under, as `podman-step` is for podman.
+
+What the agent keeps, because it can check it:
+
+| Kept | How |
+|---|---|
+| The image | Only `repository@sha256:<64 hex>` is accepted; a tag, a scheme or a short digest stops the agent |
+| The task | Built from the command and the image alone: no `env`, no credential, no stdin. The command is one argument of a fixed wrapper, never spliced into it |
+| The token | In a file only the agent's user can read, sent only in an `Authorization` header; no redirect is followed and the agent's proxy settings are not used. The URL is https, or http to this host |
+| What the server sees | A copy of the workspace without `Snakefile` and `.snakemake`, in a directory of its own under `BIOCHEF_TES_STAGING`. A link or special file in the workspace stops the step |
+| What comes back | The task hashes the workspace before and after and returns what changed with a manifest of SHA-256. The agent places a file only if every file is plain, the manifest and the files agree exactly, and no path leaves the workspace or names `Snakefile` or `.snakemake`. If one check fails, nothing from the step is placed |
+| Ownership | A server running as root returns files owned by root. `tes-step-root`, called through one sudo rule, gives the step's directory back to the agent; it has one command, `finish`, and works only two levels under `STAGING_ROOT` of `/etc/biochef-agent/tes-step.conf` |
+| A killed run | The group kill does not reach the server, so when a run ends the agent cancels the run's unfinished tasks by name prefix, waits for them and clears the staging |
+
+What it cannot keep: whether a task has a network, or sees more than its input, is the server's configuration. `BIOCHEF_TES_ISOLATION` (`attested` or `none`, required, no default) is the operator's statement, and the network and filesystem values follow it (14.1). The manifest is written by the same task as the files, so it shows that nothing changed on the way back and not that the step was honest.
+
+Settings, all required unless said, none with a default:
+
+| Variable | Meaning |
+|---|---|
+| `BIOCHEF_TES_URL` | Base URL of the server |
+| `BIOCHEF_TES_IMAGE` | The image, by digest |
+| `BIOCHEF_TES_AUTH` | `bearer` or `none` |
+| `BIOCHEF_TES_TOKEN_FILE` | With `bearer`: absolute path, mode 0600 |
+| `BIOCHEF_TES_CA` | Optional CA bundle |
+| `BIOCHEF_TES_STAGING` | A directory of the agent's that the server can read and write, at the same path |
+| `BIOCHEF_TES_HELPER` | The installed `tes-step-root` |
+| `BIOCHEF_TES_ISOLATION` | `attested` or `none` |
+
+Limits of this runner: each step costs a copy of the workspace by the agent and another by the server; a step's output arrives when its task ends, not as it is written; a file a step deletes is not deleted in the workspace; the image needs `bash`, `find`, `sha256sum`, `sort`, `comm` and `cp`.
+
+Done when: the parity workflow runs through a TES server running as root, the files come back owned by root and are the agent's after the helper, nine kinds of bad arrival are refused with nothing placed, a timed-out run leaves no task running, and no secret of the agent's is in any task posted. Not covered: a real Funnel. CI uses a stand-in that speaks the same exchange, and what Funnel does with `file://` directories is assumed, not checked (14.6).
+
+### 14.3 Singularity (part 9d)
+
+`BIOCHEF_RUNNER=singularity` is the apptainer runner with SingularityCE: the same flags, the same `BIOCHEF_APPTAINER_ARGS`, the same guarantees (14.1).
+
+- `BIOCHEF_APPTAINER_BINARY`, the absolute path of the binary, is required with `apptainer` and `singularity`. Snakemake has no setting for the binary: it runs `apptainer` if `shutil.which` finds one and `singularity` otherwise, and apptainer's packages install a `singularity` that is apptainer.
+- The agent runs the binary with `--version` at start and refuses to start unless it says `apptainer version` or `singularity-ce version`, matching the runner. Old Sylabs Singularity says `singularity version` and is refused.
+- Snakemake gets a `PATH` whose first entry is a directory of the agent's own, made once, mode 0700, holding one link named `apptainer` to the configured binary.
+- Existing `apptainer` deployments must set `BIOCHEF_APPTAINER_BINARY`; the agent says so at start rather than guessing.
+
+Done when: CI installs SingularityCE from its published package, checked against its digest, and runs the parity workflow and the network check as a user that is not root, once with the setuid starter and once with `allow setuid = no`.
+
+### 14.4 The TES API (part 9f)
+
+`python -m tesapi` is a listener of its own that lets the TRE's workflow engines send the node a TES task. It is not routes on the agent's API: the API's callers are federations and editors, these are the TRE's own tools, and the two share no credential, queue, slot or port. It never opens the node's database.
+
+A task is one command in one image, with files in and out. It becomes a Snakefile of one rule and runs through `BIOCHEF_RUNNER`, so it gets that runner's guarantees (14.1) and the same isolation rule and check at start. It runs in a workspace of its own, which is removed.
+
+It refuses first:
+
+| Refusal | Rule |
+|---|---|
+| No token | Every route needs `Authorization: Bearer`, service-info included. Tokens are SHA-256 in `BIOCHEF_TESAPI_TOKENS` (mode 0600), made with `python -m tesapi token <name>`. There is no way to turn authentication off, and no `/docs` or `openapi.json` |
+| Off this host without TLS | `BIOCHEF_TESAPI_TLS_CERT` and `BIOCHEF_TESAPI_TLS_KEY` are required unless it listens on loopback |
+| An image not listed | `BIOCHEF_TESAPI_IMAGES`, each by digest; no tag, no second executor. The listener does not start if the runner cannot run a listed image (`subprocess` runs none; rootful podman runs only the image of its configuration) |
+| A URL that is not `file://` | Only `file://` on this host |
+| A path not in a listed directory | `BIOCHEF_TESAPI_DIRS`; paths are normal, absolute and behind no symlink |
+| The node's own data | The listener does not start if a listed directory contains or lies inside `BIOCHEF_LOCAL_ROOT` (where studies' datasets are bound), `BIOCHEF_RUN_ROOT`, the audit log, the database file, the node's keys, `BIOCHEF_TES_STAGING`, the token and TLS files or the apptainer cache. Each task is checked against the same list again |
+| Anything of the caller's in the step | `env`, `stdin`, `stdout`, `stderr`, `volumes`, `resources` and anything not understood are refused, not ignored |
+| A full queue | `BIOCHEF_TESAPI_MAX_CONCURRENT` (1) run, `BIOCHEF_TESAPI_MAX_QUEUED` (16) wait, and the next gets 503. Neither is the agent's `BIOCHEF_MAX_CONCURRENT_RUNS` or a request the coordinator sent; the machine's CPU and memory are still shared |
+| Too many bytes | `BIOCHEF_TESAPI_MAX_BYTES` (1 GiB) in and out together, and `BIOCHEF_TESAPI_TIMEOUT` (900 s) |
+| An unrecordable task | `BIOCHEF_AUDIT_LOG` is required, and a task is refused with 503 if its event cannot be written |
+
+Audit events carry `"source": "tes"`: `tes.start`, `tes.task.created` (image, URLs, a SHA-256 of the command and never the arguments), `tes.task.state` at every state, `tes.task.refused`, and `tes.auth.refused`, written at most once a second with the count of those not written. A task is written to no `run_summary`, so it appears on no screen of the page: it is not a request.
+
+Narrower than TES: one executor; `command` is a list of arguments; paths are `/work/<file>`, and the command runs in the workspace, so an argument that starts with `/work` is written as the workspace's path and a path inside a shell script is not; `exit_code` is Snakemake's, so a failure is 1 and the tool's message is in `stderr`; logs arrive when the task ends; tasks are in memory, so a restart forgets them, and a caller sees only its own; a `DIRECTORY` output is merged into the destination.
+
+Done when: every refusal above has a test and a deliberate defect that breaks it; CI runs the listener in front of rootless podman and shows the step ran in the image, without the datasets, the agent's environment or a network, that the output is the agent's, that each refusal answers, and that the trail has the events with source `tes` and no secret.
+
+### 14.5 Installing the agent in a TRE that runs a TES server such as Funnel
+
+The same agent can be installed three ways. Nothing in the agent changes between them but which runner and which listener are on.
+
+| | Beside Funnel | Sending through Funnel | In place of Funnel |
+|---|---|---|---|
+| What it is | The agent runs its own steps with its own runner; Funnel runs the TRE's other jobs, untouched | The agent runs Snakemake and sends each step to Funnel as a task | The TRE's engines send their tasks to the agent's TES API, and Funnel is not used for them |
+| Federated steps run by | `apptainer`, `singularity` or `podman` | Funnel (`BIOCHEF_RUNNER=tes`) | The agent's runner |
+| The TRE's own tasks run by | Funnel | Funnel | The agent's runner, through `python -m tesapi` |
+| Network, filesystem, environment of a federated step | enforced, enforced, enforced | attested, attested, enforced | enforced, enforced, enforced |
+| Same for the TRE's own tasks | Funnel's (not the agent's to say) | Funnel's | enforced, enforced, enforced |
+| What the operator must attest | Nothing | That Funnel gives a task no network and only its input; its `file://` access should also be limited to the staging directory | Nothing |
+| What the agent still checks | The network, at start | The image digest, an empty task, the digests of everything that comes back, the ownership of the files | The network at start; images, directories, tokens and the node's data on every task |
+| Isolation rule | Passes | Needs `BIOCHEF_REQUIRE_NETWORK_ISOLATION=false`, audited at every start | Passes |
+| The TRE has to provide | A container runtime the agent's user can use, as in 9 and 14.3 | A directory both can read and write at the same path; the helper and its sudo rule if Funnel runs as root; an image with the tools of 14.2; a token | A container runtime as in the first column; the engines pointed at the agent's URL with a token; the exchange directories |
+| Cost | Two systems share the machine with no shared limits: the agent's slots and step limits do not know Funnel's | The workspace is copied twice per step; output arrives at the end; every federated step waits in Funnel's queue | Whatever the TRE's tasks need beyond the narrow subset of 14.4 cannot run: several executors, `env`, volumes, resources, other storage schemes. One node, and tasks are forgotten on restart |
+| Records | The agent's trail and Funnel's, separately | The agent's trail for the run and Funnel's for each task | One trail, with `"source": "tes"` on the TRE's tasks |
+| Fits when | The TRE keeps Funnel for its own work and the node must give federated steps the strongest guarantees the agent can check | The TRE wants one scheduler and one place for resource accounting, and accepts an operator's word about its isolation | The TRE's tasks are simple, and it wants them to run under the same guarantees as federated steps |
+
+The first is the one that needs no decision about Funnel and loses no guarantee. The second is the only one where a federated step runs with a guarantee the agent cannot check, which is why it needs the rule turned off in writing. The third is the only one where the TRE's tasks get the agent's guarantees, and it pays for it in what a task may ask for.
+
+### 14.6 Open
+
+Ask `jorgeMFS` before building anything that depends on these.
+
+1. Whether Funnel takes a `DIRECTORY` input and a `DIRECTORY` output over `file://`, filters its task list by `name_prefix`, and runs the first executor with the input directory writable at its `path`. The TES runner needs all three and has been tested only against a stand-in written from the TES 1.1 specification.
+2. A TES API with separate lists of directories to read from and to write to. Today one list serves both, so a task can write into a directory it reads from.
+3. A persistent task store for the TES API, so that a restart does not forget tasks. Today it is in memory, like the agent's runs.
+4. Client certificates for the TES runner and the TES API. Today the credential is a bearer token over https, or http on loopback.
+5. Whether the TES API may run several executors in one task, which needs a runner that can say which executor's output is which.
+6. A TES runner that mounts the workspace instead of copying it, for a TES server on the same host. It would save the two copies, and give the server access to the whole workspace.
