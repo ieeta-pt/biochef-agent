@@ -334,14 +334,20 @@ def _study_card(session, study_id, selected):
     main = _main_version(versions)
     if main is None or main.state == VersionState.REFUSED.value:
         return None
-    workflows = [row for row in repo.workflow_versions(session, main.id)
-                 if row.state == VersionState.APPROVED.value]
+    listed = repo.workflow_versions(session, main.id)
+    workflows = [row for row in listed if row.state == VersionState.APPROVED.value]
+    unreviewed = [row for row in listed if row.state == VersionState.PENDING.value]
     requests = repo.count_requests_of_study(session, study_id)
     waiting = next((row for row in versions
                     if row.state == VersionState.PENDING.value), None)
     if main.state == VersionState.APPROVED.value:
-        note = (f'{compare.plural(len(workflows), "workflow")} · '
-                f'{compare.plural(requests, "request")}')
+        # The Workflows tab counts every version of the study, so a version still
+        # waiting for review is said here too, or the two numbers would disagree.
+        parts = [f'{compare.plural(len(workflows), "workflow")} approved']
+        if unreviewed:
+            parts.append(f"{len(unreviewed)} waiting")
+        parts.append(compare.plural(requests, "request"))
+        note = " · ".join(parts)
     else:
         note = (f"{STATE_LABELS[main.state]} {fmt.day(main.state_changed_at)}, "
                 f"kept for the audit log")
