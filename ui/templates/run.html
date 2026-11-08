@@ -21,6 +21,7 @@
 <section aria-label="Steps" class="card overflow-x-auto p-4">
   <div class="flex min-w-max items-center gap-3">
     {% for step in detail.steps %}
+    {% if not loop.first %}<svg width="28" height="10" viewBox="0 0 28 10" aria-hidden="true" class="shrink-0 text-muted"><line x1="0" y1="5" x2="22" y2="5" stroke="currentColor" stroke-width="1.5"/><path d="M22 1l5 4-5 4z" fill="currentColor"/></svg>{% endif %}
     <div class="pill-{{ step.pill }} flex min-w-32 flex-col gap-0.5 rounded-control px-3 py-2 text-[13px]"><span class="font-medium">{{ step.id }}</span><span class="text-xs">{{ step.state }}{% if step.time %} · {{ step.time }}{% endif %}</span></div>
     {% else %}
     <span class="text-sm text-muted">No step has started yet.</span>
