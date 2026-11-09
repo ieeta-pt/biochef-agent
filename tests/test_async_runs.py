@@ -140,19 +140,21 @@ def service(tmp_path, monkeypatch):
     convert.tools.clear()
 
 
-def _bare_request(caller=None, authenticated_by=None):
+def _bare_request(request_id=None, caller=None, authenticated_by=None):
     """A real Request for the two tests that call submit_run directly.
 
-    The handler takes one because the audit trail records who asked (#19), and
-    these two bypass fastapi's dependency resolution -- so the request is theirs
-    to supply. A real Request rather than a stub, so they break if the way the
-    caller is read changes, which is the point of them.
+    The handler takes one so it can read the id RequestIdMiddleware validated
+    (#84) and the caller the audit trail records (#19), and these two bypass
+    fastapi's dependency resolution -- so the request is theirs to supply. A
+    real Request rather than a stub, so they break if the way either is read
+    changes, which is the point of them.
     """
     from starlette.requests import Request
 
     return Request({
         "type": "http", "method": "POST", "path": "/runs", "headers": [],
-        "state": {"caller": caller, "authenticated_by": authenticated_by},
+        "state": {"request_id": request_id, "caller": caller,
+                  "authenticated_by": authenticated_by},
     })
 
 
@@ -465,7 +467,7 @@ def test_full_store_refuses_before_upload_is_read(service, monkeypatch):
     accepted = store.create()
     monkeypatch.setattr(main, "RUNS", store)
     with pytest.raises(HTTPException) as refused:
-        asyncio.run(main.submit_run(_bare_request("someone"), WORKFLOW,
+        asyncio.run(main.submit_run(_bare_request(request_id="hub-7", caller="someone"), WORKFLOW,
                                     [UnreadUpload()]))
     assert refused.value.status_code == 503
     assert store.get(accepted.run_id).state is RunState.QUEUED
