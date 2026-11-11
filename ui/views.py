@@ -775,7 +775,7 @@ def _coordinator_card(session, settings, now):
 def _federation_card(session):
     latest = repo.latest_federation_list(session)
     if latest is None:
-        return {"kind": "mute", "headline": "No signed node list yet", "detail": None}
+        return {"kind": "mute", "headline": "No signed site list yet", "detail": None}
     return {"kind": "ok", "headline": "Up to date",
             "detail": f'{compare.plural(len(latest.nodes), "node")} · list v{latest.version}'}
 

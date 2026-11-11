@@ -536,7 +536,7 @@ Everything the page loads is served by the agent: htmx, the fonts and the styles
 
 ## The Node screen
 
-The Node screen shows the keys' fingerprints, the node list, the coordinator, the runner and the settings, all read only, and the newest 50 events of the audit trail. "Export" downloads the whole trail. The page process reads the file itself, and the API still has no route to it.
+The Node screen shows the keys' fingerprints, the site list, the coordinator, the runner and the settings, all read only, and the newest 50 events of the audit trail. "Export" downloads the whole trail. The page process reads the file itself, and the API still has no route to it.
 
 A decision's audit event is written before its transaction commits, so a commit that fails leaves an event for a decision that does not exist. The screen crosses the trail with the `decision` table and lists any such event. Nothing repairs the trail. An event is matched on its decision id, subject, action and user, and one followed by an undo is accounted for.
 
