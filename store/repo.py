@@ -717,7 +717,7 @@ def dataset_bindings(session):
                              .order_by(DatasetBinding.dataset_id)))
 
 
-# Federation node list and coordinator status
+# Site list and coordinator status
 
 
 def latest_federation_list(session):
@@ -726,7 +726,7 @@ def latest_federation_list(session):
 
 
 def store_federation_list(session, *, version, raw, signature, nodes, now=None):
-    """Keep a signed node list, refusing one older than the newest stored.
+    """Keep a signed site list, refusing one older than the newest stored.
 
     Going backwards is how a removed node would come back. Verifying the
     signature is the caller's job; this only keeps what passed.
@@ -734,11 +734,11 @@ def store_federation_list(session, *, version, raw, signature, nodes, now=None):
     latest = latest_federation_list(session)
     if latest is not None:
         if version < latest.version:
-            raise StaleList(f"node list v{version} is older than "
+            raise StaleList(f"site list v{version} is older than "
                             f"v{latest.version}")
         if version == latest.version:
             if raw != latest.raw:
-                raise Conflict(f"node list v{version} differs from the one stored")
+                raise Conflict(f"site list v{version} differs from the one stored")
             return latest
     row = FederationList(version=version, raw=raw, signature=signature,
                          nodes=nodes, received_at=now or utcnow())
