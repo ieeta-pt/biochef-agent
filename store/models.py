@@ -24,8 +24,8 @@ from sqlmodel import Field, Session, SQLModel
 
 from store.errors import ImmutableField
 from store.states import (Action, BindingSource, EgressState, MessageKind,
-                          RecipientsMode, RefusalCode, SubjectType, VersionState,
-                          Verdict)
+                          RefusalCode, ResultRecipients, SubjectType,
+                          VersionState, Verdict)
 
 # Named constraints, because SQLite can only alter a table by rebuilding it and
 # Alembic needs the names to do that.
@@ -92,7 +92,7 @@ class StudyVersion(SQLModel, table=True):
         UniqueConstraint("study_id", "version"),
         UniqueConstraint("digest"),
         _one_of("state", VersionState),
-        _one_of("recipients_mode", RecipientsMode),
+        _one_of("result_recipients", ResultRecipients),
         # Only one approved version of a study at a time. Here as well as in the
         # code, because this is the rule the whole key replacement story rests
         # on, and a race between two writers must not be able to break it.
@@ -113,7 +113,7 @@ class StudyVersion(SQLModel, table=True):
     nodes: List[Any] = _json()
     datasets: List[str] = _json()
     output_rules: Dict[str, Any] = _json()
-    recipients_mode: str = RecipientsMode.REQUESTER.value
+    result_recipients: str = ResultRecipients.SUBMITTER.value
     received_at: datetime = _moment(nullable=False)
     state: str = VersionState.PENDING.value
     state_changed_at: datetime = _moment(nullable=False)

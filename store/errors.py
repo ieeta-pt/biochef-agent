@@ -26,7 +26,7 @@ class AlreadyPosted(StoreError):
 
 
 class StaleList(StoreError):
-    """A federation node list older than the newest one stored."""
+    """A site list older than the newest one stored."""
 
 
 class ImmutableField(StoreError):
