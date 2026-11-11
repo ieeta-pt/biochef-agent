@@ -785,6 +785,11 @@ def convert_to_snakemake(workflow: Workflow, step_logs=None):
             # Omit empty typed values with their flags, matching the browser.
             if param.type not in (None, "flag") and param.value == "":
                 continue
+            # A flag ending in "=" (lastz's --format=) takes its value in the
+            # same argument, as the browser runs it.
+            if param.flag and param.flag.endswith("=") and param.type != "flag":
+                cmd.append(sh_literal(f"{param.flag}{param.value}"))
+                continue
             if param.flag:
                 cmd.append(sh_literal(param.flag))
 
