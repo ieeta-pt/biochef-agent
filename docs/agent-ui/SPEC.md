@@ -68,7 +68,7 @@ LS Login ──ID token──► Editor (member's browser, biochef-app)
 3. Watches what the agent did with **requests** (accepted, refused with a reason, joined to an existing run).
 4. Follows each **run** (steps, logs, manifest) and, when the node is configured for it, **releases or withholds** outputs.
 5. **Binds datasets** named by studies to data on this node, when the node allows bindings from the page.
-6. Reads the **node's state**: keys, federation node list, coordinator connection, runner, settings, audit log.
+6. Reads the **node's state**: keys, site list, coordinator connection, runner, settings, audit log.
 
 Requests are never approved one by one. The agent checks each request itself (section 6.3).
 
@@ -171,7 +171,7 @@ node/
   requests.py       # receive a request, check it once, record the verdict
   age.py            # age-x25519 with the node key
   datasets.py       # dataset bindings (section 6.6)
-  federation.py     # the signed node list (section 7.4)
+  federation.py     # the signed site list (section 7.4)
   egress.py         # egress pipeline (section 6.5)
   runtime.py        # the API process's side of the database channel (section 3.1)
 ```
@@ -230,7 +230,7 @@ Field names follow `ieeta-pt/biochef-coordinator#6` wherever a field comes from 
 | Table | Key fields |
 |---|---|
 | `study` | `id` (`study_id` from the document), `title` (empty until the document carries one, section 13), `created_at` |
-| `study_version` | `id`, `study_id`, `version` (int), `digest`, `previous_digest`, `raw`, `goal`, `proposer`, `members` (json), `nodes` (json, `StudyNode`), `datasets` (json, this node's dataset ids), `output_rules` (json: `aggregates_only`, `min_count`, `types`, `max_bytes`), `recipients_mode`, `received_at`, `state` (6.2), `state_changed_at` |
+| `study_version` | `id`, `study_id`, `version` (int), `digest`, `previous_digest`, `raw`, `goal`, `proposer`, `members` (json), `nodes` (json, `StudyNode`), `datasets` (json, this node's dataset ids), `output_rules` (json: `aggregates_only`, `min_count`, `types`, `max_bytes`), `result_recipients` (`submitter` or `all_members`), `received_at`, `state` (6.2), `state_changed_at` |
 | `member_key` | `study_version_id`, `member`, `ls_aai_id`, `signing_key` (P-256 JWK as json), `result_key` (age public key), `binding_token`, `identity_verified` (bool), `identity_error`, `display_name` (the `name` claim of the verified token, section 7.3) |
 | `workflow_version` | `id`, `study_id`, `study_version_id`, `digest`, `raw`, `name`, `version` and `workflowhub_id` (null unless a library workflow), `steps` (json: id, `repo`, digest, signature status, `paramValues`), `received_at`, `state`, `state_changed_at` |
 | `decision` | `id`, `subject_type` (`study_version`, `workflow_version`, `request`, `run`, `egress`, `dataset_binding`), `subject_id`, `subject_hash`, `action` (`approve`, `refuse`, `withdraw`, `release`, `withhold`, `bind`, `unbind`, `cancel`), `user`, `comment`, `dac_confirmed`, `reason`, `at`, `object_raw`, `signature`, `posted_to_coordinator_at` |
@@ -314,7 +314,7 @@ COMPLETE run
    └── manual mode:  2b wait for the data manager: Release (passing files) or Withhold
                      egress_state: awaiting_review → released | withheld (signed decision)
    ▼
-3 released: encrypt with `age-x25519` for the study's recipients, sign the ciphertext with the node key, bind it to the request
+3 released: encrypt with `age-x25519` for the study's result recipients, sign the ciphertext with the node key, bind it to the request
    ▼
 4 post to the coordinator    egress_state: sent
 
@@ -324,7 +324,7 @@ withheld: at the moment of withholding, a signed notice with no files is kept in
 
 - `egress_state` values: `not_ready`, `rules_pending`, `awaiting_airlock`, `awaiting_review`, `released`, `withheld`, `sent`.
 - Files held back by the output rules never leave, in either mode.
-- **Result document**: follow `Partial` and its in-toto `Statement` in `ieeta-pt/biochef-coordinator#6`. Keep `recipients_mode`, but implement only `requester` for now: #6 has only the submitter, and `all_members` is being raised there.
+- **Result document**: follow `Partial` and its in-toto `Statement` in `ieeta-pt/biochef-coordinator#6`. `result_recipients` says who a result is encrypted for: `submitter` (the member who submitted the request) or `all_members` (every member of the study version). Implement only `submitter` for now: #6 has only the submitter, and `all_members` is being raised there. A study version with any other value is refused when it is stored.
 - **Retention changes**: today `retention.py` starts the `BIOCHEF_KEEP_OUTPUTS` clock (default 3600 s) when the run ends, and `BIOCHEF_MAX_RETAINED_RUNS` evicts by age. An airlock review can take longer, so outputs would be deleted before egress. Change it so the clock starts when `egress_state` reaches `sent` or `withheld`. A run waiting for egress counts as active: it is never evicted, and when every slot is active new runs get 503, as the store already does. Retained workspaces are in memory, so after a restart the API process rebuilds them from `run_summary.workspace_path`.
 - **Withheld results**: the requester is told. The `Partial` with `decision: withheld`, an empty `subject` and no ciphertext is built and signed when the result is withheld, by a person or by the airlock, and stored as an `outgoing_message`, so what goes out is what was decided then. Undo of a withholding deletes the notice while it is unsent, and is refused once it has gone. `egress_state` stays `withheld`.
 - The airlock interface is TRE specific. Define a small `Airlock` protocol (`submit(files, unverified) -> ticket`, `status(ticket) -> pending|released|withheld`) with a `FakeAirlock` for tests. **Blocked** until the TRE's interface is known.
@@ -374,16 +374,16 @@ For each member listed in a study version the agent checks `binding_token`, the 
 1. Signed by LS Login (issuer `BIOCHEF_LS_LOGIN_ISSUER`, keys from its JWKS; reuse the fetching and retry pattern of `passports.py`).
 2. Audience is the editor's LS Login client (`BIOCHEF_EDITOR_CLIENT_ID`).
 3. The token names the member.
-4. The token's `nonce` equals the hash of the member's two public keys (`signing_key` and `result_key`; exact construction from the editor; **blocked** on biochef-app). This check stays closed: until the construction is defined, a member whose token passes every other check still counts as not verified, with that reason in `identity_error`, and no name is stored.
+4. The token's `nonce` equals the SHA-256 of the member's two public keys (`signing_key` and `result_key`) in RFC 8785 form. This check stays closed until the exact bytes (the object that is canonicalised, and how the digest is written in the nonce) are written in `ieeta-pt/biochef-infra` `docs/identity.md`; then it is implemented against that text, with a test vector taken from it, and opened. Until then a member whose token passes every other check still counts as not verified, with that reason in `identity_error`, and no name is stored.
 5. Expired tokens are accepted only if signed with a past LS Login key in the federation's signed key list. Until that list exists, accept only unexpired tokens and say so on the page.
 
-**Member names.** A name comes only from the `name` claim of `binding_token`, read after the checks above pass, and is stored as `member_key.display_name`. The token's `sub` must equal the member's `ls_aai_id`. If the claim is missing, show the shortened `ls_aai_id`. A failed check leaves no name. No other source is accepted, including anything in the study document.
+**Member names.** The editor requests the member token with the scope `openid profile`, so that it carries `name`. A name comes only from the `name` claim of `binding_token`, read after the checks above pass, and is stored as `member_key.display_name`. The token's `sub` must equal the member's `ls_aai_id`. If the claim is missing, show the shortened `ls_aai_id`. A failed check leaves no name. No other source is accepted, including anything in the study document.
 
 The page shows only "✓ identity verified" or "✗ identity not verified" per member, with keys behind "Show keys". Keys stay reachable because a data manager needs to see which key was there when an identity check fails.
 
-### 7.4 Federation node list
+### 7.4 Site list
 
-`BIOCHEF_FEDERATION_KEY` (public key that signs the node list) and the current list from the coordinator. Refuse older list versions than the one stored. Node page shows "Up to date · N nodes".
+`BIOCHEF_FEDERATION_KEY` (public key that signs the site list) and the current list from the coordinator. Refuse older list versions than the one stored. Node page shows "Up to date · N nodes".
 
 ## 8. Screens
 
@@ -393,7 +393,7 @@ Each screen below lists its route, what it reads, what it can do, and its states
 
 - Left: cards for every `pending` study version and workflow version, newest first. Card shows kind label, received time, name and version, one line summary of what changed, and a pill: "Re-approval needed" (new version of an approved study), "New" (new study), "New workflow version", or "Check failed · cannot be approved".
 - Clicking a study card loads its detail on the right (`hx-get="/ui/_/inbox/study/{id}"`, `hx-target="#detail"`, `hx-push-url`). A workflow card goes to the Workflow screen.
-- Study detail: compared with the approved version (link), "Proposed by <proposer>" pill (no tick: nothing verifies the signature yet, section 13), Members (name, role, "+" for new, identity status, "Show keys" toggle), Datasets on this node (binding status, required visa), Nodes (all on the signed node list), Result recipients, Output rules (diff against approved version in mono, red removed, green added, plus the Policy Engine verdict line with link), the DAC tick, optional comment, buttons **Approve and sign** and **Refuse and sign**, and the line "Approving v3 supersedes v2. Only one version of a study is valid at a time."
+- Study detail: compared with the approved version (link), "Proposed by <proposer>" pill (no tick: nothing verifies the signature yet, section 13), Members (name, role, "+" for new, identity status, "Show keys" toggle), Datasets on this node (binding status, required visa), Nodes (all on the signed site list), Result recipients, Output rules (diff against approved version in mono, red removed, green added, plus the Policy Engine verdict line with link), the DAC tick, optional comment, buttons **Approve and sign** and **Refuse and sign**, and the line "Approving v3 supersedes v2. Only one version of a study is valid at a time."
 - After a decision: the detail is replaced by a status line ("v3 approved and signed. v2 was superseded at the same time; its runs and logs stay in the study history.") with **Undo before the next poll**, which is allowed only while the decision has not been posted (`posted_to_coordinator_at` is null). Undo deletes the unsent decision and writes an audit event.
 - Failed identity: red alert naming the member, Approve disabled (`disabled` attribute, not hidden), Refuse available.
 - Empty state: "Nothing is waiting for this node."
@@ -475,7 +475,7 @@ All read with `os.getenv`, all in `README.md` and `example.env` (test enforced).
 | `BIOCHEF_DATASET_BINDINGS_FILE` | none | 5 | YAML bindings from config |
 | `BIOCHEF_DATASET_BINDINGS_FROM_UI` | `false` | 5 | Allow bindings from the page |
 | `BIOCHEF_EGRESS_MODE` | none, required by the UI | 7 | `airlock` or `manual` |
-| `BIOCHEF_FEDERATION_KEY` | none, required | 7.4 | Public key that signs the node list |
+| `BIOCHEF_FEDERATION_KEY` | none, required | 7.4 | Public key that signs the site list |
 | `BIOCHEF_PODMAN_SELINUX` | none, required with `BIOCHEF_RUNNER=podman` | 9 | `disable`: steps run without SELinux separation and the workspace is mounted as it is. `keep`: podman's labels stay on, so on an enforcing host `BIOCHEF_RUN_ROOT` must carry a label containers may use (`container_file_t`). No default, because it depends on the host |
 | `BIOCHEF_COORDINATOR_URL` | none, required | 8 | Coordinator base URL |
 | `BIOCHEF_COORDINATOR_POLL_SECONDS` | `30` | 8 | Poll interval |
@@ -508,8 +508,8 @@ Each part is one PR. Do them in this order unless `jorgeMFS` says otherwise. Par
 | 6 | **Request checks** (`node/verify.py`) and Requests screen | 1, 2, 5, fixtures of the request format | One test per check row of 6.3 and for the join; screen 04 matches section 0.1 |
 | 7 | **Run screen and egress**: `run_summary` written from run state changes, with step times and log tails, `cancel_requested` read by the API process, logs and manifest tabs, egress pipeline both modes with fakes, cancel, retention change | 4, 6 | Retention starts at `sent` or `withheld`, and survives a restart of the API process (tested); a run waiting for egress is never evicted (tested); manual Release and Withhold are signed; airlock mode shows the airlock state; optional Playwright test of the approve and release flow |
 | 7b | **Node screen**: the cards, settings, audit log and audit check of 8.7 | 1, 2, 3 | Screen 07 matches section 0.1; audit export works; the API app gains no audit route; the audit check is tested for a failed commit, an undone decision and an id reused after a rollback |
-| 7.4 | **Federation node list** (7.4): check the list's signature with `BIOCHEF_FEDERATION_KEY`, refuse older versions | 1, 7b | Bad signature and older version refused; the Node card shows "Up to date · N nodes" |
-| 8 | **Coordinator client**: poll over mTLS in the API process, fetch study versions, workflow versions, requests and the federation node list; post decisions and results | The agent API in `biochef-coordinator` | Integration test against the coordinator running locally with `docker compose` |
+| 7.4 | **Site list** (7.4): check the list's signature with `BIOCHEF_FEDERATION_KEY`, refuse older versions | 1, 7b | Bad signature and older version refused; the Node card shows "Up to date · N nodes" |
+| 8 | **Coordinator client**: poll over mTLS in the API process, fetch study versions, workflow versions, requests and the site list; post decisions and results | The agent API in `biochef-coordinator` | Integration test against the coordinator running locally with `docker compose` |
 | 9 | **Podman runner** (**parallel**) in `runner.py`, same seam as `apptainer`, steps with `--network=none`. Snakemake has no podman mode, so `podman-step` is the shell its rules run under | nothing | `ci/runner_parity.py` extended to `podman` and passing (same result, step not on the host, neighbours hidden, environment not inherited); documented in README |
 | 9b | **Network isolation for apptainer** (**parallel**) | nothing | `ci/runner_parity.py` proves a step cannot reach the network; the Node card shows it on |
 
@@ -523,7 +523,7 @@ Taken:
 |---|---|
 | Workflow approvals on a new study version | Approved again (6.2.7) |
 | DAC tick | Stays (6.2.4) |
-| Field names and formats | `ieeta-pt/biochef-coordinator#6`, except that `recipients_mode` stays (6.5) |
+| Field names and formats | `ieeta-pt/biochef-coordinator#6`, except that `result_recipients` stays (6.5) |
 | Where the agent runs | On the same machine as the jobs (3.1) |
 | Expired ID tokens | Unexpired only, until the signed list of past LS Login keys exists (7.3.5) |
 | Who may undo a decision before the next poll | Anyone signed in, audited |
@@ -538,15 +538,15 @@ Taken:
 Still open. Ask `jorgeMFS` before building anything that depends on these.
 
 1. The agent API of the coordinator, including the decision format (7.2).
-2. The editor's exact nonce construction for member keys (7.3.4). Until it is defined the check stays closed, so no real member counts as verified and no real study version can be approved.
+2. The exact bytes of the nonce for member keys (7.3.4): SHA-256 of the two keys in RFC 8785 form is decided, and the exact bytes go in `ieeta-pt/biochef-infra` `docs/identity.md`. Until they are written there the check stays closed, so no real member counts as verified and no real study version can be approved.
 3. The TRE airlock interface (6.5).
 4. Who holds the signed list of past LS Login keys, and how nodes get it (7.3.5).
-5. `all_members` as a recipients mode in `ieeta-pt/biochef-coordinator#6` (6.5).
+5. `all_members` as a value of `result_recipients` in `ieeta-pt/biochef-coordinator#6` (6.5).
 6. A `title` field on `StudyVersion` in `ieeta-pt/biochef-coordinator#6`. Until then the page shows `study_id` and the first line of `goal`, and `study.title` stays empty (6.7).
 7. A signer for workflows in `ieeta-pt/biochef-coordinator#6`, and verification of the proposer's signature on a study version. Until both exist the page shows "Proposed by" and no tick.
-8. Formats the coordinator's agent API has to settle, assumed until then and listed in `node/verify.py` and `node/federation.py`: what a member's signature covers, what `payload_digest` covers, the payload's shape, and the signature and shape of the node list.
+8. Formats the coordinator's agent API has to settle, assumed until then and listed in `node/verify.py` and `node/federation.py`: what a member's signature covers, what `payload_digest` covers, the payload's shape, and the signature and shape of the site list.
 9. Sending what waits in `outgoing_message` is part 8, and so is telling the requester which rules were not verified, if `ieeta-pt/biochef-coordinator#6` gets a field for it. `Partial` signs the statement but not its `decision`, so a withheld result is told apart by its empty `subject`.
-10. Member names from the `name` claim (7.3). This depends on `ieeta-pt/biochef-coordinator#6` carrying `binding_token` as it does now, and on the test with the mock AAI: the editor has to request the `profile` scope for the token to carry `name`.
+10. Member names from the `name` claim (7.3). The member token's scope is `openid profile`, so the token carries `name`. This depends on `ieeta-pt/biochef-coordinator#6` carrying `binding_token` as it does now, and on the test with the mock AAI.
 
 ## 14. Runners, and how the agent meets a TRE's task engine
 
