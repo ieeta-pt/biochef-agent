@@ -51,7 +51,7 @@ def verifier(**options):
 
 
 def opened(claims, key):
-    """Stands in for the nonce check the editor has not defined."""
+    """Stands in for the nonce check, closed until its bytes are written."""
 
 
 @pytest.fixture
