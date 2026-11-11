@@ -16,6 +16,7 @@ from intermediate import IO, IOMode, Node, Param, Workflow
 
 from dotenv import load_dotenv
 
+import catalog
 import signing
 import evidence_verification
 from workspace import UnsafeName, check_name
@@ -328,6 +329,42 @@ def fetch_manifest(target):
     return json.loads(body), digest, body
 
 
+_catalogs = {}
+_catalogs_guard = threading.Lock()
+
+
+def _fetch_catalog_blob(target, digest):
+    response = client.get_blob(client.get_container(target), digest)
+    if response.status_code != 200:
+        raise catalog.CatalogError(
+            f"{target}: the registry answered {response.status_code} for a catalog layer"
+        )
+    return response.content
+
+
+def pin_through_catalog(repo):
+    """The reference to fetch, as the signed catalog decides it.
+
+    Before anything else in fetch_tool, so neither the strict-mode check nor
+    the manifest fetch ever sees a tag the registry could have moved. One
+    Catalog per registry and cache directory, so its refresh interval and its
+    recorded sequence belong to the registry they describe.
+    """
+    if catalog.mode() == catalog.OFF:
+        return repo
+    with _catalogs_guard:
+        key = (REGISTRY_URL, TOOL_CACHE)
+        current = _catalogs.get(key)
+        if current is None:
+            current = _catalogs[key] = catalog.Catalog(
+                REGISTRY_URL,
+                lambda target: fetch_manifest(target),
+                lambda target, digest: _fetch_catalog_blob(target, digest),
+                TOOL_CACHE,
+            )
+    return current.pin(repo)
+
+
 def fetch_tool(tool_id, repo):
     """Pull a bundle into the shared cache and return it.
 
@@ -339,6 +376,7 @@ def fetch_tool(tool_id, repo):
     tool_id = check_name(tool_id.split("-")[0])
 
     outdir = os.path.join(TOOL_CACHE, tool_id)
+    repo = pin_through_catalog(repo)
     target = f"{REGISTRY_URL}/{repo}"
     current_mode = signing.mode()
     if current_mode == signing.STRICT and not signing.is_immutable(target):
