@@ -221,7 +221,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_NODE_SIGNING_KEY` | | path of the node's Ed25519 private key, see [The node's keys](#the-nodes-keys) |
 | `BIOCHEF_NODE_ENCRYPTION_KEY` | | path of the node's X25519 private key |
 | `BIOCHEF_NODE_NAME` | | this node's name, required by the UI |
-| `BIOCHEF_FEDERATION_KEY` | | path of the PEM public key that signs the federation's node list |
+| `BIOCHEF_FEDERATION_KEY` | | path of the PEM public key that signs the site list |
 | `BIOCHEF_COORDINATOR_POLL_SECONDS` | `30` | how often the coordinator is polled; three intervals with no success shows it as offline |
 | `BIOCHEF_EGRESS_MODE` | | `airlock` or `manual`, required by the UI, and what makes an agent a node, see [Egress](#egress) |
 | `BIOCHEF_DATASET_BINDINGS_FILE` | | YAML file of dataset bindings, locked on the page |
@@ -535,9 +535,9 @@ The page refuses to start without `BIOCHEF_AUDIT_LOG`, because every decision ma
 
 Everything the page loads is served by the agent: htmx, the fonts and the stylesheet are in `ui/static/`, and `ui/static.sha256` records the vendored files. `ui/static/app.css` is built and committed, so nothing else is needed at runtime. After changing a template or `ui/tailwind/input.css`, run `make css`, which downloads the pinned Tailwind CLI, checks it against `ui/tailwind/SHA256SUMS` and rebuilds the file. CI fails if the committed file differs.
 
-## The federation's node list
+## The site list
 
-`node/federation.py` keeps the list of nodes only with a valid signature from `BIOCHEF_FEDERATION_KEY`, and refuses a version older than the newest one held, because going backwards is how a removed node comes back. Nothing receives a list yet: the coordinator client does that. The format is an assumption until the coordinator defines it, and the module says which one.
+`node/federation.py` keeps the site list, the list of nodes in the federation, only with a valid signature from `BIOCHEF_FEDERATION_KEY`, and refuses a version older than the newest one held, because going backwards is how a removed node comes back. Nothing receives a list yet: the coordinator client does that. The format is an assumption until the coordinator defines it, and the module says which one.
 
 ## The Node screen
 
