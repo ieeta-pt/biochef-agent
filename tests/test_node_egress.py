@@ -237,7 +237,7 @@ def test_only_passing_files_are_in_the_result(engine):
     assert archive.getnames() == ["summary.tsv"]
 
 
-def test_the_result_is_encrypted_for_the_requester_only(engine):
+def test_the_result_is_encrypted_for_the_submitter_only(engine):
     document = released(engine)
     box = base64.b64decode(document["ciphertext"])
     with pytest.raises(pyrage.DecryptError):
