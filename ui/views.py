@@ -14,7 +14,8 @@ from node.keys import short_fingerprint
 from store import repo
 from store.errors import NotFound
 from store.models import Decision
-from store.states import Action, MessageKind, SubjectType, Verdict, VersionState
+from store.states import (Action, MessageKind, ResultRecipients, SubjectType,
+                          Verdict, VersionState)
 from ui import compare, format as fmt
 
 UNKNOWN_MEMBER = "unknown member"
@@ -24,6 +25,7 @@ PAGE_SIZE = 20
 STATE_LABELS = {"pending": "Waiting in Inbox", "approved": "Approved",
                 "refused": "Refused", "withdrawn": "Withdrawn",
                 "superseded": "Superseded"}
+RECIPIENT_LABELS = {ResultRecipients.SUBMITTER.value: "Submitter only"}
 STATE_PILLS = {"pending": "warn", "approved": "ok", "refused": "bad",
                "withdrawn": "mute", "superseded": "mute"}
 CHECK_LABELS = {
@@ -177,15 +179,15 @@ def _nodes(session, version, settings):
     names = [entry.get("node", "") for entry in version.nodes]
     latest = repo.latest_federation_list(session)
     if latest is None:
-        check = ("warn", "No signed node list yet")
+        check = ("warn", "No signed site list yet")
     else:
         known = {entry.get("node") for entry in latest.nodes}
         missing = [name for name in names if name not in known]
         if missing:
-            check = ("bad", f'Not on the signed node list v{latest.version}: '
+            check = ("bad", f'Not on the signed site list v{latest.version}: '
                             f'{", ".join(missing)}')
         else:
-            check = ("ok", f"all on the signed node list v{latest.version}")
+            check = ("ok", f"all on the signed site list v{latest.version}")
     shown = [f"{name} (this node)" if name == settings.node_name else name
              for name in names]
     return {"names": ", ".join(shown), "check": check}
@@ -252,7 +254,7 @@ def study_detail(session, version, settings, policy):
         "members": members, "removed": removed, "failed": failed,
         "datasets": _datasets(session, version),
         "nodes": _nodes(session, version, settings),
-        "recipients": "Requester only",
+        "recipients": RECIPIENT_LABELS[version.result_recipients],
         "recipients_note": f"Unchanged from v{approved.version}" if approved else None,
         "rule_lines": lines, "rules_changed": rules_changed,
         "verdict": rules_verdict(version, policy) if pending else None,
@@ -420,7 +422,8 @@ def study_page(session, study_id, settings, tab):
         "members": [{"label": labels[member],
                      "proposer": member == main.proposer} for member in listed],
         "verified": verified, "datasets": _datasets(session, main),
-        "recipients": "Requester only", "required_visa": settings.required_visa,
+        "recipients": RECIPIENT_LABELS[main.result_recipients],
+        "required_visa": settings.required_visa,
         "rule_lines": list(compare.rule_lines(main.output_rules).values()),
         "versions": [_version_row(session, row, versions) for row in versions],
     }

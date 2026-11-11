@@ -544,7 +544,7 @@ A decision's audit event is written before its transaction commits, so a commit 
 
 A node sets `BIOCHEF_EGRESS_MODE` to `airlock` or `manual`. That also turns on the mirror: the API process copies each run into `run_summary`, carries out cancellations asked for on the page, and rebuilds retained workspaces after a restart, because the database is the only channel between the two processes. A plain agent leaves it unset and needs no database.
 
-Output rules judge every file first, and a file held back never leaves in either mode. Then the TRE's airlock decides, or a data manager releases or withholds on the Run screen with a signed decision. A released run is encrypted for the requester, signed with the node key and posted. A withheld one gets a signed notice with no files, made when it is withheld and kept until the coordinator can be told.
+Output rules judge every file first, and a file held back never leaves in either mode. Then the TRE's airlock decides, or a data manager releases or withholds on the Run screen with a signed decision. A released run is encrypted for the member who submitted the request (`result_recipients: submitter`, the only value for now), signed with the node key and posted. A withheld one gets a signed notice with no files, made when it is withheld and kept until the coordinator can be told.
 
 The retention clock of `BIOCHEF_KEEP_OUTPUTS` starts at `sent` or `withheld`, not when the run ends. A run waiting for egress is never evicted, and when such runs fill `BIOCHEF_MAX_RETAINED_RUNS` a new run gets 503.
 
@@ -578,9 +578,9 @@ A binding names a folder and a run reads files: `node/datasets.file_in_binding` 
 
 ## Member identity
 
-A study version lists each member's keys next to an LS Login ID token. `node/identity.py` checks the token: signed by LS Login, through the keys at `BIOCHEF_LS_LOGIN_ISSUER`, made for `BIOCHEF_EDITOR_CLIENT_ID`, unexpired, and with a `sub` equal to the member's `ls_aai_id`. A member's name comes only from a token that passed.
+A study version lists each member's keys next to an LS Login ID token. `node/identity.py` checks the token: signed by LS Login, through the keys at `BIOCHEF_LS_LOGIN_ISSUER`, made for `BIOCHEF_EDITOR_CLIENT_ID`, unexpired, and with a `sub` equal to the member's `ls_aai_id`. A member's name comes only from the `name` claim of a token that passed; the editor asks for the scope `openid profile` so that the token carries it.
 
-The nonce that ties the token to the member's keys cannot be checked yet, because how the editor builds it is not defined. Until it is, a member whose token passes everything else still counts as not verified, with that reason shown on the page, so no real study version can be approved.
+The nonce that ties the token to the member's keys is the SHA-256 of the member's signing and result keys in RFC 8785 form. It cannot be checked yet, because the exact bytes are not written yet in `ieeta-pt/biochef-infra` `docs/identity.md`, and the check will be built against that text. Until then, a member whose token passes everything else still counts as not verified, with that reason shown on the page, so no real study version can be approved.
 
 ## Before deploying this
 
