@@ -38,10 +38,11 @@ WORKFLOW_ALLOWED = {
 }
 
 
-class RecipientsMode(str, Enum):
-    """Who a result is encrypted for. Only the requester, for now."""
+class ResultRecipients(str, Enum):
+    """Who a result is encrypted for. Only the member who submitted the request,
+    for now; `all_members` waits for ieeta-pt/biochef-coordinator#6."""
 
-    REQUESTER = "requester"
+    SUBMITTER = "submitter"
 
 
 class SubjectType(str, Enum):

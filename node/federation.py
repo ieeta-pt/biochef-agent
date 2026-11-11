@@ -1,4 +1,4 @@
-"""The list of nodes in the federation, and who vouches for it (section 7.4).
+"""The site list: the federation's nodes, and who vouches for it (section 7.4).
 
 A study names nodes, and the Inbox says whether each is on this list, so a forged
 list would let a study reach somewhere nobody approved. The list is taken only
@@ -27,7 +27,7 @@ class FederationError(Exception):
 
 
 def load_key(path=None):
-    """The public key that signs the node list."""
+    """The public key that signs the site list."""
     path = path or (os.getenv("BIOCHEF_FEDERATION_KEY") or "").strip()
     if not path:
         raise FederationError("BIOCHEF_FEDERATION_KEY is not set")
@@ -47,15 +47,15 @@ def check(raw, signature, key):
         padded = signature + "=" * (-len(signature) % 4)
         key.verify(base64.urlsafe_b64decode(padded), raw)
     except (InvalidSignature, ValueError, TypeError):
-        raise FederationError("the node list's signature does not verify") from None
+        raise FederationError("the site list's signature does not verify") from None
     try:
         document = json.loads(raw)
         version, nodes = document["version"], document["nodes"]
     except (ValueError, KeyError, TypeError):
-        raise FederationError("the node list is not a list of nodes") from None
+        raise FederationError("the site list is not a list of nodes") from None
     if (not isinstance(version, int) or isinstance(version, bool)
             or not isinstance(nodes, list)):
-        raise FederationError("the node list is not a list of nodes")
+        raise FederationError("the site list is not a list of nodes")
     return document
 
 

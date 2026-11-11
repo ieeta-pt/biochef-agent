@@ -5,8 +5,10 @@ token is what ties a person to those keys. So the checks are on the token: signe
 by LS Login, made for the editor, still valid, about this member, and binding
 these keys through its nonce.
 
-The nonce is the check that matters most, and it cannot run yet: how the editor
-builds it is not defined. Without it a valid token proves who signed in, not that
+The nonce is the check that matters most, and it cannot run yet. It is the
+SHA-256 of the member's signing and result keys in RFC 8785 form, but the exact
+bytes are not written yet in ieeta-pt/biochef-infra docs/identity.md, and the
+check is built against that text and nothing else. Without it a valid token proves who signed in, not that
 these keys are theirs, which is exactly the attack the check exists for. So it
 stays closed. A token that passes everything else still counts as not verified,
 with that reason recorded, rather than passing because one check is missing.
@@ -22,8 +24,8 @@ import jwt
 import passports
 from store import repo
 
-NONCE_UNDEFINED = ("The token is valid, but how the editor builds its nonce is not "
-                   "defined yet, so these keys cannot be tied to this person")
+NONCE_UNDEFINED = ("The token is valid, but the exact bytes of its nonce are not "
+                   "written yet, so these keys cannot be tied to this person")
 EXPIRED = ("The token has expired. Only unexpired tokens are accepted until the "
            "federation publishes its list of past LS Login keys")
 WRONG_PERSON = "The token names someone other than this member"
@@ -36,7 +38,7 @@ class IdentityError(Exception):
 
 
 def nonce_closed(claims, key):
-    """The check of 7.3.4 until the editor defines the construction."""
+    """The check of 7.3.4 until biochef-infra docs/identity.md writes its bytes."""
     raise IdentityError(NONCE_UNDEFINED)
 
 
