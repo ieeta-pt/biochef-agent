@@ -155,7 +155,8 @@ def test_the_detail_of_a_new_version_against_the_approved_one(client):
     assert "EGAD00001009912" in text and "✓ bound to local data" in text
     assert "Visa required · ControlledAccessGrants" in text
     assert f"{mock.NODE} (this node)" in text
-    assert "✓ all on the signed node list v14" in text
+    assert "✓ all on the signed site list v14" in text
+    assert "Submitter only" in text
     assert "Approving v3 supersedes v2." in text
     assert "withdraws" not in text
 
@@ -739,3 +740,8 @@ def test_every_page_of_the_seed_loads_only_from_the_agent(client, engine, pendin
         text = client.get(path).text
         assert not re.search(r"""(?:src|href)=["'](?:https?:)?//""", text), path
         assert 'style="' not in text and "onclick" not in text.lower()
+
+
+def test_the_study_page_names_the_result_recipients(client):
+    text = client.get(f"/ui/studies/{mock.MICROBIOME}").text
+    assert "Result recipients" in text and "Submitter only" in text
