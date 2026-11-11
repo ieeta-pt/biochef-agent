@@ -96,7 +96,7 @@ def test_a_node_that_never_polled_says_so(tmp_path, trail):
     (tmp_path / "e").mkdir()
     bind = fresh_database(tmp_path / "e")[1]
     text = web(bind).get("/ui/node").text
-    assert "Not connected yet" in text and "No signed node list yet" in text
+    assert "Not connected yet" in text and "No signed site list yet" in text
     assert "Nothing in the audit trail yet." in text
 
 
