@@ -1,4 +1,4 @@
-"""The signed node list: a bad signature or an older version is refused (7.4)."""
+"""The signed site list: a bad signature or an older version is refused (7.4)."""
 
 import base64
 import json

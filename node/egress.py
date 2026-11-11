@@ -123,7 +123,12 @@ def start(session, run_id, policy, airlock, *, mode, now=None, keep_seconds=None
 
 
 def _recipient_key(session, request):
-    """The requester's age key, from the study version the request named."""
+    """The submitter's age key, from the study version the request named.
+
+    `submitter` is the only value of `result_recipients` the store accepts, so
+    a result is encrypted for the member who submitted the request and no one
+    else.
+    """
     version = repo.study_version_named(session, request.study_id, request.study_version)
     return next(row for row in repo.member_keys(session, version.id)
                 if row.member == request.member).result_key
@@ -255,7 +260,7 @@ def _encrypt(data, recipient_key):
 
 def send_released(session, keys, coordinator, workspace_of, *, node, now=None,
                   keep_seconds=None):
-    """Stages 3 and 4: encrypt for the requester, sign, post."""
+    """Stages 3 and 4: encrypt for the submitter, sign, post."""
     now = now or repo.utcnow()
     for run in repo.runs_in_egress_state(session, EgressState.RELEASED):
         ws = workspace_of(run.run_id)

@@ -817,7 +817,7 @@ def test_a_config_binding_cannot_be_removed(engine):
             repo.unbind_dataset(session, "EGAD1")
 
 
-# Federation list and coordinator status
+# Site list and coordinator status
 
 
 def store_list(session, version, raw=b"list"):
