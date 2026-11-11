@@ -537,7 +537,7 @@ Everything the page loads is served by the agent: htmx, the fonts and the styles
 
 A node sets `BIOCHEF_EGRESS_MODE` to `airlock` or `manual`. That also turns on the mirror: the API process copies each run into `run_summary`, carries out cancellations asked for on the page, and rebuilds retained workspaces after a restart, because the database is the only channel between the two processes. A plain agent leaves it unset and needs no database.
 
-Output rules judge every file first, and a file held back never leaves in either mode. Then the TRE's airlock decides, or a data manager releases or withholds on the Run screen with a signed decision. A released run is encrypted for the requester, signed with the node key and posted. A withheld one gets a signed notice with no files, made when it is withheld and kept until the coordinator can be told.
+Output rules judge every file first, and a file held back never leaves in either mode. Then the TRE's airlock decides, or a data manager releases or withholds on the Run screen with a signed decision. A released run is encrypted for the member who submitted the request (`result_recipients: submitter`, the only value for now), signed with the node key and posted. A withheld one gets a signed notice with no files, made when it is withheld and kept until the coordinator can be told.
 
 The retention clock of `BIOCHEF_KEEP_OUTPUTS` starts at `sent` or `withheld`, not when the run ends. A run waiting for egress is never evicted, and when such runs fill `BIOCHEF_MAX_RETAINED_RUNS` a new run gets 503.
 
