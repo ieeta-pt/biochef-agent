@@ -374,7 +374,34 @@ For each member listed in a study version the agent checks `binding_token`, the 
 1. Signed by LS Login (issuer `BIOCHEF_LS_LOGIN_ISSUER`, keys from its JWKS; reuse the fetching and retry pattern of `passports.py`).
 2. Audience is the editor's LS Login client (`BIOCHEF_EDITOR_CLIENT_ID`).
 3. The token names the member.
-4. The token's `nonce` is exactly, compared as a string, the SHA-256 of the RFC 8785 form of `{"v": "biochef.member-keys.v1", "result_key": …, "signing_key": {"crv": "P-256", "kty": "EC", "x": …, "y": …}}`, in base64url without padding (43 characters). The object is built from the member's keys as the study version lists them, which are the keys the editor sends to `PUT /me/keys`. `signing_key` is the public JWK with exactly `crv`, `kty`, `x` and `y` (no `kid`, `alg` or `use`), and `x` and `y` are base64url without padding, 32 bytes each, leading zeros kept. `result_key` is the age recipient in lowercase. `v` names the format, so this hash cannot be confused with any other and the format can change later. Keys in any other form are refused, not normalised. This is the construction confirmed for `ieeta-pt/biochef-infra` `docs/identity.md`, and the test vector is in `tests/test_node_identity.py`. A member whose nonce does not match counts as not verified, with that reason in `identity_error`, and no name is stored.
+4. The token's `nonce` ties it to the member's keys. The agent builds this object from the member's keys as the study version lists them, which are the keys the editor sends to `PUT /me/keys`:
+
+   ```json
+   {"v": "biochef.member-keys.v1", "result_key": "age1…", "signing_key": {"crv": "P-256", "kty": "EC", "x": "…", "y": "…"}}
+   ```
+
+   - `signing_key` is the public JWK with exactly `crv`, `kty`, `x` and `y` (no `kid`, `alg` or `use`). `x` and `y` are base64url without padding, 32 bytes each, leading zeros kept, so each is 43 characters.
+   - `result_key` is the age recipient in lowercase.
+   - `v` names the format, so this hash cannot be confused with any other and the format can change later.
+
+   The object is serialized with RFC 8785 (JSON Canonicalization Scheme) to UTF-8 bytes, and the nonce is the SHA-256 of those bytes in base64url without padding, 43 characters. The token's `nonce` must equal it, compared as an exact string. Keys in any other form are refused, not normalised. A member whose nonce does not match counts as not verified, with that reason in `identity_error`, and no name is stored.
+
+   Test vector, with synthetic keys whose `x` starts with a zero byte. Keys:
+
+   ```json
+   {"signing_key": {"kty": "EC", "crv": "P-256", "x": "AO1cfutKPq_Pj_qgqcxF6mw7pf0zvS0bOTf3G-GON1s", "y": "HjpzF_k9FmBSD7iiJq3QrtNRFM_uF0xVckpsACGAf38"},
+    "result_key": "age1vpw3jerf7764tnxv0jvwg9umcmstqf2zxwvezp4xpeetjxwsgsdsesfryj"}
+   ```
+
+   Canonical bytes:
+
+   ```
+   {"result_key":"age1vpw3jerf7764tnxv0jvwg9umcmstqf2zxwvezp4xpeetjxwsgsdsesfryj","signing_key":{"crv":"P-256","kty":"EC","x":"AO1cfutKPq_Pj_qgqcxF6mw7pf0zvS0bOTf3G-GON1s","y":"HjpzF_k9FmBSD7iiJq3QrtNRFM_uF0xVckpsACGAf38"},"v":"biochef.member-keys.v1"}
+   ```
+
+   Nonce: `ZU6yVFLLXiQ1WErqbRJRX9gXa47goE8iHMpLPnozw4A`
+
+   This construction was confirmed in [ieeta-pt/biochef-infra#2](https://github.com/ieeta-pt/biochef-infra/pull/2#issuecomment-6826028486), and `docs/identity.md` in ieeta-pt/biochef-infra must match it. `tests/test_node_identity.py` uses the same vector.
 5. Expired tokens are accepted only if signed with a past LS Login key in the federation's signed key list. Until that list exists, accept only unexpired tokens and say so on the page.
 
 **Member names.** The editor requests the member token with the scope `openid profile`, so that it carries `name`. A name comes only from the `name` claim of `binding_token`, read after the checks above pass, and is stored as `member_key.display_name`. The token's `sub` must equal the member's `ls_aai_id`. If the claim is missing, show the shortened `ls_aai_id`. A failed check leaves no name. No other source is accepted, including anything in the study document.
@@ -538,7 +565,7 @@ Taken:
 Still open. Ask `jorgeMFS` before building anything that depends on these.
 
 1. The agent API of the coordinator, including the decision format (7.2).
-2. Defined: the nonce for member keys (7.3.4). Its construction is confirmed for `ieeta-pt/biochef-infra` `docs/identity.md`, with the `v` field, and the check is implemented against the test vector.
+2. Defined: the nonce for member keys (7.3.4), with the construction and test vector written there. This construction was confirmed in [ieeta-pt/biochef-infra#2](https://github.com/ieeta-pt/biochef-infra/pull/2#issuecomment-6826028486), and `docs/identity.md` in ieeta-pt/biochef-infra must match it.
 3. The TRE airlock interface (6.5).
 4. Who holds the signed list of past LS Login keys, and how nodes get it (7.3.5).
 5. `all_members` as a value of `result_recipients` in `ieeta-pt/biochef-coordinator#6` (6.5).
