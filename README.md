@@ -491,6 +491,14 @@ and HTTP 503 capacity refusal as `/runs`.
 5. Each declared output is read back and base64-encoded into the response.
 6. The run's directory is removed, whether it succeeded or not.
 
+## Running the whole stack locally
+
+`docs/self-hosting.md` brings up a registry, this agent and the editor with one
+`docker compose up`, and explains what to do with them. It is the agent's own
+development stack — no authentication anywhere, plain HTTP — and the document
+says so. The full local TRE, with the coordinator and a silo, is `make up` in
+biochef-infra, which builds the agent from this repository's `Dockerfile`.
+
 ## Before deploying this
 
 **It is not ready to be exposed.** Several open issues describe defects reachable
