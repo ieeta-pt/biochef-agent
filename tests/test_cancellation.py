@@ -105,12 +105,10 @@ class _Registry:
              "annotations": {"org.opencontainers.image.title": "tool"}},
         ]}
 
-    def pull(self, target, outdir):
-        os.makedirs(outdir, exist_ok=True)
-        with open(os.path.join(outdir, "bundle.json"), "wb") as f:
-            f.write(self.bundle_bytes)
-        with open(os.path.join(outdir, "tool"), "wb") as f:
-            f.write(self.binary_bytes)
+    def download_blob(self, container, digest, outfile):
+        contents = {"bundle.json": self.bundle_bytes, "tool": self.binary_bytes}
+        with open(outfile, "wb") as f:
+            f.write(contents[os.path.basename(outfile)])
 
 
 @pytest.fixture
