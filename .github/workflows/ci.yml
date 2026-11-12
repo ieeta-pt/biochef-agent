@@ -219,7 +219,7 @@ jobs:
     steps:
       # Both into the workspace, as siblings. actions/checkout refuses a path
       # outside GITHUB_WORKSPACE, so the repository cannot be checked out at the
-      # root and the editor at ../Biochef -- and this layout is the one
+      # root and the editor at ../biochef-app -- and this layout is the one
       # docs/self-hosting.md tells a developer to create, which is the layout
       # that has to be tested.
       - uses: actions/checkout@v4
@@ -228,8 +228,8 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          repository: ieeta-pt/Biochef
-          path: Biochef
+          repository: ieeta-pt/biochef-app
+          path: biochef-app
 
       - name: Bring up registry, agent and frontend
         # E6's acceptance (#19) is that a new developer reaches a running stack

@@ -1,33 +1,29 @@
-# Running BioChef locally
+# Running the agent locally
 
-A registry, the agent, and the editor, on one machine, from a clean checkout.
+Two ways to run the agent on one machine:
 
-This is a **development** stack. It runs a registry over plain HTTP with no
-authentication and an agent with no authentication in front of it, which is fine
-on a laptop and is not a deployment. What it is for is having the three pieces
-talk to each other so you can change one and see the effect.
+- **This repository's stack:** a registry, the agent and the editor, with one `docker compose up`. Use it to work on the agent itself.
+- **The local TRE:** `make up` in [biochef-infra](https://github.com/ieeta-pt/biochef-infra) runs the whole platform with simulated silos, and builds the agent from this repository's `Dockerfile`. Its docs are in biochef-infra's `docs/local-build.md`.
 
-## What you need
+Both are development setups: plain HTTP, no real data, bound to `127.0.0.1`.
 
-- Docker with Compose v2 (`docker compose version` should print `v2.x`)
-- The editor checked out beside this repository
+## How the agent talks
 
-```
-git clone https://github.com/ieeta-pt/biochef-agent.git
-git clone https://github.com/ieeta-pt/Biochef.git
-```
+In BioChef nothing connects to an agent. The editor submits jobs to the coordinator, and each agent, inside its silo, polls the coordinator for them. The agent opens every connection: to the coordinator, and to a registry for tools.
 
-so that the two directories sit side by side:
+The coordinator's side of this is not built yet, so for now you call the agent directly, from the same machine (below).
+
+The agent will also have a frontend of its own: the agent page, where a node's data manager approves studies and workflows, follows runs and releases outputs. It is a separate process on its own port, reachable only inside the TRE, and it is not in this stack yet. It is a different thing from the editor, which researchers use.
+
+## This repository's stack
+
+You need Docker with Compose v2, and the editor checked out beside this repository, as the biochef-infra submodules are:
 
 ```
 .
 ├── biochef-agent      # you are here
-└── Biochef            # the editor
+└── biochef-app        # the editor
 ```
-
-If the editor is somewhere else, set `FRONTEND_CONTEXT` to its path.
-
-## Bringing it up
 
 From `biochef-agent`:
 
@@ -35,132 +31,54 @@ From `biochef-agent`:
 docker compose up --build
 ```
 
-The first run takes a few minutes: it installs the agent's pinned Python
-dependencies and the editor's npm packages. Later runs reuse both.
-
-When it has settled you have:
-
 | | |
 |---|---|
 | the editor | <http://localhost:3000> |
 | the agent | <http://localhost:8000/docs> |
 | the registry | <http://localhost:5000/v2/> |
 
-To check without a browser:
+`./ci/stack_smoke.sh` checks that each one answers; CI runs the same script.
 
-```
-./ci/stack_smoke.sh
-```
+The registry starts empty, so a workflow that names a tool fails at the pull until the tool is published there. Publish with [biochef-hub](https://github.com/ieeta-pt/biochef-hub), pointed at `REGISTRY_URL=localhost:5000` and `REGISTRY_INSECURE=true`. Because this registry has no signed catalogue, the compose file sets `BIOCHEF_TOOL_CATALOG=off`.
 
-which is the same thing CI runs, and asserts each service actually answers
-rather than that the containers were created.
+## Calling the agent
 
-## The one piece of ordering that matters
-
-The agent builds its registry client and logs in **at import**. It does not
-start and then retry: if the registry is not answering, the agent exits.
-
-The compose file handles this with a healthcheck on the registry and
-`depends_on: condition: service_healthy`, so `up` is deterministic. It is worth
-knowing because it is the first thing to suspect if you adapt this file and the
-agent starts failing "randomly" — almost always it is starting before whatever
-it pulls from.
-
-## Credentials, which are not optional even without authentication
-
-The compose file sends a username and password the registry ignores. They have
-to be there: the ORAS client prompts for a username it was not given, and a
-container has no terminal to answer with, so an agent configured with empty
-credentials exits at startup rather than serving anything.
-
-If you point the agent at a registry that *does* authenticate, replace them.
-
-## Exercising the agent
-
-Not from the editor, today. The editor's "Run Workflow with Agent" path is
-commented out upstream — the button, the dialog that asks for the agent's URL,
-and the function that posts to it, all disabled together — so bringing this
-stack up does not give you a button to press. The editor is here so you can work
-on it against a live agent, not because the two are wired end to end yet.
-
-Drive the agent directly instead. It serves interactive documentation:
-
-```
-open http://localhost:8000/docs
-```
-
-or post a workflow and its inputs the way the editor would:
+Open <http://localhost:8000/docs>, or post a workflow and its inputs:
 
 ```
 curl -F "biochef_workflow=<workflow.json" -F files=@input.fasta \
      http://localhost:8000/convert -o results.zip
 ```
 
-Both details in that first `-F` matter, and getting either wrong produces the
-same 422, which reads as though the agent is complaining about your workflow:
+Use `<` (the workflow is a form field) and keep the quotes, or the agent answers 422.
 
-- `<` and not `@`. The workflow is a form *field* whose value happens to live in
-  a file; the inputs are file *uploads*. `-F name=@file` sends a file part, and
-  the agent rejects it.
-- The **quotes**. Unquoted, the shell reads `<workflow.json` as a redirection
-  and curl never sees it, so the field arrives empty.
+## The agent in the local TRE
 
-Two things to know before re-enabling the editor's path:
+In `make up`, each silo runs this image. What it needs there:
 
-- It **hardcodes** `http://localhost:8000/convert` rather than reading any
-  environment variable, so changing `AGENT_PORT` moves the agent out from under
-  it. That is why this compose file sets no `AGENT_URL`: there is nothing to
-  read it.
-- The agent sends no CORS headers, and a browser on `localhost:3000` calling
-  `localhost:8000` is making a cross-origin request. The call will reach the
-  agent and run, but the browser will refuse to hand the response back to the
-  page. Whichever change re-enables that path has to add the headers too.
-
-## Publishing a tool to your local registry
-
-The stack comes up empty. The agent pulls tool bundles from the registry by the
-`repo` named in a workflow, so until something is published, a workflow that
-names a tool will fail at the pull with a 404.
-
-Publishing is [biochef-hub](https://github.com/ieeta-pt/biochef-hub)'s job, and
-its own documentation covers building a recipe. Point it at this registry with:
-
-```
-REGISTRY_URL=localhost:5000
-REGISTRY_INSECURE=true
-```
-
-## Changing things
-
-| what you want | how |
+| | |
 |---|---|
-| a different port | `AGENT_PORT=9000 docker compose up` — also `REGISTRY_PORT`, `FRONTEND_PORT` |
-| the editor elsewhere | `FRONTEND_CONTEXT=/path/to/Biochef docker compose up` |
-| reach it from another device | `BIND_HOST=0.0.0.0 docker compose up` — read the security note first |
+| Network | An internal network with no published port. Its only ways out are the coordinator and, under avenue A, the global registry, both through the silo's egress proxy |
+| Tools | `REGISTRY_URL` names the global registry (avenue A) or the silo's own registry (avenue B), picked in the silo's `.env`. `REGISTRY_INSECURE=true`, because the local registries are plain HTTP |
+| Catalogue | Left at `required`. The local registries are seeded from production, signed catalogue included |
+| Credentials | `REGISTRY_USERNAME` and `REGISTRY_PASSWORD` must not be empty, even for a registry without authentication, or the agent stops at start |
+| Data | `BIOCHEF_DATA_SOURCES` includes `localpath`, and `BIOCHEF_LOCAL_ROOT` is the silo's synthetic data store |
+| Start order | The registry must answer before the agent starts: the agent logs in to it at start and exits if it cannot |
+| Who calls it | Only the silo's shell (`make shell`), until the agent polls the coordinator |
+| Agent page | Once it exists, it runs next to the agent on its own port, reachable from inside the silo only, never published |
+| Steps | In the agent's own container for now; the container is the boundary on a laptop |
+
+The image runs as an unprivileged user (uid 10001), and `/app` is writable by it, because the agent writes uploads and tool bundles under its working directory.
+
+## Changing this stack
+
+| What you want | How |
+|---|---|
+| other ports | `AGENT_PORT=9000 docker compose up`, also `REGISTRY_PORT` and `FRONTEND_PORT` |
+| the editor elsewhere | `FRONTEND_CONTEXT=/path/to/biochef-app docker compose up` |
 | agent logs | `docker compose logs -f agent` |
 | a shell in the agent | `docker compose exec agent sh` |
-| start over | `docker compose down -v` — the `-v` also drops the registry's contents |
+| your agent changes | `docker compose up --build agent`; editor changes reload on their own |
+| start over | `docker compose down -v`, which also empties the registry |
 
-Editing the editor's source takes effect without a restart; it is mounted, and
-the dev server reloads. Editing the agent's source does not — rebuild it with
-`docker compose up --build agent`.
-
-## What this stack does not do
-
-- **No authentication anywhere.** The registry accepts anonymous pushes and the
-  agent answers anyone who can reach the port.
-- **No isolation.** The agent executes tool binaries pulled from the registry
-  inside its own container, as an unprivileged user but with no sandbox of its
-  own.
-- **Plain HTTP**, so nothing here is safe across a network you do not control.
-
-Which is why every port binds to `127.0.0.1` and not to every interface, as
-docker would by default. The stack is reachable from this machine and nowhere
-else unless you say otherwise:
-
-```
-BIND_HOST=0.0.0.0 docker compose up      # reachable from your network
-```
-
-Do that only on a network you trust, and remember there is nothing asking who
-the caller is.
+Every port binds to `127.0.0.1`. `BIND_HOST=0.0.0.0` makes the stack reachable from your network, where anyone can call the agent and push to the registry, so use it only on a network you trust.

@@ -494,8 +494,10 @@ and HTTP 503 capacity refusal as `/runs`.
 ## Running the whole stack locally
 
 `docs/self-hosting.md` brings up a registry, this agent and the editor with one
-`docker compose up`, and explains what to do with them. It is a development
-stack — no authentication anywhere, plain HTTP — and the document says so.
+`docker compose up`, and explains what to do with them. It is the agent's own
+development stack — no authentication anywhere, plain HTTP — and the document
+says so. The full local TRE, with the coordinator and a silo, is `make up` in
+biochef-infra, which builds the agent from this repository's `Dockerfile`.
 
 ## Before deploying this
 
