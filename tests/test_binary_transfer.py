@@ -349,7 +349,9 @@ def test_malformed_async_submission_removes_owned_spool_file(
                     break
                 time.sleep(0.01)
 
-        assert status == "SYSTEM_ERROR"
+        # A document that is not JSON is the caller's mistake, so the run
+        # settles as EXECUTOR_ERROR, not SYSTEM_ERROR (#86).
+        assert status == "EXECUTOR_ERROR"
         assert handed_over and all(not os.path.exists(path) for path in handed_over)
     finally:
         main.RETAINED.release_all()
