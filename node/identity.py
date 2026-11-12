@@ -6,14 +6,19 @@ by LS Login, made for the editor, still valid, about this member, and binding
 these keys through its nonce.
 
 The nonce is the check that matters most. Without it a valid token proves who
-signed in, not that these keys are theirs. Its construction is the one agreed for
-ieeta-pt/biochef-infra docs/identity.md: the editor builds an object from the
-keys exactly as it sends them to PUT /me/keys, with a version name, serializes
-it with RFC 8785, and the nonce is the SHA-256 of those bytes in base64url
-without padding. The agent builds the same object from the keys the study
-version lists and compares the token's nonce with it as an exact string. Keys
-that are not in that form are refused rather than normalised, since a
+signed in, not that these keys are theirs. The editor builds an object from the
+keys exactly as it sends them to PUT /me/keys, with "v": "biochef.member-keys.v1",
+serializes it with RFC 8785, and the nonce is the SHA-256 of those bytes in
+base64url without padding. The agent builds the same object from the keys the
+study version lists and compares the token's nonce with it as an exact string.
+Keys that are not in that form are refused rather than normalised, since a
 normalised key would hash to something the editor never signed in for.
+
+This construction was confirmed in ieeta-pt/biochef-infra#2
+(https://github.com/ieeta-pt/biochef-infra/pull/2#issuecomment-6826028486), and
+docs/identity.md in ieeta-pt/biochef-infra must match it. The test vector is in
+tests/test_node_identity.py and in section 7.3.4 of docs/agent-ui/SPEC.md
+(ieeta-pt/biochef-agent#106).
 
 Everything here records a result and raises nothing about the token: a member who
 fails is an ordinary state of a study version, and the page shows why.
