@@ -5,27 +5,36 @@ token is what ties a person to those keys. So the checks are on the token: signe
 by LS Login, made for the editor, still valid, about this member, and binding
 these keys through its nonce.
 
-The nonce is the check that matters most, and it cannot run yet. It is the
-SHA-256 of the member's signing and result keys in RFC 8785 form, but the exact
-bytes are not written yet in ieeta-pt/biochef-infra docs/identity.md, and the
-check is built against that text and nothing else. Without it a valid token proves who signed in, not that
-these keys are theirs, which is exactly the attack the check exists for. So it
-stays closed. A token that passes everything else still counts as not verified,
-with that reason recorded, rather than passing because one check is missing.
+The nonce is the check that matters most. Without it a valid token proves who
+signed in, not that these keys are theirs. Its construction is the one agreed for
+ieeta-pt/biochef-infra docs/identity.md: the editor builds an object from the
+keys exactly as it sends them to PUT /me/keys, with a version name, serializes
+it with RFC 8785, and the nonce is the SHA-256 of those bytes in base64url
+without padding. The agent builds the same object from the keys the study
+version lists and compares the token's nonce with it as an exact string. Keys
+that are not in that form are refused rather than normalised, since a
+normalised key would hash to something the editor never signed in for.
 
 Everything here records a result and raises nothing about the token: a member who
 fails is an ordinary state of a study version, and the page shows why.
 """
 
+import base64
+import hashlib
 import os
+import re
 
 import jwt
+import rfc8785
 
 import passports
 from store import repo
 
-NONCE_UNDEFINED = ("The token is valid, but the exact bytes of its nonce are not "
-                   "written yet, so these keys cannot be tied to this person")
+MEMBER_KEYS_VERSION = "biochef.member-keys.v1"
+MALFORMED_KEYS = ("The member's keys are not in the form their nonce is made from, "
+                  "so they cannot be tied to this person")
+WRONG_NONCE = ("The token's nonce is not the hash of these keys, so they cannot be "
+               "tied to this person")
 EXPIRED = ("The token has expired. Only unexpired tokens are accepted until the "
            "federation publishes its list of past LS Login keys")
 WRONG_PERSON = "The token names someone other than this member"
@@ -37,15 +46,64 @@ class IdentityError(Exception):
     """Why a member's token cannot be accepted, in words for the page."""
 
 
-def nonce_closed(claims, key):
-    """The check of 7.3.4 until biochef-infra docs/identity.md writes its bytes."""
-    raise IdentityError(NONCE_UNDEFINED)
+_JWK_MEMBERS = {"crv", "kty", "x", "y"}
+_COORDINATE = re.compile(r"[A-Za-z0-9_-]{43}")
+_AGE_RECIPIENT = re.compile(r"age1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58}")
+
+
+def _coordinate(value):
+    """A P-256 coordinate as RFC 7518 writes it: 32 bytes, base64url, no padding.
+
+    The leading zeros are kept, so the string is always 43 characters, and only
+    the one string that encodes those 32 bytes is accepted.
+    """
+    if not isinstance(value, str) or not _COORDINATE.fullmatch(value):
+        raise IdentityError(MALFORMED_KEYS)
+    raw = base64.urlsafe_b64decode(value + "=")
+    if base64.urlsafe_b64encode(raw).rstrip(b"=").decode() != value:
+        raise IdentityError(MALFORMED_KEYS)
+    return value
+
+
+def member_keys_bytes(signing_key, result_key):
+    """The RFC 8785 bytes a member's nonce is the hash of (7.3.4).
+
+    `signing_key` is the public JWK with exactly crv, kty, x and y, and
+    `result_key` the age recipient in lowercase. Anything else is refused.
+    """
+    if not isinstance(signing_key, dict) or set(signing_key) != _JWK_MEMBERS:
+        raise IdentityError(MALFORMED_KEYS)
+    if signing_key["kty"] != "EC" or signing_key["crv"] != "P-256":
+        raise IdentityError(MALFORMED_KEYS)
+    if not isinstance(result_key, str) or not _AGE_RECIPIENT.fullmatch(result_key):
+        raise IdentityError(MALFORMED_KEYS)
+    return rfc8785.dumps({
+        "v": MEMBER_KEYS_VERSION,
+        "result_key": result_key,
+        "signing_key": {"crv": "P-256", "kty": "EC",
+                        "x": _coordinate(signing_key["x"]),
+                        "y": _coordinate(signing_key["y"])},
+    })
+
+
+def member_keys_nonce(signing_key, result_key):
+    """The nonce the editor asks LS Login for: 43 characters of base64url."""
+    digest = hashlib.sha256(member_keys_bytes(signing_key, result_key)).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+
+def check_nonce(claims, key):
+    """The check of 7.3.4: the token's nonce is exactly the hash of these keys."""
+    expected = member_keys_nonce(key.signing_key, key.result_key)
+    nonce = claims.get("nonce")
+    if not isinstance(nonce, str) or nonce != expected:
+        raise IdentityError(WRONG_NONCE)
 
 
 class Verifier:
     """Issuer, audience and keys. The keys are fetched when first needed."""
 
-    def __init__(self, issuer, client_id, keyset=None, nonce_check=nonce_closed):
+    def __init__(self, issuer, client_id, keyset=None, nonce_check=check_nonce):
         if not issuer or not client_id:
             raise IdentityError("BIOCHEF_LS_LOGIN_ISSUER and "
                                 "BIOCHEF_EDITOR_CLIENT_ID are both required")
