@@ -60,6 +60,11 @@ def test_isolation_is_off_in_warn_colours(engine):
     assert "steps run without network" not in text
 
 
+def test_isolation_is_on_only_when_the_runner_says_so(engine):
+    text = web(engine, runner="apptainer", network_isolated=True).get("/ui/node").text
+    assert "Network isolation: on" in text and "Network isolation: off" not in text
+
+
 def test_busy_slots_are_counted_from_the_store(engine):
     assert "1 of 4 slots busy" in web(engine).get("/ui/node").text
 

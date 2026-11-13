@@ -323,3 +323,27 @@ def test_a_good_bindings_file_is_synced_at_start(ready, dev, tmp_path):
     from store import db, repo
     with db.reading(app.state.bind) as session:
         assert repo.dataset_binding(session, "EGAD1").source == "config"
+
+
+# What the Node screen reports
+
+
+def test_isolation_follows_the_runner(dev):
+    assert settings.load().network_isolated is False
+    dev.setenv("BIOCHEF_RUNNER", "apptainer")
+    assert settings.load().network_isolated is True
+
+
+def test_a_runner_that_does_not_exist_stops_the_page(dev):
+    dev.setenv("BIOCHEF_RUNNER", "nonsense")
+    with pytest.raises(SettingsError, match="nonsense"):
+        settings.load()
+
+
+@pytest.mark.parametrize("name", ["BIOCHEF_KEEP_OUTPUTS", "BIOCHEF_MAX_RETAINED_RUNS",
+                                  "BIOCHEF_MAX_CONCURRENT_RUNS",
+                                  "BIOCHEF_COORDINATOR_POLL_SECONDS"])
+def test_a_number_is_a_number(dev, name):
+    dev.setenv(name, "soon")
+    with pytest.raises(SettingsError, match=name):
+        settings.load()
