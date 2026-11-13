@@ -131,6 +131,18 @@ def test_undo_of_a_release_from_the_page(engine):
     assert "Release 2 files and sign" in client.get("/ui/runs/run_8e90").text
 
 
+def test_no_undo_once_the_poll_has_claimed_the_release(engine):
+    to_review(engine)
+    client = web(engine, "manual")
+    post(client, "/ui/_/runs/run_8e90/release")
+    with db.writing(engine) as session:
+        for row in repo.unposted_decisions(session):
+            repo.claim_for_posting(session, row.id)
+    text = client.get("/ui/runs/run_8e90").text
+    assert "Released by j.silva" in text
+    assert "Undo before the next poll" not in text
+
+
 def test_airlock_mode_refuses_a_release_past_the_page(engine):
     response = post(web(engine), "/ui/_/runs/run_8f21/release")
     assert response.status_code == 409 and "airlock" in response.text

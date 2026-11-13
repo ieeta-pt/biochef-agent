@@ -149,7 +149,7 @@ def keep_withheld_notice(session, keys, run_id, *, node, now=None):
     return row
 
 
-def poll_airlock(session, airlock, keys, *, node, now=None, keep_seconds=None):
+def poll_airlock(session, airlock, keys, *, node, keep_seconds, now=None):
     now = now or repo.utcnow()
     for run in repo.runs_in_egress_state(session, EgressState.AWAITING_AIRLOCK):
         answer = airlock.status(run.airlock_ticket)
@@ -184,7 +184,7 @@ def release(session, keys, *, node, run_id, user, now=None, confirm_unverified=F
     return _decide(session, keys, node, run_id, Action.RELEASE, user, now, reason)
 
 
-def withhold(session, keys, *, node, run_id, user, now=None, keep_seconds=None):
+def withhold(session, keys, *, node, run_id, user, keep_seconds, now=None):
     now = now or repo.utcnow()
     repo.set_egress_state(session, run_id, EgressState.WITHHELD, now,
                           retain_seconds=keep_seconds)
@@ -196,7 +196,7 @@ def withhold(session, keys, *, node, run_id, user, now=None, keep_seconds=None):
 def undo_review(session, decision, *, user):
     """Take back a release or a withholding that has not gone anywhere yet."""
     run = repo.get_run(session, decision.subject_id)
-    if decision.posted_to_coordinator_at is not None:
+    if repo.has_left(decision):
         raise Conflict("This decision has already been sent, so it cannot be undone.")
     expected = (EgressState.RELEASED.value if decision.action == Action.RELEASE.value
                 else EgressState.WITHHELD.value)
@@ -258,8 +258,8 @@ def _encrypt(data, recipient_key):
     return pyrage.encrypt(data, [pyrage.x25519.Recipient.from_str(recipient_key)])
 
 
-def send_released(session, keys, coordinator, workspace_of, *, node, now=None,
-                  keep_seconds=None):
+def send_released(session, keys, coordinator, workspace_of, *, node, keep_seconds,
+                  now=None):
     """Stages 3 and 4: encrypt for the submitter, sign, post."""
     now = now or repo.utcnow()
     for run in repo.runs_in_egress_state(session, EgressState.RELEASED):
