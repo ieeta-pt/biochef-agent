@@ -221,6 +221,8 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_RUN_TIMEOUT` | `900` | seconds before a run's whole process group is killed |
 | `BIOCHEF_AUDIT_LOG` | *(unset)* | path to an append-only JSONL audit trail; unset writes none |
 | `BIOCHEF_DB_URL` | `sqlite:////var/lib/biochef/agent.db` | the node's database, see [The node's store](#the-nodes-store) |
+| `BIOCHEF_NODE_SIGNING_KEY` | | path of the node's Ed25519 private key, see [The node's keys](#the-nodes-keys) |
+| `BIOCHEF_NODE_ENCRYPTION_KEY` | | path of the node's X25519 private key |
 | `BIOCHEF_KEEP_WORKSPACE` | `false` | leave a run's directory behind, for debugging |
 | `BIOCHEF_MAX_UPLOAD_BYTES` | `536870912` | largest request body accepted, in bytes |
 | `BIOCHEF_MAX_RUNS` | `256` | maximum run records retained for polling |
@@ -506,7 +508,17 @@ python -m store downgrade base           # remove them
 python -m store.seed --fixture mock      # invented data, for development only
 ```
 
-SQLite only, in WAL mode, because two processes open the file. Any other `BIOCHEF_DB_URL` is refused at start: concurrent approvals rely on SQLite's write lock, and no other database has been tested. The seed refuses a database that already holds data, and its decisions are not really signed: their signature is the literal `unsigned-fixture`.
+SQLite only, in WAL mode, because two processes open the file. Any other `BIOCHEF_DB_URL` is refused at start: concurrent approvals rely on SQLite's write lock, and no other database has been tested. The seed refuses a database that already holds data, and signs its decisions with a key it generates and throws away.
+
+## The node's keys
+
+A node has two keys: Ed25519 signs its decisions and results, and X25519 decrypts the payloads of requests. Create them outside this repository:
+
+```sh
+python -m node.keys init --out /etc/biochef/keys
+```
+
+It prints both public fingerprints, for registering the node, and refuses to replace a key that exists. The files must stay readable by their owner only. Point `BIOCHEF_NODE_SIGNING_KEY` and `BIOCHEF_NODE_ENCRYPTION_KEY` at them; a key that is missing, exposed, inside the repository or of the wrong type is refused.
 
 ## Before deploying this
 
