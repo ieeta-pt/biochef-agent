@@ -200,8 +200,10 @@ request.
 
 which creates a virtualenv, installs `requirements.txt`, and starts the service
 on the FastAPI default port. `snakemake` is one of the pinned requirements, so
-nothing else needs installing. It needs Python 3.11, 3.12 or 3.13, the versions
-CI tests, and refuses to start on any other.
+nothing else needs installing. It needs Python 3.11, 3.12, 3.13 or 3.14, the
+versions CI tests, and refuses to start on any other. On 3.14, `immutables`
+0.21 has no wheel, so pip builds it from source and needs a C compiler (gcc or
+clang).
 
 Configuration is by environment variable, and `example.env` lists them:
 
