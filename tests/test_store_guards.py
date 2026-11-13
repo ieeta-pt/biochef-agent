@@ -464,8 +464,6 @@ def test_an_unknown_run_state_is_refused_by_the_database(engine):
     "failed_check = 'expired'",
     "verdict = 'accepted', failed_check = 'expired'",
     "verdict = 'joined'",
-    "joined_request_id = 'req_1'",
-    "verdict = 'refused', failed_check = 'expired', joined_request_id = 'req_1'",
 ])
 def test_a_verdict_and_its_reason_go_together_in_the_database(engine, assignment):
     with db.writing(engine) as session:

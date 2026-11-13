@@ -70,9 +70,9 @@ class Action(str, Enum):
 
 
 class Verdict(str, Enum):
+    """What a request got, stored once. A repeat of it is counted, not stored."""
     ACCEPTED = "accepted"
     REFUSED = "refused"
-    JOINED = "joined"
 
 
 class RefusalCode(str, Enum):

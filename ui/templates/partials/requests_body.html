@@ -1,0 +1,51 @@
+{% from "partials/macros.html" import pill %}
+<div id="requests" class="flex flex-col gap-4">
+  <div role="tablist" aria-label="Filter" class="flex gap-1 border-b border-line">
+    {% for name, label in data.tabs %}
+    <button type="button" role="tab" aria-selected="{{ 'true' if data.filter == name else 'false' }}" class="tab-button {{ 'tab-on' if data.filter == name }}" hx-get="/ui/_/requests?filter={{ name }}" hx-target="#requests" hx-swap="outerHTML">{{ label }}</button>
+    {% endfor %}
+  </div>
+  <div class="flex flex-col items-start gap-6 wide:flex-row">
+    <section aria-label="Request list" class="card table-box w-full min-w-0 flex-1">
+      <table>
+        <thead><tr><th>Request</th><th>Study</th><th>Workflow</th><th>From</th><th>Received</th><th>Verdict</th></tr></thead>
+        <tbody>
+          {% for row in data.rows %}
+          <tr>
+            <td><button type="button" class="btn-link mono text-brand-strong" hx-get="/ui/_/requests?filter={{ data.filter }}&amp;selected={{ row.id }}" hx-target="#requests" hx-swap="outerHTML" {% if row.id == data.selected %}aria-current="true"{% endif %}>{{ row.id }}</button></td>
+            <td>{{ row.study }}</td>
+            <td>{{ row.workflow }}</td>
+            <td>{{ row.member }}</td>
+            <td class="whitespace-nowrap">{{ row.when }}</td>
+            <td>{{ pill(row.pill[0], row.pill[1]) }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6">No requests in the last 24 hours.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+    {% if data.panel %}
+    {% set panel = data.panel %}
+    <aside aria-label="Checks" class="card flex w-full flex-col gap-3 p-5 wide:w-[340px] wide:shrink-0">
+      <div class="flex flex-col gap-1">
+        <span class="lbl">Checks for</span>
+        <h2 class="mono m-0 text-base font-medium">{{ panel.id }}</h2>
+        <span class="text-[13px] text-muted">Expires {{ panel.expires }}</span>
+      </div>
+      <ol class="m-0 flex list-none flex-col gap-1.5 p-0 text-[13px]">
+        {% for mark, text in panel.marks %}
+        <li class="flex gap-2 {{ {'passed': 'text-ok', 'failed': 'text-bad font-medium', 'not_reached': 'text-muted', 'waiting': 'text-muted'}[mark] }}">
+          <span aria-hidden="true">{{ {'passed': '✓', 'failed': '✗', 'not_reached': '·', 'waiting': '·'}[mark] }}</span>
+          <span>{{ text }}{% if mark == 'not_reached' %} · not reached{% elif mark == 'waiting' %} · not checked yet{% endif %}</span>
+        </li>
+        {% endfor %}
+      </ol>
+      {% for reason in panel.reasons %}<p class="m-0 text-[13px] text-bad">{{ reason }}</p>{% endfor %}
+      {% if panel.repeats %}<p class="m-0 text-[13px] text-brand-deep"><span aria-hidden="true">↻ </span>{{ panel.repeats }}</p>{% endif %}
+      {% if panel.run_id %}<span class="mono text-[13px]">Run {{ panel.run_id }}</span>{% endif %}
+      {% if panel.refused %}<p class="m-0 text-[13px] text-muted">The refusal is signed with the node key and sent to the coordinator, so the requester sees why.</p>{% endif %}
+    </aside>
+    {% endif %}
+  </div>
+</div>

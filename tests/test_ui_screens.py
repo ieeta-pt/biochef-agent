@@ -535,7 +535,6 @@ def test_the_workflows_tab_of_the_mock(client):
 def test_the_requests_tab_of_the_mock(client):
     text = client.get(f"/ui/_/studies/{mock.CARDIO}/tab/requests").text
     assert "Refused · workflow not approved" in text
-    assert "Repeated · joined req_8f21" in text
     assert "Refused · expired" in text
     assert "Done · in review" in text and "Done · sent" in text
     assert "Rui Matos" in text and "gwas-qc · 1.3.2" in text
