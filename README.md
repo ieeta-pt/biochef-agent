@@ -503,7 +503,7 @@ python -m store downgrade base           # remove them
 python -m store.seed --fixture mock      # invented data, for development only
 ```
 
-SQLite by default, in WAL mode, because two processes open the file. The seed refuses a database that already holds data, and its decisions are not really signed: their signature is the literal `unsigned-fixture`.
+SQLite only, in WAL mode, because two processes open the file. Any other `BIOCHEF_DB_URL` is refused at start: concurrent approvals rely on SQLite's write lock, and no other database has been tested. The seed refuses a database that already holds data, and its decisions are not really signed: their signature is the literal `unsigned-fixture`.
 
 ## Before deploying this
 
