@@ -224,6 +224,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_NODE_SIGNING_KEY` | | path of the node's Ed25519 private key, see [The node's keys](#the-nodes-keys) |
 | `BIOCHEF_NODE_ENCRYPTION_KEY` | | path of the node's X25519 private key |
 | `BIOCHEF_NODE_NAME` | | this node's name, required by the UI |
+| `BIOCHEF_EGRESS_MODE` | | `airlock` or `manual`, required by the UI, and what makes an agent a node, see [Egress](#egress) |
 | `BIOCHEF_DATASET_BINDINGS_FILE` | | YAML file of dataset bindings, locked on the page |
 | `BIOCHEF_DATASET_BINDINGS_FROM_UI` | `false` | allow bindings to be made on the page |
 | `BIOCHEF_LS_LOGIN_ISSUER` | | LS Login issuer URL, for checking members' ID tokens |
@@ -553,6 +554,16 @@ The agent has no accounts. The TRE decides who may open the page, and `BIOCHEF_U
 The page refuses to start without `BIOCHEF_AUDIT_LOG`, because every decision made there has to reach the trail, and without the node's signing key or a migrated database. `run-ui.sh` starts `python -m ui`, which keeps uvicorn's proxy headers off. If you run `uvicorn ui.app:app` yourself, pass `--no-proxy-headers`, because otherwise uvicorn rewrites the client address that the identity check depends on.
 
 Everything the page loads is served by the agent: htmx, the fonts and the stylesheet are in `ui/static/`, and `ui/static.sha256` records the vendored files. `ui/static/app.css` is built and committed, so nothing else is needed at runtime. After changing a template or `ui/tailwind/input.css`, run `make css`, which downloads the pinned Tailwind CLI, checks it against `ui/tailwind/SHA256SUMS` and rebuilds the file. CI fails if the committed file differs.
+
+## Egress
+
+A node sets `BIOCHEF_EGRESS_MODE` to `airlock` or `manual`. That also turns on the mirror: the API process copies each run into `run_summary`, carries out cancellations asked for on the page, and rebuilds retained workspaces after a restart, because the database is the only channel between the two processes. A plain agent leaves it unset and needs no database.
+
+Output rules judge every file first, and a file held back never leaves in either mode. Then the TRE's airlock decides, or a data manager releases or withholds on the Run screen with a signed decision. A released run is encrypted for the member who submitted the request (`result_recipients: submitter`, the only value for now), signed with the node key and posted. A withheld one gets a signed notice with no files, made when it is withheld and kept until the coordinator can be told.
+
+The retention clock of `BIOCHEF_KEEP_OUTPUTS` starts at `sent` or `withheld`, not when the run ends. A run waiting for egress is never evicted, and when such runs fill `BIOCHEF_MAX_RETAINED_RUNS` a new run gets 503.
+
+The Policy Engine, the airlock and the coordinator's result endpoint are protocols in `node/` with fakes. Until the Policy Engine is connected, the agent checks `types` and `max_bytes` itself, from each file's name and size, and marks `min_count` and `aggregates_only` as not verified on every file that passes. A data manager releasing such a run ticks an explicit confirmation, and the signed decision names the rules that were not verified; in airlock mode the airlock receives the same marking. Without an airlock, an airlock node's runs wait: nothing skips that stage.
 
 ## Requests
 

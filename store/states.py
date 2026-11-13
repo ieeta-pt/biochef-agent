@@ -111,6 +111,11 @@ EGRESS_ALLOWED = {
     EgressState.SENT: set(),
 }
 
+class MessageKind(str, Enum):
+    """What waits in the outbox for the coordinator."""
+    WITHHELD_RESULT = "withheld_result"
+
+
 EGRESS_FINISHED = frozenset({EgressState.SENT, EgressState.WITHHELD})
 """Where the retention clock starts. Before this, outputs are still needed."""
 

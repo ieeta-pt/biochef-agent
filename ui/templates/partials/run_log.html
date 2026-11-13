@@ -1,0 +1,1 @@
+<pre id="run-log" class="mono m-0 max-h-96 overflow-auto whitespace-pre-wrap rounded-control bg-head p-3 text-xs"{% if detail.live and detail.log == 'run' %} data-live hx-get="/ui/_/runs/{{ detail.id }}/log" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>{{ detail.log_text }}</pre>
