@@ -11,9 +11,9 @@ fi
 source venv/bin/activate
 
 # The same check as run.sh, and for the same reasons.
-python -c 'import sys; sys.exit(0 if (3, 11) <= sys.version_info[:2] <= (3, 13) else 1)' || {
-    echo "This needs Python 3.11, 3.12 or 3.13; the venv has $(python --version 2>&1)." >&2
-    echo "Remove the venv directory and re-run with one of those as python3 on PATH." >&2
+python -c 'import sys; sys.exit(0 if (3, 11) <= sys.version_info[:2] <= (3, 14) else 1)' || {
+    echo "This needs Python 3.11, 3.12, 3.13 or 3.14; the venv has $(python --version 2>&1)." >&2
+    echo "Rebuild the venv with one of those, for example: rm -rf venv && python3.13 -m venv venv && ./run-ui.sh" >&2
     exit 1
 }
 
