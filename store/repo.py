@@ -9,9 +9,10 @@ node/verify.py will take `now`: a rule about time should be testable without
 waiting for it.
 """
 
+import unicodedata
 from datetime import datetime, timezone
 
-from sqlalchemy import delete, func
+from sqlalchemy import delete, func, update
 from sqlmodel import select
 
 from store.errors import (AlreadyPosted, Conflict, IdentityNotVerified,
@@ -27,6 +28,14 @@ from store.states import (BUSY_RUN_STATES, CANCELLABLE_RUN_STATES,
 
 SHORT_ID_LENGTH = 8
 """How much of an ls_aai_id the page shows when a member has no verified name."""
+
+MAX_NAME_LENGTH = 128
+"""Longer than any real name. A longer claim is shown as no name at all."""
+
+_INVISIBLE = {"Cc", "Cf", "Zl", "Zp"}
+"""Control and format characters, and line and paragraph separators: what can
+reorder, hide or break the text around a name on the page where approvals
+happen (U+202E, zero-width joiners, DEL, U+2028)."""
 
 
 def utcnow():
@@ -74,11 +83,16 @@ def add_study_version(session, *, study_id, version, digest, raw, goal, proposer
 
     if session.get(Study, study_id) is None:
         session.add(Study(id=study_id, created_at=now))
+    # A poll can deliver a version after a newer one was approved here. It could
+    # never be approved, so it arrives superseded rather than waiting for ever.
+    approved = approved_version(session, study_id)
+    state = (VersionState.SUPERSEDED if approved is not None
+             and approved.version > version else VersionState.PENDING)
     row = StudyVersion(
         study_id=study_id, version=version, digest=digest, raw=raw, goal=goal,
         proposer=proposer, members=members, nodes=nodes, datasets=datasets,
         output_rules=output_rules, previous_digest=previous_digest,
-        received_at=now, state_changed_at=now)
+        received_at=now, state=state.value, state_changed_at=now)
     session.add(row)
     session.flush()
     return row
@@ -125,9 +139,21 @@ def pending_study_versions(session):
 
 def add_member_key(session, *, study_version_id, member, ls_aai_id, signing_key,
                    result_key, binding_token):
-    row = MemberKey(study_version_id=study_version_id, member=member,
-                    ls_aai_id=ls_aai_id, signing_key=signing_key,
-                    result_key=result_key, binding_token=binding_token)
+    """Record a member's keys as the study version lists them.
+
+    Idempotent like add_study_version, because the poll that adds them repeats.
+    Different keys for the same member of the same version are refused: the
+    version is signed, so its keys cannot change.
+    """
+    fields = {"ls_aai_id": ls_aai_id, "signing_key": signing_key,
+              "result_key": result_key, "binding_token": binding_token}
+    found = session.get(MemberKey, (study_version_id, member))
+    if found is not None:
+        if any(getattr(found, name) != value for name, value in fields.items()):
+            raise Conflict(f"the keys of {member} in study version "
+                           f"{study_version_id} differ from the ones received")
+        return found
+    row = MemberKey(study_version_id=study_version_id, member=member, **fields)
     session.add(row)
     return row
 
@@ -142,9 +168,10 @@ def _usable_name(claims):
     name = claims.get("name")
     if not isinstance(name, str) or not name.strip():
         return None
-    if any(ord(character) < 32 for character in name):
+    if any(unicodedata.category(character) in _INVISIBLE for character in name):
         return None
-    return name.strip()
+    name = name.strip()
+    return name if len(name) <= MAX_NAME_LENGTH else None
 
 
 def mark_identity_verified(session, study_version_id, member, claims):
@@ -195,29 +222,48 @@ def _require_verified_members(session, version):
                 f"study version {version.id}: {member} is not verified")
 
 
+def _end_workflows(session, study_version_id, state, now):
+    """Move the workflows still open under a study version along with it."""
+    for workflow in workflow_versions(session, study_version_id):
+        if workflow.state in (VersionState.PENDING.value,
+                              VersionState.APPROVED.value):
+            _move(workflow, WORKFLOW_ALLOWED, state, now)
+
+
 def approve_study_version(session, version_id, now=None):
     """Approve a version, superseding the approved one in the same transaction.
 
     Returns the version it replaced, or None. Its workflows go with it, because
-    approvals do not carry over to a new study version.
+    approvals do not carry over to a new study version. Older versions still
+    pending are superseded too, with their workflows: they could never be
+    approved after this one.
+
+    Everything is checked before anything moves, so a refusal leaves the store
+    as it was even for a caller that catches the error and commits.
     """
     now = now or utcnow()
     version = get_study_version(session, version_id)
+    current = VersionState(version.state)
+    if VersionState.APPROVED not in STUDY_ALLOWED[current]:
+        raise IllegalTransition(f"study_version {version.id}: {current.value} -> "
+                                f"{VersionState.APPROVED.value}")
     _require_verified_members(session, version)
-
     replaced = approved_version(session, version.study_id)
+    if replaced is not None and replaced.version > version.version:
+        raise Conflict(f"study {version.study_id}: v{replaced.version} is "
+                       f"approved, so v{version.version} cannot replace it")
+
     if replaced is not None:
-        if replaced.version > version.version:
-            raise Conflict(f"study {version.study_id}: v{replaced.version} is "
-                           f"approved, so v{version.version} cannot replace it")
         _move(replaced, STUDY_ALLOWED, VersionState.SUPERSEDED, now)
-        for workflow in workflow_versions(session, replaced.id):
-            if workflow.state in (VersionState.PENDING.value,
-                                  VersionState.APPROVED.value):
-                _move(workflow, WORKFLOW_ALLOWED, VersionState.SUPERSEDED, now)
+        _end_workflows(session, replaced.id, VersionState.SUPERSEDED, now)
         # The index allows one approved row at any instant, and a flush orders
         # updates by key rather than by what they mean.
         session.flush()
+    for older in study_versions(session, version.study_id):
+        if (older.version < version.version
+                and older.state == VersionState.PENDING.value):
+            _move(older, STUDY_ALLOWED, VersionState.SUPERSEDED, now)
+            _end_workflows(session, older.id, VersionState.SUPERSEDED, now)
 
     _move(version, STUDY_ALLOWED, VersionState.APPROVED, now)
     session.flush()
@@ -231,8 +277,11 @@ def refuse_study_version(session, version_id, now=None):
 
 
 def withdraw_study_version(session, version_id, now=None):
+    """Withdraw a version, and the workflows still open under it."""
+    now = now or utcnow()
     version = get_study_version(session, version_id)
-    _move(version, STUDY_ALLOWED, VersionState.WITHDRAWN, now or utcnow())
+    _move(version, STUDY_ALLOWED, VersionState.WITHDRAWN, now)
+    _end_workflows(session, version.id, VersionState.WITHDRAWN, now)
     return version
 
 
@@ -371,26 +420,59 @@ def unposted_decisions(session):
         .order_by(Decision.id)))
 
 
+def has_left(decision):
+    """Whether a decision may be at the coordinator, so it can no longer be undone.
+
+    True from the moment its POST is claimed, not only once the POST returned:
+    a POST whose answer was lost may still have arrived.
+    """
+    return (decision.posting_started_at is not None
+            or decision.posted_to_coordinator_at is not None)
+
+
+def claim_for_posting(session, decision_id, now=None):
+    """Mark a decision as on its way, before the POST that sends it.
+
+    The caller commits this in its own transaction and only then sends, so an
+    undo either ran first, and the decision is gone (NotFound: send nothing), or
+    runs after and is refused. A decision claimed before and never marked posted,
+    because the process stopped, is returned again so the POST can be retried.
+    One statement with the condition in it, like delete_unposted_decision.
+    """
+    session.exec(update(Decision).where(
+        Decision.id == decision_id, Decision.posting_started_at.is_(None))
+        .values(posting_started_at=now or utcnow()))
+    row = _get(session, Decision, decision_id)
+    session.refresh(row)
+    return row
+
+
 def mark_posted(session, decision_id, now=None):
     row = _get(session, Decision, decision_id)
     if row.posted_to_coordinator_at is not None:
         raise Conflict(f"decision {decision_id} was already posted")
-    row.posted_to_coordinator_at = now or utcnow()
+    now = now or utcnow()
+    if row.posting_started_at is None:
+        # Posted implies on its way: an undo must see it either way.
+        row.posting_started_at = now
+    row.posted_to_coordinator_at = now
     return row
 
 
 def delete_unposted_decision(session, decision_id):
-    """Undo a decision that has not left this node. Refused once it has.
+    """Undo a decision that has not left this node. Refused once it may have.
 
-    One statement with the condition in it, so that a poll posting the decision
+    One statement with the condition in it, so that a poll claiming the decision
     at the same moment cannot slip between a check and a delete.
     """
     result = session.exec(delete(Decision).where(
         Decision.id == decision_id,
+        Decision.posting_started_at.is_(None),
         Decision.posted_to_coordinator_at.is_(None)))
     if result.rowcount == 0:
         _get(session, Decision, decision_id)
-        raise AlreadyPosted(f"decision {decision_id} was already posted")
+        raise AlreadyPosted(f"decision {decision_id} may already be at the "
+                            f"coordinator")
 
 
 # Requests
@@ -502,20 +584,23 @@ def count_refused_since(session, since):
 def save_run(session, run_id, **fields):
     """Create or update a run's record. Written by the API process only.
 
-    `cancel_requested` and `egress_state` are not settable here: they have their
-    own functions, so that no general update can clear a cancellation or skip a
-    stage of egress.
+    `cancel_requested`, `egress_state` and `retain_until` are not settable here:
+    they have their own functions, so that no general update can clear a
+    cancellation, skip a stage of egress or move the retention clock. The files
+    under review are fixed once the rules have run (models.EGRESS_FIELDS).
     """
-    for protected in ("cancel_requested", "egress_state"):
-        if protected in fields:
-            raise Conflict(f"{protected} has its own function")
+    for name in fields:
+        if name in ("cancel_requested", "egress_state", "retain_until"):
+            raise Conflict(f"{name} is not set through save_run")
+        if name not in RunSummary.model_fields:
+            raise Conflict(f"run_summary has no field {name!r}")
     row = session.get(RunSummary, run_id)
     if row is None:
+        if "state" not in fields:
+            raise Conflict(f"a new run {run_id} needs a state")
         row = RunSummary(run_id=run_id, state=fields.pop("state"))
         session.add(row)
     for name, value in fields.items():
-        if name not in RunSummary.model_fields:
-            raise Conflict(f"run_summary has no field {name!r}")
         setattr(row, name, value)
     session.flush()
     return row
@@ -550,8 +635,11 @@ def set_egress_state(session, run_id, state, now=None, *, retain_seconds=None):
     current = EgressState(row.egress_state)
     if state not in EGRESS_ALLOWED[current]:
         raise IllegalTransition(f"run {run_id}: {current.value} -> {state.value}")
+    if state in EGRESS_FINISHED and retain_seconds is None:
+        raise Conflict(f"run {run_id}: {state.value} starts the retention clock, "
+                       f"so it needs retain_seconds")
     row.egress_state = state.value
-    if state in EGRESS_FINISHED and retain_seconds is not None:
+    if state in EGRESS_FINISHED:
         moment = (now or utcnow()).timestamp() + retain_seconds
         row.retain_until = datetime.fromtimestamp(moment, timezone.utc)
     return row
