@@ -19,7 +19,11 @@ class VersionState(str, Enum):
 
 
 STUDY_ALLOWED = {
-    VersionState.PENDING: {VersionState.APPROVED, VersionState.REFUSED},
+    # A version still waiting when a newer one is approved goes with the one it
+    # would have replaced: approving it later is refused, so it would wait for
+    # ever.
+    VersionState.PENDING: {VersionState.APPROVED, VersionState.REFUSED,
+                           VersionState.SUPERSEDED},
     VersionState.APPROVED: {VersionState.WITHDRAWN, VersionState.SUPERSEDED},
     VersionState.REFUSED: set(),
     VersionState.WITHDRAWN: set(),
@@ -27,10 +31,10 @@ STUDY_ALLOWED = {
 }
 
 WORKFLOW_ALLOWED = {
-    # A workflow still waiting when its study version is replaced goes with it:
-    # approvals do not carry over, so nothing would ever decide it.
+    # A workflow still waiting when its study version is replaced or withdrawn
+    # goes with it: approvals do not carry over, so nothing would ever decide it.
     VersionState.PENDING: {VersionState.APPROVED, VersionState.REFUSED,
-                           VersionState.SUPERSEDED},
+                           VersionState.SUPERSEDED, VersionState.WITHDRAWN},
     VersionState.APPROVED: {VersionState.WITHDRAWN, VersionState.SUPERSEDED},
     VersionState.REFUSED: set(),
     VersionState.WITHDRAWN: set(),
@@ -109,6 +113,11 @@ EGRESS_ALLOWED = {
 
 EGRESS_FINISHED = frozenset({EgressState.SENT, EgressState.WITHHELD})
 """Where the retention clock starts. Before this, outputs are still needed."""
+
+RUN_STATES = frozenset({"QUEUED", "INITIALIZING", "RUNNING", "COMPLETE",
+                        "EXECUTOR_ERROR", "SYSTEM_ERROR", "CANCELING",
+                        "CANCELED"})
+"""The WES states of section 6.4, as named by runs.RunState."""
 
 CANCELLABLE_RUN_STATES = frozenset({"QUEUED", "INITIALIZING", "RUNNING"})
 """As named by runs.RunState. Strings, so the store need not import the runner."""
