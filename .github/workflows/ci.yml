@@ -12,8 +12,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The floor. run.sh enforces the same number at runtime, and the two must not
-  # drift: this matrix is the only thing that proves the floor is real.
+  # The floor. run.sh enforces the same range as the suite matrix below, and
+  # tests/test_python_guard.py fails if they drift: the matrix is the only thing
+  # that proves the range is real.
   FLOOR: "3.11"
 
 jobs:
@@ -37,13 +38,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The floor, because it is the version most likely to break silently,
-        # and the newest, because it is what development happens on. Adding a
-        # version here is the same decision as changing the floor in run.sh.
-        # 3.11 is the declared floor on this branch. Test it as well as the
-        # newer development interpreters so the code and pinned requirements
-        # prove the version promised by run.sh and .python-version.
-        python: ["3.11", "3.12", "3.13"]
+        # Every version run.sh accepts, from the floor the pinned requirements
+        # impose (3.11, also .python-version) to the newest. Adding or removing
+        # one here is the same decision as changing the range in run.sh, and
+        # tests/test_python_guard.py fails until both agree. On 3.14 immutables
+        # builds from source; ubuntu-latest has gcc, so this proves it builds.
+        python: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v4
