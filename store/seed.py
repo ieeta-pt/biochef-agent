@@ -307,11 +307,12 @@ def _generated_runs(session):
 
 
 def _seed_bindings(session, keys, now):
-    for dataset_id, source, location, by in mock.BINDINGS:
+    for dataset_id, source, location, by, visa_value in mock.BINDINGS:
         at = now - mock.days(2)
         repo.bind_dataset(session, dataset_id=dataset_id,
                           source=BindingSource(source), type="localpath",
-                          location=location, bound_by=by, now=at)
+                          location=location, visa_value=visa_value, bound_by=by,
+                          now=at)
         if source == "page":
             _decide(session, keys, SubjectType.DATASET_BINDING, dataset_id, Action.BIND,
                     by, at)

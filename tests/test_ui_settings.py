@@ -254,3 +254,61 @@ def test_run_ui_uses_that_command():
     assert "exec python -m ui" in script
     assert "uvicorn" not in script.replace("uvicorn's", "")
     assert os.access(REPO_ROOT / "run-ui.sh", os.X_OK)
+
+
+# Dataset bindings
+
+
+def test_bindings_are_off_by_default(dev):
+    loaded = settings.load()
+    assert (loaded.bindings_from_ui, loaded.bindings_file) == (False, None)
+
+
+@pytest.mark.parametrize("value", ["yes", "TRUE", "1"])
+def test_the_switch_is_true_or_false(dev, value):
+    dev.setenv("BIOCHEF_DATASET_BINDINGS_FROM_UI", value)
+    with pytest.raises(SettingsError, match="true or false"):
+        settings.load()
+
+
+@pytest.mark.parametrize("name,value", [
+    ("BIOCHEF_DATASET_BINDINGS_FROM_UI", "true"),
+    ("BIOCHEF_DATASET_BINDINGS_FILE", "/etc/biochef/datasets.yaml")])
+def test_bindings_need_localpath_and_a_root(dev, tmp_path, name, value):
+    dev.setenv(name, value)
+    dev.setenv("BIOCHEF_DATA_SOURCES", "upload")
+    dev.setenv("BIOCHEF_LOCAL_ROOT", str(tmp_path))
+    with pytest.raises(SettingsError, match="localpath"):
+        settings.load()
+    dev.setenv("BIOCHEF_DATA_SOURCES", "upload,localpath")
+    dev.setenv("BIOCHEF_LOCAL_ROOT", str(tmp_path / "missing"))
+    with pytest.raises(SettingsError, match="BIOCHEF_LOCAL_ROOT"):
+        settings.load()
+    dev.setenv("BIOCHEF_LOCAL_ROOT", str(tmp_path))
+    assert settings.load().local_root == str(tmp_path)
+
+
+def test_a_bad_bindings_file_stops_the_page(ready, dev, tmp_path):
+    migrate.upgrade(ready)
+    (tmp_path / "data").mkdir()
+    bad = tmp_path / "datasets.yaml"
+    bad.write_text("EGAD1:\n  type: localpath\n  location: ../..\n")
+    dev.setenv("BIOCHEF_DATA_SOURCES", "localpath")
+    dev.setenv("BIOCHEF_LOCAL_ROOT", str(tmp_path / "data"))
+    dev.setenv("BIOCHEF_DATASET_BINDINGS_FILE", str(bad))
+    with pytest.raises(SettingsError, match="outside the data root"):
+        ui_app.configured_app()
+
+
+def test_a_good_bindings_file_is_synced_at_start(ready, dev, tmp_path):
+    migrate.upgrade(ready)
+    (tmp_path / "data" / "cohort").mkdir(parents=True)
+    good = tmp_path / "datasets.yaml"
+    good.write_text("EGAD1:\n  type: localpath\n  location: cohort\n")
+    dev.setenv("BIOCHEF_DATA_SOURCES", "localpath")
+    dev.setenv("BIOCHEF_LOCAL_ROOT", str(tmp_path / "data"))
+    dev.setenv("BIOCHEF_DATASET_BINDINGS_FILE", str(good))
+    app = ui_app.configured_app()
+    from store import db, repo
+    with db.reading(app.state.bind) as session:
+        assert repo.dataset_binding(session, "EGAD1").source == "config"

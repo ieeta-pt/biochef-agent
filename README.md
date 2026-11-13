@@ -224,6 +224,8 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_NODE_SIGNING_KEY` | | path of the node's Ed25519 private key, see [The node's keys](#the-nodes-keys) |
 | `BIOCHEF_NODE_ENCRYPTION_KEY` | | path of the node's X25519 private key |
 | `BIOCHEF_NODE_NAME` | | this node's name, required by the UI |
+| `BIOCHEF_DATASET_BINDINGS_FILE` | | YAML file of dataset bindings, locked on the page |
+| `BIOCHEF_DATASET_BINDINGS_FROM_UI` | `false` | allow bindings to be made on the page |
 | `BIOCHEF_LS_LOGIN_ISSUER` | | LS Login issuer URL, for checking members' ID tokens |
 | `BIOCHEF_EDITOR_CLIENT_ID` | | the editor's LS Login client id, the audience of those tokens |
 | `BIOCHEF_UI_HOST` | `127.0.0.1` | interface the UI binds to |
@@ -551,6 +553,24 @@ The agent has no accounts. The TRE decides who may open the page, and `BIOCHEF_U
 The page refuses to start without `BIOCHEF_AUDIT_LOG`, because every decision made there has to reach the trail, and without the node's signing key or a migrated database. `run-ui.sh` starts `python -m ui`, which keeps uvicorn's proxy headers off. If you run `uvicorn ui.app:app` yourself, pass `--no-proxy-headers`, because otherwise uvicorn rewrites the client address that the identity check depends on.
 
 Everything the page loads is served by the agent: htmx, the fonts and the stylesheet are in `ui/static/`, and `ui/static.sha256` records the vendored files. `ui/static/app.css` is built and committed, so nothing else is needed at runtime. After changing a template or `ui/tailwind/input.css`, run `make css`, which downloads the pinned Tailwind CLI, checks it against `ui/tailwind/SHA256SUMS` and rebuilds the file. CI fails if the committed file differs.
+
+## Dataset bindings
+
+A study names datasets by id, and a binding says which folder under `BIOCHEF_LOCAL_ROOT` holds one. Both ways of binding need `localpath` in `BIOCHEF_DATA_SOURCES` and an existing `BIOCHEF_LOCAL_ROOT`.
+
+```yaml
+# BIOCHEF_DATASET_BINDINGS_FILE
+EGAD00001009912:
+  type: localpath
+  location: cardio/2019_2024/
+  visa_value: https://dac.example.org/datasets/EGAD00001009912
+```
+
+`visa_value` is the exact value the data access committee issues in a visa for this dataset, usually a URL. On a node with `BIOCHEF_PASSPORT_REQUIRE_VISA`, a request is compared with it and with nothing else, so a dataset with no `visa_value` refuses every request as `visa_missing`, and the Datasets page says so.
+
+The file is read when the page starts. Its bindings are locked on the page, and it wins over anything bound there: a page binding it replaces gets a signed `unbind`, and the page reports it. With `BIOCHEF_DATASET_BINDINGS_FROM_UI=true` a data manager can bind, edit and remove the others, each as a signed decision. Anything that resolves outside the root is refused, with the same check `localpath` applies to a run's inputs.
+
+A binding names a folder and a run reads files: `node/datasets.file_in_binding` turns a file named relative to the dataset into a `localpath` path, and refuses anything that leaves the dataset's own folder.
 
 ## Member identity
 
