@@ -119,6 +119,15 @@ class MessageKind(str, Enum):
 EGRESS_FINISHED = frozenset({EgressState.SENT, EgressState.WITHHELD})
 """Where the retention clock starts. Before this, outputs are still needed."""
 
+TES_LEASE_SECONDS = 30
+"""How long the TES API's place in the database stays its own without a heartbeat. The
+listener (tesapi.records) and the Node screen, which says whether one is running,
+read the same number."""
+
+TES_STATES = ("QUEUED", "INITIALIZING", "RUNNING", "CANCELING", "COMPLETE",
+              "EXECUTOR_ERROR", "SYSTEM_ERROR", "CANCELED")
+"""The states of a TES task, in the order a screen lists them."""
+
 RUN_STATES = frozenset({"QUEUED", "INITIALIZING", "RUNNING", "COMPLETE",
                         "EXECUTOR_ERROR", "SYSTEM_ERROR", "CANCELING",
                         "CANCELED"})
@@ -129,6 +138,18 @@ CANCELLABLE_RUN_STATES = frozenset({"QUEUED", "INITIALIZING", "RUNNING"})
 
 BUSY_RUN_STATES = frozenset({"INITIALIZING", "RUNNING", "CANCELING"})
 """A run holding a slot of BIOCHEF_MAX_CONCURRENT_RUNS."""
+
+
+class TesState(str, Enum):
+    """The states of a TES task (GA4GH TES 1.1), as the TES API keeps them."""
+    QUEUED = "QUEUED"
+    INITIALIZING = "INITIALIZING"
+    RUNNING = "RUNNING"
+    CANCELING = "CANCELING"
+    COMPLETE = "COMPLETE"
+    EXECUTOR_ERROR = "EXECUTOR_ERROR"
+    SYSTEM_ERROR = "SYSTEM_ERROR"
+    CANCELED = "CANCELED"
 
 
 class BindingSource(str, Enum):

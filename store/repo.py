@@ -19,7 +19,7 @@ from store.errors import (AlreadyPosted, Conflict, IdentityNotVerified,
                           IllegalTransition, NotFound, StaleList)
 from store.models import (DatasetBinding, Decision, FederationList, MemberKey,
                           NodeStatus, OutgoingMessage, Request, RunSummary, Study,
-                          StudyVersion, WorkflowVersion)
+                          StudyVersion, TesListener, TesTask, WorkflowVersion)
 from store.states import (BUSY_RUN_STATES, CANCELLABLE_RUN_STATES,
                           EGRESS_ALLOWED, EGRESS_FINISHED, STUDY_ALLOWED,
                           WORKFLOW_ALLOWED, BindingSource, EgressState,
@@ -879,3 +879,25 @@ def record_network_check(session, *, ok, detail, now=None):
 
 def node_status(session):
     return session.get(NodeStatus, 1)
+
+
+# The TES API's own tables, which the Node screen only reads
+
+
+def tes_listener(session):
+    """The lease the TES API holds on this database, or None if none ever did."""
+    return session.get(TesListener, 1)
+
+
+def tes_task_counts(session):
+    """State -> how many tasks are in it, for the states that have any."""
+    rows = session.exec(select(TesTask.state, func.count()).group_by(TesTask.state))
+    return {state: count for state, count in rows}
+
+
+def latest_tes_tasks(session, limit=10):
+    """The newest tasks. Only what a list needs: never a command or a log."""
+    return list(session.exec(
+        select(TesTask.id, TesTask.name, TesTask.owner, TesTask.image, TesTask.state,
+               TesTask.created_at)
+        .order_by(TesTask.created_at.desc(), TesTask.id).limit(limit)))

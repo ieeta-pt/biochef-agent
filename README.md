@@ -272,6 +272,18 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_TES_STAGING` | | a directory of the agent's, which the server can read and write, required with `tes` |
 | `BIOCHEF_TES_HELPER` | | the absolute path of the installed `tes-step-root`, required with `tes` |
 | `BIOCHEF_TES_ISOLATION` | | `attested` or `none`, required with `tes`: the operator's statement about the server, see [The TES runner](#the-tes-runner) |
+| `BIOCHEF_TESAPI_TOKENS` | | the absolute path of a file (mode 0600) of `name sha256:<hex>` lines, one per caller of the TES API; required by `python -m tesapi` |
+| `BIOCHEF_TESAPI_IMAGES` | | comma-separated images by digest a TES task may name; required by `python -m tesapi` |
+| `BIOCHEF_TESAPI_READ_DIRS` | | comma-separated absolute directories a TES task may read its inputs from, through `file://`; required by `python -m tesapi` |
+| `BIOCHEF_TESAPI_WRITE_DIRS` | | comma-separated absolute directories a TES task may write its outputs to; required, and may share no directory with `BIOCHEF_TESAPI_READ_DIRS`, or the listener does not start |
+| `BIOCHEF_TESAPI_DIRS` | | removed. If set, `python -m tesapi` refuses to start and says to use the two above |
+| `BIOCHEF_TESAPI_HOST` | `127.0.0.1` | the interface the TES API listens on; anything else needs TLS |
+| `BIOCHEF_TESAPI_PORT` | `8082` | the TES API's port |
+| `BIOCHEF_TESAPI_TLS_CERT`, `BIOCHEF_TESAPI_TLS_KEY` | | certificate and key files, both or neither, required off this host |
+| `BIOCHEF_TESAPI_MAX_CONCURRENT` | `1` | how many TES tasks run at once, apart from the agent's own runs |
+| `BIOCHEF_TESAPI_MAX_QUEUED` | `16` | how many wait for a slot; another gets 503 |
+| `BIOCHEF_TESAPI_MAX_BYTES` | `1073741824` | the most a task may copy in and out together |
+| `BIOCHEF_TESAPI_TIMEOUT` | `900` | seconds a task may run |
 | `BIOCHEF_CONTAINER_IMAGE` | `docker://debian:stable-slim` | image each step runs in, under the `apptainer` runner |
 | `BIOCHEF_APPTAINER_BINARY` | | the absolute path of the apptainer or SingularityCE binary, required with `apptainer` and `singularity` |
 | `BIOCHEF_APPTAINER_CACHE` | `apptainer-cache` | where pulled container images are kept between runs |
@@ -424,6 +436,26 @@ The script runs a workspace only if it is a directory directly under `RUN_ROOT`,
 
 - `disable` runs each step with `--security-opt=label=disable`: no SELinux separation for the container, and the workspace mount works without relabelling anything. The other confinements stay: no network, no capabilities, `no-new-privileges`, the read-only root, the limits, the step's user and only the run's workspace mounted.
 - `keep` leaves podman's SELinux labelling on, so a step runs confined as `container_t`. The workspace is not relabelled, so on a host with SELinux enforcing, the directory runs are made in (`BIOCHEF_RUN_ROOT`) has to carry a label containers may use, such as `container_file_t`, or every step fails with permission denied. On a host without SELinux it changes nothing.
+
+### The TES API
+
+`python -m tesapi` is a listener of its own that lets the TRE's workflow engines send the node a GA4GH TES task: one command in one image, with files in and out. It is not part of the agent's API. The agent's API serves federations and editors, this serves the TRE's own tools, and the two share no credential, queue, slot or port. It keeps its tasks, and its place as the one listener of the database, in two tables of the node's database and opens no other. It is for a TRE that already has a workflow engine speaking TES, such as Nextflow's TES executor, and wants the node to run what it sends under the node's own guarantees.
+
+It refuses first:
+
+- **Every route needs a token, service-info included.** `Authorization: Bearer <token>`, compared against the SHA-256 in `BIOCHEF_TESAPI_TOKENS`, so a copy of that file is not a way in. `python -m tesapi token <name>` makes a token, shows it once, and prints the line to add. There is no setting that turns authentication off, and `/docs` and `/openapi.json` do not exist. The listener starts without `BIOCHEF_AUDIT_LOG` or any list below set: none has a default. Listening on anything but this host needs `BIOCHEF_TESAPI_TLS_CERT` and `BIOCHEF_TESAPI_TLS_KEY`.
+- **Only listed images.** A task runs only an image in `BIOCHEF_TESAPI_IMAGES`, each `repository@sha256:<digest>`. A tag, another digest, or a second executor is refused. The runner has to be able to run them: rootful podman runs only the image in its configuration file, and `subprocess` runs none, so the listener does not start with them.
+- **Only listed directories, and only through `file://`.** Inputs are read from `BIOCHEF_TESAPI_READ_DIRS` and outputs written to `BIOCHEF_TESAPI_WRITE_DIRS`, two lists that may share no directory: the same place, or one inside the other, and the listener does not start. So nothing a task wrote can be read back as an input, and nothing it read can be overwritten. Any other URL scheme is refused. A path is accepted only if it is already what it says: normal, absolute, behind no symlink. Do not list a directory that anyone the operator does not trust can write to, because a path can be swapped between the check and the copy.
+- **Never the node's own data.** The listener does not start if a listed directory contains, or lies inside, `BIOCHEF_LOCAL_ROOT` (where studies' datasets are bound), `BIOCHEF_RUN_ROOT`, the audit log, the database file, the node's keys, `BIOCHEF_TES_STAGING`, the token and TLS files, or the apptainer cache. Each task is checked against the same list again. A task has no way to name a dataset binding, because the listener never reads them.
+- **Nothing of the caller's goes into the step.** `env`, `stdin`, `stdout`, `stderr`, `volumes` and `resources` are refused, not ignored, as is anything the listener does not understand. The command is a list of arguments, written into the step as one quoted command.
+
+Then it runs the task like any other step. The task becomes a Snakefile with one rule and goes through `BIOCHEF_RUNNER`, the same runner and image mechanism as a federated step, so its network, filesystem and environment guarantees are that runner's, and `BIOCHEF_REQUIRE_NETWORK_ISOLATION` is applied to the listener too. At start it records `node.runner.isolation_not_required` if that rule is off, and runs the same network check as the agent. The task runs in a workspace of its own, which is removed. Paths in a task are `/work/<file>`: the command runs in the workspace, so `/work/x` and `x` are the same file, and an argument that starts with `/work` is written as the workspace's path. A path inside a shell script in an argument is not.
+
+Its queue and slots are its own: `BIOCHEF_TESAPI_MAX_CONCURRENT` run at once, `BIOCHEF_TESAPI_MAX_QUEUED` wait, and the next gets 503 with `Retry-After`. They are separate from the agent's `BIOCHEF_MAX_CONCURRENT_RUNS` and from the requests the coordinator sends, though not from the machine's CPU and memory.
+
+What TES asks for and this does not do: `exit_code` is Snakemake's, not the tool's, so any failure is 1 and the tool's own message is in `stderr`; logs arrive when the task ends; a caller sees only its own tasks; the newest 1000 are kept in the database (`tes_task`, migration 0006, and `tes_listener`, migration 0007, so run `python -m store migrate` first or the listener refuses to start), with the URLs and not the inline content of their inputs, and one that was queued or running when the listener stopped is read back as `SYSTEM_ERROR` with the reason in `system_logs` and an audit event, because nothing of it is left to finish; one listener holds a database at a time: a second one started against it refuses to start and says which pid on which host holds it, because starting would end the first one's running tasks. The first renews a lease in `tes_listener` every 10 seconds and gives it up when it stops cleanly; one that was killed is replaced after 30 seconds without a renewal, and the replacement records `tes.lock.acquired` with whom it replaced. A listener that finds its place taken, or cannot reach the database for most of the lease, stops taking tasks, cancels the ones it has and records `tes.lock.lost`. Listeners on different machines that share a database need clocks that agree to a few seconds; a `DIRECTORY` output is merged into the destination, replacing plain files and refusing anything else.
+
+The audit trail gets, with `"source": "tes"`: `tes.start`, `tes.task.created` (the image, the URLs and a SHA-256 of the command, never the arguments, which can hold secrets), `tes.task.state` at every state, `tes.task.refused` and `tes.auth.refused`. The last is written at most once a second, with the count of those it did not write. If the trail cannot be written the task is refused with 503.
 
 ### What each runner guarantees
 
