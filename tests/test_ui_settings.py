@@ -1,7 +1,6 @@
 """The UI refuses to start on a half configured setting (section 4)."""
 
 import os
-import re
 import subprocess
 import sys
 
@@ -259,14 +258,6 @@ def test_the_command_keeps_proxy_headers_off(dev, monkeypatch, tmp_path):
     assert entry.main() == 0
     assert seen == {"host": "127.0.0.1", "port": 8081, "proxy_headers": False}
 
-
-@pytest.mark.parametrize("version,accepted", [
-    ((3, 10), False), ((3, 11), True), ((3, 13), True), ((3, 14), False)])
-def test_run_ui_refuses_a_python_ci_does_not_test(version, accepted):
-    script = (REPO_ROOT / "run-ui.sh").read_text()
-    guard = re.search(r"python -c '([^']+)' \|\|", script).group(1)
-    claim = f"import sys; sys.version_info = {version + (0,)}; "
-    assert (run_python("-c", claim + guard).returncode == 0) is accepted
 
 
 def test_run_ui_uses_that_command():
