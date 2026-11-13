@@ -301,12 +301,13 @@ def test_a_token_with_no_name_verifies_without_one(engine):
 
 
 def test_a_later_failure_takes_the_name_away(engine):
+    """The keys are fixed with the study version, so a later check fails for a
+    reason outside them: here LS Login no longer publishes the token's key."""
     version = member(engine, LOGIN.token())
-    check(engine, version)
-    with db.writing(engine) as session:
-        key = repo.member_keys(session, version)[0]
-        key.binding_token = LOGIN.token(nonce=NONCE[::-1])
     _, key = check(engine, version)
+    assert key.identity_verified is True and key.display_name == "Ana Costa"
+    rotated = Verifier(ISSUER, EDITOR, keyset=keyset(Issuer()))
+    _, key = check(engine, version, rotated)
     assert key.identity_verified is False and key.display_name is None
 
 

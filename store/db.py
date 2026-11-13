@@ -55,14 +55,19 @@ def _configure_sqlite(engine):
 
 
 def make_engine(database_url=None):
-    """An engine for this URL. Refuses a SQLite file that could not be created.
+    """An engine for this URL. Refuses anything but SQLite, and a SQLite file
+    that could not be created.
 
-    SQLite's own message for that is "unable to open database file", which does
-    not say which file or why.
+    Only SQLite is supported: the write lock above is how concurrent approvals
+    are kept apart, and on another database they would end in a raw integrity
+    error from the partial index, with no row locks taken. SQLite's own message
+    for a missing directory is "unable to open database file", which does not
+    say which file or why.
     """
     parsed = make_url(database_url or url())
     if parsed.get_backend_name() != "sqlite":
-        return create_engine(parsed)
+        raise StoreError(f"BIOCHEF_DB_URL must be a sqlite:// URL, not "
+                         f"{parsed.get_backend_name()}: only SQLite is supported")
 
     if parsed.database and parsed.database != ":memory:":
         parent = Path(parsed.database).parent
