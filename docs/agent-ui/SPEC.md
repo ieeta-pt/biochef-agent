@@ -87,7 +87,7 @@ Requests are never approved one by one. The agent checks each request itself (se
 4. Every new setting is read with a literal `os.getenv("BIOCHEF_…")` and documented in **both** `README.md` and `example.env`. `tests/test_settings_are_documented.py` must scan every package of the repo, not only `*.py` at the root. A process that does not import `convert.py` has to call `load_dotenv()` itself, because that module is the only one that loads `.env` today.
 5. Keep the existing API (`/convert`, `/runs…`, `/ga4gh/wes/v1/…`) and `openapi.json` unchanged unless a part says otherwise. If an interface changes, `openapi.json` and the README change in the same PR.
 6. Match the house style of the repo: module docstrings that explain *why*, explicit failures over silent defaults, refuse to start on a half configured setting (see `auth.py` and `audit.py`).
-7. Python floor is 3.11 (`.python-version`, `run.sh`, CI matrix 3.11, 3.12, 3.13). Everything must work on 3.11.
+7. Python floor is 3.11 (`.python-version`, `run.sh`, CI matrix 3.11 to 3.14). Everything must work on 3.11.
 8. No network at runtime for the UI. No CDN, no Google Fonts, no external script. Everything the page loads is served by the agent.
 
 ## 3. Technology stack
@@ -417,6 +417,20 @@ The page shows only "✓ identity verified" or "✗ identity not verified" per m
 
 `BIOCHEF_FEDERATION_KEY` (public key that signs the site list) and the current list from the coordinator. Refuse older list versions than the one stored. Node page shows "Up to date · N nodes".
 
+### 7.5 Posting decisions to the coordinator
+
+The poster is part 8. Undo (8.1) is safe only if it follows this order.
+
+#### Ordering rule
+
+1. Call `repo.claim_for_posting(decision)`, which sets `posting_started_at`, and commit that transaction.
+2. Only after the commit returns, POST the decision to the coordinator.
+3. On success, mark the decision as posted (`repo.mark_posted`). On failure, leave `posting_started_at` set and retry. Undo stays refused once `posting_started_at` is set, whatever the outcome of the POST.
+4. On startup, the poster resends every decision that has `posting_started_at` set but is not marked as posted (outbox pattern), so a crash between the commit and the POST does not leave a decision stuck.
+5. Resends are safe only if the coordinator treats the decision id as an idempotency key and ignores duplicates. The id is only unique per node, so the key is the node and the decision id. This is a requirement on the coordinator's agent API (`ieeta-pt/biochef-coordinator#3`).
+
+Doing the POST before the commit reopens the race between undo and posting raised in #107: the page could delete a decision the coordinator already holds. No test in the store catches that order, because the store cannot see when the POST happens; part 8 must test it.
+
 ## 8. Screens
 
 Each screen below lists its route, what it reads, what it can do, and its states. htmx fragments are `GET` or `POST` routes under `/ui/_/…` returning partial templates; full pages are under `/ui/…`. `/` redirects to `/ui/inbox`.
@@ -426,7 +440,7 @@ Each screen below lists its route, what it reads, what it can do, and its states
 - Left: cards for every `pending` study version and workflow version, newest first. Card shows kind label, received time, name and version, one line summary of what changed, and a pill: "Re-approval needed" (new version of an approved study), "New" (new study), "New workflow version", or "Check failed · cannot be approved".
 - Clicking a study card loads its detail on the right (`hx-get="/ui/_/inbox/study/{id}"`, `hx-target="#detail"`, `hx-push-url`). A workflow card goes to the Workflow screen.
 - Study detail: compared with the approved version (link), "Proposed by <proposer>" pill (no tick: nothing verifies the signature yet, section 13), Members (name, role, "+" for new, identity status, "Show keys" toggle), Datasets on this node (binding status, required visa), Nodes (all on the signed site list), Result recipients, Output rules (diff against approved version in mono, red removed, green added, plus the Policy Engine verdict line with link), the DAC tick, optional comment, buttons **Approve and sign** and **Refuse and sign**, and the line "Approving v3 supersedes v2. Only one version of a study is valid at a time."
-- After a decision: the detail is replaced by a status line ("v3 approved and signed. v2 was superseded at the same time; its runs and logs stay in the study history.") with **Undo before the next poll**, which is allowed only while the decision has not started to leave (`posting_started_at` and `posted_to_coordinator_at` are null). The poll (part 8) sets `posting_started_at` with `repo.claim_for_posting` and commits before the POST, so an undo either runs first and nothing is sent, or runs after and is refused. Undo deletes the unsent decision and writes an audit event.
+- After a decision: the detail is replaced by a status line ("v3 approved and signed. v2 was superseded at the same time; its runs and logs stay in the study history.") with **Undo before the next poll**, which is allowed only while the decision has not started to leave (`posting_started_at` and `posted_to_coordinator_at` are null). The poster (part 8) sets `posting_started_at` with `repo.claim_for_posting` and commits before the POST (7.5, Ordering rule), so an undo either runs first and nothing is sent, or runs after and is refused. Undo deletes the unsent decision and writes an audit event.
 - Failed identity: red alert naming the member, Approve disabled (`disabled` attribute, not hidden), Refuse available.
 - Empty state: "Nothing is waiting for this node."
 
@@ -541,7 +555,7 @@ Each part is one PR. Do them in this order unless `jorgeMFS` says otherwise. Par
 | 7 | **Run screen and egress**: `run_summary` written from run state changes, with step times and log tails, `cancel_requested` read by the API process, logs and manifest tabs, egress pipeline both modes with fakes, cancel, retention change | 4, 6 | Retention starts at `sent` or `withheld`, and survives a restart of the API process (tested); a run waiting for egress is never evicted (tested); manual Release and Withhold are signed; airlock mode shows the airlock state; optional Playwright test of the approve and release flow |
 | 7b | **Node screen**: the cards, settings, audit log and audit check of 8.7 | 1, 2, 3 | Screen 07 matches section 0.1; audit export works; the API app gains no audit route; the audit check is tested for a failed commit, an undone decision and an id reused after a rollback |
 | 7.4 | **Site list** (7.4): check the list's signature with `BIOCHEF_FEDERATION_KEY`, refuse older versions | 1, 7b | Bad signature and older version refused; the Node card shows "Up to date · N nodes" |
-| 8 | **Coordinator client**: poll over mTLS in the API process, fetch study versions, workflow versions, requests and the site list; post decisions and results | The agent API in `biochef-coordinator` | Integration test against the coordinator running locally with `docker compose` |
+| 8 | **Coordinator client**: poll over mTLS in the API process, fetch study versions, workflow versions, requests and the site list; post decisions (in the order of 7.5) and results | The agent API in `biochef-coordinator` | Integration test against the coordinator running locally with `docker compose` |
 | 9 | **Podman runner** (**parallel**) in `runner.py`, same seam as `apptainer`, steps with `--network=none`. Snakemake has no podman mode, so `podman-step` is the shell its rules run under | nothing | `ci/runner_parity.py` extended to `podman` and passing (same result, step not on the host, neighbours hidden, environment not inherited); documented in README |
 | 9b | **Network isolation for apptainer** (**parallel**) | nothing | `ci/runner_parity.py` proves a step cannot reach the network; the Node card shows it on |
 
