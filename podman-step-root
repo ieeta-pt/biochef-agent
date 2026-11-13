@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# The only thing the agent may run as root, for rootful podman. The agent does
+# not run as root: it calls this through one sudo rule, and this decides
+# everything a container gets from its own configuration file, which only root
+# can change. What the agent passes is checked, never trusted:
+#
+#   podman-step-root run <workspace> <command>
+#       one step, in a container, as STEP_UID:STEP_GID, never as root
+#   podman-step-root finish <workspace>
+#       removes the run's leftover containers and gives the workspace back to
+#       the agent, so it can delete what the steps wrote
+#
+# A workspace must be a directory directly under RUN_ROOT, named by no symlink,
+# owned by the user sudo was called by, and in group STEP_GID. Whatever a step
+# does, it runs with no network, no capabilities, no new privileges, a read-only
+# root filesystem and the limits below, and sees only that workspace.
+#
+# Install it owned by root and writable only by root, for example as
+# /usr/local/libexec/biochef-agent/podman-step-root, and allow the agent's user
+# exactly that path in sudoers:
+#
+#   biochef ALL=(root) NOPASSWD: /usr/local/libexec/biochef-agent/podman-step-root
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 0022
+
+CONF=/etc/biochef-agent/podman-step.conf
+
+die() {
+    echo "podman-step-root: $*" >&2
+    exit 2
+}
+
+[ "$(id -u)" = 0 ] || die "must run as root, through sudo"
+case "${SUDO_UID:-}" in
+    '' | 0 | *[!0-9]*) die "must be called through sudo, by the agent's user" ;;
+esac
+
+# Owned by root and writable by nobody else, the file and the directory it is in.
+owned_by_root() {
+    local owner mode
+    read -r owner mode < <(stat -c '%u %a' -- "$1")
+    [ "$owner" = 0 ] && [ $((8#$mode & 8#022)) = 0 ]
+}
+[ -f "$CONF" ] && [ ! -L "$CONF" ] || die "$CONF is missing"
+owned_by_root "$CONF" && owned_by_root "$(dirname "$CONF")" ||
+    die "$CONF and its directory must be owned by root and writable by no one else"
+
+declare -A conf=()
+while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in '' | '#'*) continue ;; esac
+    [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]] || die "not KEY=value in $CONF: $line"
+    key=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+    case "$key" in
+        RUN_ROOT | STEP_UID | STEP_GID | IMAGE | PIDS | MEMORY | SELINUX) ;;
+        *) die "unknown key in $CONF: $key" ;;
+    esac
+    [ -z "${conf[$key]+set}" ] || die "$key appears twice in $CONF"
+    conf[$key]=$value
+done < "$CONF"
+
+need() {
+    local key=$1 shape=$2
+    [ -n "${conf[$key]+set}" ] || die "$CONF has no $key"
+    [[ "${conf[$key]}" =~ $shape ]] || die "$key=${conf[$key]} in $CONF is not valid"
+}
+need RUN_ROOT '^/[A-Za-z0-9._/-]*[A-Za-z0-9._-]$'
+need STEP_UID '^[1-9][0-9]{0,9}$'
+need STEP_GID '^[1-9][0-9]{0,9}$'
+need IMAGE '^docker://[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,250}$'
+need PIDS '^[1-9][0-9]{0,6}$'
+need MEMORY '^[1-9][0-9]{0,9}[kmg]$'
+need SELINUX '^(disable|keep)$'
+root=${conf[RUN_ROOT]}
+[ "$(realpath -e -- "$root" 2>/dev/null)" = "$root" ] ||
+    die "RUN_ROOT=$root must exist and be named by no symlink"
+[ "${conf[STEP_UID]}" != "$SUDO_UID" ] ||
+    die "STEP_UID must not be the agent's own user"
+
+# The workspace the agent named, checked against the configuration.
+workspace() {
+    local path=$1 owner group
+    [[ "$path" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "not a workspace path: $path"
+    [ "$(realpath -e -- "$path" 2>/dev/null)" = "$path" ] ||
+        die "the workspace must exist and be named by no symlink: $path"
+    [ "$(dirname -- "$path")" = "$root" ] ||
+        die "the workspace must be directly under RUN_ROOT=$root: $path"
+    [ -d "$path" ] && [ ! -L "$path" ] || die "the workspace is not a directory: $path"
+    read -r owner group < <(stat -c '%u %g' -- "$path")
+    [ "$owner" = "$SUDO_UID" ] || die "the workspace is not the agent's: $path"
+    [ "$group" = "${conf[STEP_GID]}" ] || die "the workspace is not in group STEP_GID: $path"
+}
+
+case "${1:-}" in
+    run)
+        [ "$#" -eq 3 ] && [ -n "$3" ] || die "expects: run <workspace> <command>"
+        workspace "$2"
+        selinux=()
+        [ "${conf[SELINUX]}" = disable ] && selinux=(--security-opt=label=disable)
+        cd -- "$2"
+        # The step's own umask, so that what it writes stays readable and
+        # writable by the group the agent is in, and by nobody else.
+        exec podman run --rm --init --pull=missing \
+            --network=none \
+            --user "${conf[STEP_UID]}:${conf[STEP_GID]}" \
+            --cap-drop=all \
+            --security-opt=no-new-privileges \
+            ${selinux[@]+"${selinux[@]}"} \
+            --read-only \
+            --pids-limit "${conf[PIDS]}" \
+            --memory "${conf[MEMORY]}" \
+            --memory-swap "${conf[MEMORY]}" \
+            --label "biochef.run=$(basename -- "$2")" \
+            --volume "$2:$2" \
+            --workdir "$2" \
+            "${conf[IMAGE]}" \
+            bash -c "umask 0007
+$3" </dev/null
+        ;;
+    finish)
+        [ "$#" -eq 2 ] || die "expects: finish <workspace>"
+        workspace "$2"
+        label="label=biochef.run=$(basename -- "$2")"
+        mapfile -t left < <(podman ps --all --quiet --filter "$label")
+        if [ "${#left[@]}" -gt 0 ]; then
+            podman rm --force "${left[@]}" >/dev/null
+        fi
+        # -P walks the tree without following any symlink a step left in it.
+        chown -R -P "$SUDO_UID:${conf[STEP_GID]}" -- "$2"
+        chmod -R u+rwX -- "$2"
+        ;;
+    *)
+        die "expects: run <workspace> <command> | finish <workspace>"
+        ;;
+esac

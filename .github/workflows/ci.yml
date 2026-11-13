@@ -206,7 +206,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends /tmp/apptainer.deb
           apptainer --version
 
-      - name: The same workflow under both runners
+      - name: Check podman
+        # Preinstalled on the runner image. The parity check fails without it.
+        run: podman --version
+
+      - name: The same workflow under every runner
         # E2's acceptance (#15), run for real rather than asserted about.
         #
         # It is not enough to compare outputs. A container runner that quietly
@@ -226,6 +230,28 @@ jobs:
         # that cannot verify anything must not report success.
         run: |
           python ci/runner_parity.py
+
+  podman-rootful:
+    name: rootful podman 3.0.1
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rootful podman as Debian 11 ships it
+        # The podman some TREs have: 3.0.1, run as root. The agent does not run
+        # as root; it reaches it through podman-step-root and one sudo rule.
+        # ci/podman-rootful.sh sets that up as the README says, checks that the
+        # rule allows nothing else and that the script refuses what it must, and
+        # then runs a workflow and checks, from inside the step, the user, the
+        # read-only root, the limits, the network and the neighbours.
+        #
+        # Inside a privileged Debian 11 container, the image pinned by digest,
+        # because the runner's own podman is 4.9. Debian 11's packages are now
+        # only on archive.debian.org, and the script installs them from there.
+        run: |
+          docker run --rm --privileged -v "$PWD:/src:ro" \
+            python:3.13-bullseye@sha256:f58f33e0563f2ba81c7afe6259cd912f0c33413da93c75cc3a70a941c17afa8c \
+            bash /src/ci/podman-rootful.sh
 
   catalogue:
     name: catalogue converts
