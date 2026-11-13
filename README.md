@@ -530,12 +530,14 @@ It prints both public fingerprints, for registering the node, and refuses to rep
 
 ## The page for a node's data manager
 
-A second process, on its own port, for the people who run a node inside a TRE. It shares the database and the audit trail with the API and nothing else: it never mounts the API's routes, and the API never serves it. So far this is the shell: the sidebar, identity, CSRF protection and five empty screens.
+A second process, on its own port, for the people who run a node inside a TRE. It shares the database and the audit trail with the API and nothing else: it never mounts the API's routes, and the API never serves it. So far it has the Inbox, Studies and the workflow screens, where study and workflow versions are approved, refused, withdrawn and undone. Requests, Datasets and Node are still empty.
 
 ```sh
 ./run-ui.sh          # uses the settings in the environment or .env
-./run-ui.sh --dev    # a fixed user on 127.0.0.1, marked in red on every page
+./run-ui.sh --dev    # a seeded database and a fixed user on 127.0.0.1, marked in red on every page
 ```
+
+`--dev` keeps its database, keys and audit trail in `~/.cache/biochef-agent-dev`. Its seed is invented data, and its Policy Engine is a fake that the page labels as one. Delete that directory for a fresh seed.
 
 It needs Python 3.11 to 3.14, like `run.sh`, and refuses to start on any other.
 
@@ -544,7 +546,7 @@ The agent has no accounts. The TRE decides who may open the page, and `BIOCHEF_U
 - `header`: a reverse proxy passes the user name in `BIOCHEF_UI_IDENTITY_HEADER`. The header counts only from an address in `BIOCHEF_UI_TRUSTED_PROXIES`. Anything else is a 401, static files included.
 - `dev`: `BIOCHEF_UI_DEV_USER`, from a loopback address only. It refuses to start on any other `BIOCHEF_UI_HOST`.
 
-The page refuses to start without `BIOCHEF_AUDIT_LOG`, because every decision made there has to reach the trail. `run-ui.sh` starts `python -m ui`, which keeps uvicorn's proxy headers off. If you run `uvicorn ui.app:app` yourself, pass `--no-proxy-headers`, because otherwise uvicorn rewrites the client address that the identity check depends on.
+The page refuses to start without `BIOCHEF_AUDIT_LOG`, because every decision made there has to reach the trail, and without the node's signing key or a migrated database. `run-ui.sh` starts `python -m ui`, which keeps uvicorn's proxy headers off. If you run `uvicorn ui.app:app` yourself, pass `--no-proxy-headers`, because otherwise uvicorn rewrites the client address that the identity check depends on.
 
 Everything the page loads is served by the agent: htmx, the fonts and the stylesheet are in `ui/static/`, and `ui/static.sha256` records the vendored files. `ui/static/app.css` is built and committed, so nothing else is needed at runtime. After changing a template or `ui/tailwind/input.css`, run `make css`, which downloads the pinned Tailwind CLI, checks it against `ui/tailwind/SHA256SUMS` and rebuilds the file. CI fails if the committed file differs.
 

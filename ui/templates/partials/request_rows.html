@@ -1,0 +1,17 @@
+{% from "partials/macros.html" import pill %}
+{% for row in requests.rows %}
+<tr>
+  <td class="mono">{{ row.request_id }}</td>
+  <td>{{ row.member }}</td>
+  <td>{{ row.workflow }}</td>
+  <td>{{ pill(row.check[0], row.check[1]) }}</td>
+  <td>{{ row.run }}</td>
+</tr>
+{% else %}
+<tr><td colspan="5">No request has reached this node for this study.</td></tr>
+{% endfor %}
+{% if requests.older %}
+<tr id="show-older"><td colspan="5">
+  <button type="button" class="btn btn-quiet" hx-get="/ui/_/studies/{{ requests.study_id }}/requests?offset={{ requests.next_offset }}" hx-target="#show-older" hx-swap="outerHTML">Show {{ requests.older }} older</button>
+</td></tr>
+{% endif %}

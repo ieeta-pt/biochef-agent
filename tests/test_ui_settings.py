@@ -7,8 +7,12 @@ import sys
 import pytest
 
 import ui.__main__ as entry
+from node import keys as node_keys
+from store import migrate
 from tests.ui_support import REPO_ROOT, USER_HEADER
+from ui import app as ui_app
 from ui import settings
+from ui.app import create_app
 from ui.settings import SettingsError
 
 NAMES = ("BIOCHEF_UI_IDENTITY", "BIOCHEF_UI_IDENTITY_HEADER",
@@ -157,6 +161,52 @@ def test_cookies_are_secure_behind_the_proxy_only(dev):
     assert settings.load().secure_cookies is True
 
 
+def test_the_visa_comes_from_the_passport_setting(dev):
+    assert settings.load().required_visa is None
+    dev.setenv("BIOCHEF_PASSPORT_REQUIRE_VISA", "ControlledAccessGrants")
+    assert settings.load().required_visa == "ControlledAccessGrants"
+
+
+# What a decision needs, checked at start
+
+
+@pytest.fixture
+def ready(dev, tmp_path):
+    node_keys.init(tmp_path / "keys")
+    dev.setenv("BIOCHEF_NODE_SIGNING_KEY", str(tmp_path / "keys" / node_keys.SIGNING_FILE))
+    dev.setenv("BIOCHEF_NODE_ENCRYPTION_KEY",
+               str(tmp_path / "keys" / node_keys.ENCRYPTION_FILE))
+    url = f"sqlite:///{tmp_path}/agent.db"
+    dev.setenv("BIOCHEF_DB_URL", url)
+    return url
+
+
+def test_a_configured_page_starts(ready):
+    migrate.upgrade(ready)
+    assert ui_app.configured_app().state.keys is not None
+
+
+def test_no_page_on_a_database_that_is_not_migrated(ready):
+    with pytest.raises(SettingsError, match="python -m store migrate"):
+        ui_app.configured_app()
+
+
+def test_no_page_without_the_signing_key(ready, dev):
+    migrate.upgrade(ready)
+    dev.delenv("BIOCHEF_NODE_SIGNING_KEY")
+    with pytest.raises(node_keys.NodeKeyError, match="BIOCHEF_NODE_SIGNING_KEY"):
+        ui_app.configured_app()
+
+
+def test_the_fake_policy_engine_is_for_development_only(ready, dev):
+    migrate.upgrade(ready)
+    assert ui_app.configured_app().state.policy.name == "Fake Policy Engine"
+    dev.setenv("BIOCHEF_UI_IDENTITY", "header")
+    dev.setenv("BIOCHEF_UI_IDENTITY_HEADER", USER_HEADER)
+    dev.setenv("BIOCHEF_UI_TRUSTED_PROXIES", "10.0.0.0/24")
+    assert ui_app.configured_app().state.policy is None
+
+
 # The processes, as started
 
 
@@ -181,18 +231,19 @@ def test_the_command_refuses_with_one_line():
     assert "Traceback" not in result.stderr
 
 
-def test_the_page_imports_neither_the_api_nor_the_converter():
-    """convert.py logs in to the registry on import (section 8.3)."""
+def test_the_page_does_not_import_the_api():
     code = ("import sys, ui.app; "
-            "print(sorted({'main', 'convert', 'runs', 'store'} & set(sys.modules)))")
+            "print(sorted({'main', 'runs'} & set(sys.modules)))")
     result = run_python("-c", code)
     assert result.stdout.strip() == "[]", result.stderr
 
 
-def test_the_command_keeps_proxy_headers_off(dev, monkeypatch):
+def test_the_command_keeps_proxy_headers_off(dev, monkeypatch, tmp_path):
     seen = {}
     monkeypatch.setattr(entry.uvicorn, "run",
                         lambda app, **options: seen.update(options))
+    monkeypatch.setattr(entry.app, "configured_app", lambda: create_app(
+        settings.load(), bind=None, keys=None))
     assert entry.main() == 0
     assert seen == {"host": "127.0.0.1", "port": 8081, "proxy_headers": False}
 

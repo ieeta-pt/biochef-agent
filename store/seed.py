@@ -67,7 +67,10 @@ def _decide(session, keys, subject_type, subject_id, action, user, at, *,
         action=action, user=user, at=at, subject_hash=subject_hash, reason=reason,
         dac_confirmed=dac_confirmed)
     object_raw, signature = decisions.sign(document, keys)
-    return decisions.store(session, document, object_raw, signature)
+    row = decisions.store(session, document, object_raw, signature)
+    # History, as far as the mocks are concerned: it has left the node.
+    repo.mark_posted(session, row.id, now=at)
+    return row
 
 
 def _fixture_token(name, ls_aai_id):
@@ -140,7 +143,7 @@ def _apply_study_state(session, keys, row, state, at):
         _decide(session, keys, subject, row.id, Action.APPROVE, "j.silva", decided,
                 subject_hash=row.digest, dac_confirmed=True)
         if replaced is not None:
-            _decide(session, keys, subject, replaced.id, Action.WITHDRAW, SYSTEM_USER,
+            _decide(session, keys, subject, replaced.id, Action.WITHDRAW, "j.silva",
                     decided, subject_hash=replaced.digest, reason="superseded")
     if state == "withdrawn":
         withdrawn = decided + timedelta(days=5)
@@ -155,14 +158,20 @@ def _seed_workflows(session, keys, versions, now):
          age) in mock.WORKFLOWS:
         at = now - age
         digest = _mock_digest(ends, key)
-        steps = [{"id": step, "repo": f"biochef-plugins-{step}",
-                  "digest": _mock_digest(("0e5f", "92dd"), step),
-                  "signature": "sign/v1", "paramValues": dict(values)}
-                 for step in mock.GWAS_STEPS]
-        document = {"nodes": [{"id": step["id"], "type": "workflowNode",
-                               "data": {"repo": f'{step["repo"]}@{step["digest"]}',
-                                        "paramValues": step["paramValues"]}}
-                              for step in steps], "edges": []}
+        changes = mock.TOOL_CHANGES.get(key, {})
+        shape = mock.COHORT_STEPS if name == "cohort-summary" else mock.GWAS_STEPS
+        steps = [{"id": step, "repo": f"biochef/{tool}",
+                  "digest": _mock_digest(changes.get(tool, mock.TOOL_DIGESTS[tool]),
+                                         tool),
+                  "signature": "sign/v1", "description": description,
+                  "paramValues": dict(values if params is None else params)}
+                 for step, tool, description, params in shape]
+        document = {"nodes": [
+            {"id": step["id"], "type": "workflowNode",
+             "data": {"repo": f'{step["repo"]}@{step["digest"]}',
+                      "paramValues": {name: {"enabled": True, "value": value}
+                                      for name, value in step["paramValues"].items()}}}
+            for step in steps], "edges": []}
         row = repo.add_workflow_version(
             session, study_version_id=versions[(study, number)].id, digest=digest,
             raw=_bytes(document), steps=steps, name=name, version=version, now=at)

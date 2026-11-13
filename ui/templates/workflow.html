@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% from "partials/macros.html" import pill, status_line, diff %}
+{% block title %}{{ detail.title }}{% endblock %}
+{% block header %}
+<nav aria-label="Breadcrumb" class="flex flex-wrap gap-2 text-sm"><a href="{{ detail.study_href }}">{{ detail.study_title }}</a><span aria-hidden="true" class="text-muted">/</span><span>Workflows</span></nav>
+<header class="flex flex-wrap items-end justify-between gap-4">
+  <div class="flex flex-col gap-1.5">
+    <span class="lbl">{{ detail.kicker }}</span>
+    <h1 class="m-0 text-[26px] font-medium">{{ detail.title }}</h1>
+    <span class="text-[13px] text-muted">{% if detail.base_version %}Compared with {{ detail.base_version }} (approved) · {% endif %}hash over tools and parameter values <span class="mono">{{ detail.digest }}</span></span>
+  </div>
+  {{ pill(detail.pill, detail.state) }}
+</header>
+{% endblock %}
+{% block content %}
+<section aria-label="Graph" class="card flex flex-col gap-4 px-6 py-5">
+  <h2 class="m-0 text-base font-medium">Steps</h2>
+  {% include "partials/workflow_steps.html" %}
+</section>
+{% if detail.changes %}
+<section aria-label="Changes" class="card flex flex-col gap-3 px-6 py-5">
+  <h2 class="m-0 text-base font-medium">What changed since {{ detail.base_version }}</h2>
+  {{ diff(detail.changes) }}
+  <a href="/ui/workflows/{{ detail.id }}/source" class="text-sm">See recipe.json and the generated Snakefile</a>
+</section>
+{% else %}
+<section aria-label="Changes" class="card flex flex-col gap-3 px-6 py-5">
+  <h2 class="m-0 text-base font-medium">What changed</h2>
+  <p class="m-0 text-sm text-muted">There is no approved version of this workflow to compare with.</p>
+  <a href="/ui/workflows/{{ detail.id }}/source" class="text-sm">See recipe.json and the generated Snakefile</a>
+</section>
+{% endif %}
+{% if detail.status or detail.pending %}
+<section aria-label="Decision" class="card flex flex-col gap-3 px-6 py-5">
+  {% if detail.status %}
+  {{ status_line(detail.status) }}
+  {% else %}
+  <div class="flex flex-wrap items-center gap-3">
+    <button type="button" class="btn btn-primary" {% if detail.blocker %}disabled{% else %}hx-post="/ui/_/workflows/{{ detail.id }}/approve" hx-target="#decision-error" hx-swap="innerHTML"{% endif %}>{{ detail.approve_label }}</button>
+    <button type="button" class="btn btn-danger" hx-post="/ui/_/workflows/{{ detail.id }}/refuse" hx-target="#decision-error" hx-swap="innerHTML">Refuse and sign</button>
+    {% if detail.blocker %}<span class="text-[13px] text-bad">{{ detail.blocker }}</span>{% elif detail.approve_note %}<span class="text-[13px] text-muted">{{ detail.approve_note }}</span>{% endif %}
+  </div>
+  <div id="decision-error"></div>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}
