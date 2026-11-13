@@ -304,7 +304,7 @@ def _workflow_message(session, workflow, decision):
 def status_of(session, subject_type, row):
     """The line shown while a decision has not left this node, or None."""
     about = repo.decisions_about(session, subject_type, row.id)
-    if not about or about[0].posted_to_coordinator_at is not None:
+    if not about or repo.has_left(about[0]):
         return None
     decision = about[0]
     if decision.reason == review.SUPERSEDED:
