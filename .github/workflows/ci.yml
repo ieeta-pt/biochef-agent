@@ -294,6 +294,148 @@ jobs:
             python:3.13-bullseye@sha256:f58f33e0563f2ba81c7afe6259cd912f0c33413da93c75cc3a70a941c17afa8c \
             bash /src/ci/podman-rootful.sh
 
+  tes:
+    name: tes, against a server running as root
+    runs-on: ubuntu-24.04
+    env:
+      # By digest, because the runner refuses anything else. The index digest of
+      # debian:bookworm-slim, so it resolves on any architecture.
+      BIOCHEF_TES_IMAGE: "debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc"
+      BIOCHEF_TES_AUTH: bearer
+      BIOCHEF_TES_ISOLATION: attested
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      - name: Install the helper, the one sudo rule and a TES server running as root
+        # What the README says an operator sets up, by ci/tes-setup.sh. It checks
+        # that the rule allows the helper and nothing else, and that the helper
+        # refuses a directory outside STAGING_ROOT, a relative one, one a symlink
+        # names, one at the wrong depth and an unknown command.
+        #
+        # The server is tests/tes_support.py, not Funnel: it speaks the same
+        # exchange, runs each task in a docker container with no network, and as
+        # root it returns files owned by root. That proves the exchange and what the
+        # agent does around it, and nothing about any particular server.
+        run: |
+          docker pull "$BIOCHEF_TES_IMAGE"
+          bash ci/tes-setup.sh
+
+      - name: A workflow through TES, as the agent's user
+        # The agent is biochefagent, which can sudo the helper and nothing else.
+        # From inside the steps: the image they ran in is not the host's, another
+        # run's directory and the agent's environment are not there. From the files:
+        # the server returned them owned by root, the helper gave them back, and
+        # retention can delete them. And a run that times out is cancelled through
+        # the server.
+        run: |
+          sudo -u "$AGENT_USER" -H env \
+            "PATH=$PATH" "TES_CHECK_EXPECT_ROOT=1" "BIOCHEF_TES_URL=$BIOCHEF_TES_URL" \
+            "BIOCHEF_TES_IMAGE=$BIOCHEF_TES_IMAGE" "BIOCHEF_TES_AUTH=$BIOCHEF_TES_AUTH" \
+            "BIOCHEF_TES_TOKEN_FILE=$BIOCHEF_TES_TOKEN_FILE" \
+            "BIOCHEF_TES_STAGING=$BIOCHEF_TES_STAGING" "BIOCHEF_TES_HELPER=$BIOCHEF_TES_HELPER" \
+            "BIOCHEF_TES_ISOLATION=$BIOCHEF_TES_ISOLATION" \
+            python /srv/biochef-agent-src/ci/tes_check.py
+
+      - name: The container of the run that timed out is gone
+        run: test -z "$(docker ps --quiet --filter name=tes-)"
+
+  tes-funnel:
+    name: tes, against Funnel v0.12.2, auth ${{ matrix.auth }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Funnel with no authentication on the loopback, and with the basic
+        # authentication its config offers. Its OIDC mode is not exercised.
+        auth: [none, basic]
+    env:
+      # Funnel v0.12.2 has a tag and no release, binary or public image, so it is built
+      # here from the commit the tag names. The commit, not the tag, so a moved tag
+      # cannot change what is tested.
+      FUNNEL_REF: d5f06550076db4a5ca4a77ae81f6a3fda37d7a3d
+      BIOCHEF_TES_IMAGE: "debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc"
+      BIOCHEF_TES_AUTH: ${{ matrix.auth }}
+      BIOCHEF_TES_ISOLATION: attested
+      TES_SERVER: funnel
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: calypr/funnel
+          ref: ${{ env.FUNNEL_REF }}
+          path: funnel-src
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: funnel-src/go.mod
+          cache-dependency-path: funnel-src/go.sum
+
+      - name: Build Funnel
+        run: |
+          make -C funnel-src build
+          funnel-src/funnel version
+          # Out of the checkout, which ci/tes-setup.sh copies for the agent's user.
+          mv funnel-src "$RUNNER_TEMP/funnel-src"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      - name: Install the helper and the one sudo rule, and start Funnel as root
+        # The same setup as the stand-in's job, with Funnel in its place: the helper
+        # and the rule are checked the same way, and Funnel is configured as an
+        # operator who attests network isolation would configure it (docker run with
+        # no network, its own --read-only), allowed to read and write the staging
+        # root and nothing else.
+        run: |
+          docker pull "$BIOCHEF_TES_IMAGE"
+          FUNNEL_SRC="$RUNNER_TEMP/funnel-src" bash ci/tes-setup.sh
+
+      - name: A workflow through Funnel, as the agent's user
+        # What the stand-in's job checks, against the real server, which wants a user
+        # and a password (its BasicAuth), and is refused without them. The three things the
+        # runner takes from a TES server and which only Funnel can confirm are in this:
+        # a DIRECTORY input and output by file://, the name_prefix filter (the run is
+        # cancelled by it, and the check lists by it), and a step that writes, which
+        # Funnel can only do in its own copy because it mounts every input read-only.
+        run: |
+          sudo -u "$AGENT_USER" -H env \
+            "PATH=$PATH" "TES_CHECK_EXPECT_ROOT=1" "BIOCHEF_TES_URL=$BIOCHEF_TES_URL" \
+            "BIOCHEF_TES_IMAGE=$BIOCHEF_TES_IMAGE" "BIOCHEF_TES_AUTH=$BIOCHEF_TES_AUTH" \
+            "BIOCHEF_TES_USER=$BIOCHEF_TES_USER" \
+            "BIOCHEF_TES_PASSWORD_FILE=$BIOCHEF_TES_PASSWORD_FILE" \
+            "BIOCHEF_TES_STAGING=$BIOCHEF_TES_STAGING" "BIOCHEF_TES_HELPER=$BIOCHEF_TES_HELPER" \
+            "BIOCHEF_TES_ISOLATION=$BIOCHEF_TES_ISOLATION" \
+            python /srv/biochef-agent-src/ci/tes_check.py
+
+      - name: No container of the run that timed out is left
+        # Funnel removes a cancelled task's container itself, a moment after the
+        # cancel, so this waits for it. What is left after the wait is named.
+        run: |
+          for _ in $(seq 1 30); do
+              [ -z "$(docker ps --quiet)" ] && exit 0
+              sleep 1
+          done
+          docker ps --format 'left: {{.Names}} {{.Image}} {{.Status}}'
+          exit 1
+
+      - name: Funnel's log
+        if: failure()
+        run: sudo cat "${RUNNER_TEMP:-/tmp}/funnel.log" | tail -80 | cut -c1-400
+
   catalogue:
     name: catalogue converts
     runs-on: ubuntu-latest

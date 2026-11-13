@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+# Runs one Snakemake step as a GA4GH TES task. Snakemake has no TES mode, so
+# TesRunner makes this script the shell its rules run under, as podman-step is
+# for podman, and each rule's command arrives here as `-c <command>`, in the run's
+# workspace. The work is in tes.py, next to this script, which needs only the
+# standard library; see its docstring for what the task contains and what is
+# checked.
+#
+# Every value comes from BIOCHEF_TES_* in the environment the runner gives
+# Snakemake, has no default, and is checked again here, so a step never runs on a
+# guess.
+import os
+import sys
+
+if sys.version_info < (3, 8):
+    sys.stderr.write("tes-step: needs python 3.8 or later\n")
+    sys.exit(2)
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+import tes  # noqa: E402
+
+sys.exit(tes.main(sys.argv[1:]))
