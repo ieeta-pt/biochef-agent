@@ -5,8 +5,11 @@ refuses a database that already holds anything, so that a mistyped
 BIOCHEF_DB_URL cannot mix invented approvals into a node's record.
 
 Decisions are signed with a key generated on the spot and then thrown away, so
-they have the shape of real ones and no node vouches for them. They are not
-written to the audit trail: nobody decided anything.
+they have the shape of real ones and no node vouches for them. `seed()` does not
+write to the audit trail: nobody decided anything. `python -m store.seed` does, after
+it, if BIOCHEF_AUDIT_LOG is set (`write_audit`), so that the Node screen of a demo
+has a trail to show; each event carries the time of what it records, and every
+decision has its event, so the screen's audit check finds nothing to flag.
 
 Display names come out of the fixture tokens, which nobody signed. Member ids stay opaque everywhere else.
 """
@@ -22,12 +25,13 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from sqlalchemy import func
 from sqlmodel import select
 
+import audit
 from node import decisions
 from node.keys import generate
 from store import db, migrate, repo
 from store.errors import StoreError
 from store.fixtures import mock
-from store.models import Study
+from store.models import Decision, Request, RunSummary, Study
 from store.states import (Action, BindingSource, EgressState, SubjectType,
                           Verdict)
 
@@ -342,7 +346,9 @@ def _seed_node(session, keys, now):
 
 
 def seed(bind=None, now=None, keys=None):
-    """Fill the database. Refuses one that is behind or already holds data."""
+    """Fill the database. Refuses one that is behind or already holds data.
+
+    Returns the keys the decisions were signed with."""
     bind = bind or db.engine()
     keys = keys or generate()
     if not migrate.is_current(bind):
@@ -358,6 +364,58 @@ def seed(bind=None, now=None, keys=None):
         _seed_runs(session, now)
         _seed_bindings(session, keys, now)
         _seed_node(session, keys, now)
+    return keys
+
+
+def _stamp(moment):
+    return moment.isoformat()
+
+
+def write_audit(bind=None, keys=None):
+    """Write the events that the seeded history would have left, oldest first.
+
+    Returns how many, which is none when no trail is configured. The events are
+    built from the rows, not invented beside them, so that each decision has the one
+    event the audit check of the Node screen looks for.
+    """
+    if audit.path() is None:
+        return 0
+    bind = bind or db.engine()
+    fingerprint = keys.signing_fingerprint if keys is not None else None
+    named = {row[0] for row in mock.REQUESTS}
+    found = []
+    with db.reading(bind) as session:
+        for row in session.exec(select(Decision)):
+            found.append((row.at, decisions.EVENT_DECISION, {
+                "decision_id": row.id, "node": mock.NODE,
+                "subject_type": row.subject_type, "subject_id": row.subject_id,
+                "subject_hash": row.subject_hash, "action": row.action,
+                "user": row.user, "reason": row.reason, "signed": True,
+                "signed_by": fingerprint}))
+        for row in session.exec(select(Request)):
+            if row.request_id not in named:
+                continue
+            found.append((row.received_at, "node.request.checked", {
+                "request_id": row.request_id, "study_id": row.study_id,
+                "study_version": row.study_version, "member": row.member,
+                "verdict": row.verdict, "failed_check": row.failed_check}))
+            if row.repeats:
+                found.append((row.last_repeat_at, "node.request.checked", {
+                    "request_id": row.request_id, "study_id": row.study_id,
+                    "study_version": row.study_version, "member": row.member,
+                    "verdict": "joined", "failed_check": None, "repeat": True,
+                    "repeat_of": row.run_id}))
+        for row in session.exec(select(RunSummary)):
+            if row.run_id not in ("run_8f21", "run_8e90", "run_7c04"):
+                continue
+            found.append((row.started_at, "run.state", {
+                "run_id": row.run_id, "state": "RUNNING"}))
+            if row.ended_at is not None:
+                found.append((row.ended_at, "run.state", {
+                    "run_id": row.run_id, "state": row.state}))
+    for moment, event, fields in sorted(found, key=lambda item: item[0]):
+        audit.record(event, at=_stamp(moment), **fields)
+    return len(found)
 
 
 def main(argv=None):
@@ -365,10 +423,13 @@ def main(argv=None):
     parser.add_argument("--fixture", required=True, choices=["mock"])
     parser.parse_args(argv)
     try:
-        seed()
+        keys = seed()
+        written = write_audit(keys=keys)
     except StoreError as refused:
         print(refused, file=sys.stderr)
         return 1
+    if written:
+        print(f"wrote {written} events to the audit trail")
     return 0
 
 

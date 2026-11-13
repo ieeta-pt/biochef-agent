@@ -51,6 +51,12 @@ class Settings:
     bindings_file: str | None = None
     bindings_from_ui: bool = False
     egress_mode: str = "airlock"
+    runner: str = "subprocess"
+    signing_mode: str = "off"
+    max_concurrent_runs: int = 4
+    max_retained_runs: int = 32
+    keep_outputs_seconds: int = 3600
+    poll_seconds: int = 30
 
     @property
     def secure_cookies(self):
@@ -131,6 +137,32 @@ def _bindings():
             "bindings_from_ui": from_ui}
 
 
+def _whole(name, value):
+    try:
+        return int(value)
+    except ValueError:
+        raise SettingsError(f"{name} must be a whole number, not {value!r}") from None
+
+
+def _node_facts():
+    """What the Node screen reports. The processes that use them still decide them."""
+    return {
+        "runner": _setting(os.getenv("BIOCHEF_RUNNER")) or "subprocess",
+        "signing_mode": (_setting(os.getenv("BIOCHEF_SIGNING_MODE")) or "off").lower(),
+        "max_concurrent_runs": _whole(
+            "BIOCHEF_MAX_CONCURRENT_RUNS",
+            _setting(os.getenv("BIOCHEF_MAX_CONCURRENT_RUNS")) or "4"),
+        "max_retained_runs": _whole(
+            "BIOCHEF_MAX_RETAINED_RUNS",
+            _setting(os.getenv("BIOCHEF_MAX_RETAINED_RUNS")) or "32"),
+        "keep_outputs_seconds": _whole(
+            "BIOCHEF_KEEP_OUTPUTS", _setting(os.getenv("BIOCHEF_KEEP_OUTPUTS")) or "3600"),
+        "poll_seconds": _whole(
+            "BIOCHEF_COORDINATOR_POLL_SECONDS",
+            _setting(os.getenv("BIOCHEF_COORDINATOR_POLL_SECONDS")) or "30"),
+    }
+
+
 def _egress_mode():
     value = _setting(os.getenv("BIOCHEF_EGRESS_MODE"))
     if value not in ("airlock", "manual"):
@@ -162,6 +194,7 @@ def load():
             _setting(os.getenv("BIOCHEF_POLICY_ENGINE_URL"))),
         "required_visa": _setting(os.getenv("BIOCHEF_PASSPORT_REQUIRE_VISA")),
         "egress_mode": _egress_mode(),
+        **_node_facts(),
         **_bindings(),
     }
 
