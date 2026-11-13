@@ -220,6 +220,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_RUN_ROOT` | the system temp directory | where a run's private directory is created |
 | `BIOCHEF_RUN_TIMEOUT` | `900` | seconds before a run's whole process group is killed |
 | `BIOCHEF_AUDIT_LOG` | *(unset)* | path to an append-only JSONL audit trail; unset writes none |
+| `BIOCHEF_DB_URL` | `sqlite:////var/lib/biochef/agent.db` | the node's database, see [The node's store](#the-nodes-store) |
 | `BIOCHEF_KEEP_WORKSPACE` | `false` | leave a run's directory behind, for debugging |
 | `BIOCHEF_MAX_UPLOAD_BYTES` | `536870912` | largest request body accepted, in bytes |
 | `BIOCHEF_MAX_RUNS` | `256` | maximum run records retained for polling |
@@ -493,6 +494,19 @@ and HTTP 503 capacity refusal as `/runs`.
    whole process group is killed if it overruns.
 5. Each declared output is read back and base64-encoded into the response.
 6. The run's directory is removed, whether it succeeded or not.
+
+## The node's store
+
+What a node has decided lives in a database, because an approval has to outlast the process that made it. `store/` holds the tables of [the agent UI specification](docs/agent-ui/SPEC.md), section 6.1, and all access goes through `store/repo.py`. The API does not use it yet.
+
+```sh
+export BIOCHEF_DB_URL=sqlite:////var/lib/biochef/agent.db
+python -m store migrate                  # create or upgrade the tables
+python -m store downgrade base           # remove them
+python -m store.seed --fixture mock      # invented data, for development only
+```
+
+SQLite only, in WAL mode, because two processes open the file. Any other `BIOCHEF_DB_URL` is refused at start: concurrent approvals rely on SQLite's write lock, and no other database has been tested. The seed refuses a database that already holds data, and its decisions are not really signed: their signature is the literal `unsigned-fixture`.
 
 ## Before deploying this
 
