@@ -101,7 +101,7 @@ All versions pinned. Add new Python pins to `requirements.txt` and make `pip che
 | Interactivity | htmx | **2.0.11** (npm `latest` tag, 22 Sep 2026) | Vendored file `ui/static/vendor/htmx-2.0.11.min.js` with its 0BSD licence. Do **not** use htmx 4.x yet (major rewrite, published 28 Aug 2026) |
 | CSS | Tailwind CSS standalone CLI | **4.3.3** (16 Jul 2026) | Do not take 4.3.4 or 4.3.5 (released 2 and 6 Nov 2026). A `make css` target (and the Dockerfile, once `ieeta-pt/biochef-agent#73` adds one) downloads the binary for the host from the GitHub release, Linux x64 and macOS arm64 at least, checks its SHA-256 against a value committed in the repo, and builds `ui/static/app.css`. Commit the built CSS too, so the agent runs without the CLI |
 | Fonts | Roboto 400/500/700 and Roboto Mono 400/500, woff2, latin and latin-ext | from `@fontsource/roboto` 5.3.0 and `@fontsource/roboto-mono` 5.3.0, OFL 1.1 | Vendored under `ui/static/fonts/` with the licence file. Same family as the BioChef app |
-| Database | SQLModel on SQLAlchemy | sqlmodel 0.0.37, SQLAlchemy 2.0.49 (already pinned) | SQLite by default (`BIOCHEF_DB_URL=sqlite:////var/lib/biochef/agent.db`), Postgres possible later |
+| Database | SQLModel on SQLAlchemy | sqlmodel 0.0.37, SQLAlchemy 2.0.49 (already pinned) | SQLite only (`BIOCHEF_DB_URL=sqlite:////var/lib/biochef/agent.db`); any other URL is refused at start, because concurrent approvals rely on SQLite's write lock |
 | Migrations | Alembic | 1.20.1 (new pin; needs SQLAlchemy ≥ 2.0, Mako) | From the first table. No `create_all` in production paths |
 | Signatures | `cryptography` | 50.0.1 (already pinned) | Ed25519 for the node, ES256 on P-256 to check members (section 7). `cryptography` does not read `age-x25519`, so `pyrage` 1.4.0 does |
 | Canonical JSON | `rfc8785` | 0.1.4 (new pin) | Bytes that signatures cover (section 7.2) |
@@ -231,11 +231,11 @@ Field names follow `ieeta-pt/biochef-coordinator#6` wherever a field comes from 
 |---|---|
 | `study` | `id` (`study_id` from the document), `title` (empty until the document carries one, section 13), `created_at` |
 | `study_version` | `id`, `study_id`, `version` (int), `digest`, `previous_digest`, `raw`, `goal`, `proposer`, `members` (json), `nodes` (json, `StudyNode`), `datasets` (json, this node's dataset ids), `output_rules` (json: `aggregates_only`, `min_count`, `types`, `max_bytes`), `result_recipients` (`submitter` or `all_members`), `received_at`, `state` (6.2), `state_changed_at` |
-| `member_key` | `study_version_id`, `member`, `ls_aai_id`, `signing_key` (P-256 JWK as json), `result_key` (age public key), `binding_token`, `identity_verified` (bool), `identity_error`, `display_name` (the `name` claim of the verified token, section 7.3) |
+| `member_key` | `study_version_id`, `member`, `ls_aai_id`, `signing_key` (P-256 JWK as json), `result_key` (age public key), `binding_token`, `identity_verified` (bool), `identity_error`, `display_name` (the `name` claim of the verified token, section 7.3; no name if it holds a control, format or separator character or is longer than 128 characters). The keys never change once stored |
 | `workflow_version` | `id`, `study_id`, `study_version_id`, `digest`, `raw`, `name`, `version` and `workflowhub_id` (null unless a library workflow), `steps` (json: id, `repo`, digest, signature status, `paramValues`), `received_at`, `state`, `state_changed_at` |
-| `decision` | `id`, `subject_type` (`study_version`, `workflow_version`, `request`, `run`, `egress`, `dataset_binding`), `subject_id`, `subject_hash`, `action` (`approve`, `refuse`, `withdraw`, `release`, `withhold`, `bind`, `unbind`, `cancel`), `user`, `comment`, `dac_confirmed`, `reason`, `at`, `object_raw`, `signature`, `posted_to_coordinator_at` |
+| `decision` | `id`, `subject_type` (`study_version`, `workflow_version`, `request`, `run`, `egress`, `dataset_binding`), `subject_id`, `subject_hash`, `action` (`approve`, `refuse`, `withdraw`, `release`, `withhold`, `bind`, `unbind`, `cancel`), `user`, `comment`, `dac_confirmed`, `reason`, `at`, `object_raw`, `signature`, `posting_started_at` (set before the POST, 8.1), `posted_to_coordinator_at`. Both go from null to a moment once and never back |
 | `request` | `request_id`, `study_id`, `study_version` (int, as named, because it may not exist here), `study_digest`, `workflow_digest`, `member`, `node`, `datasets` (json), `not_after`, `payload_digest`, `raw`, `received_at`, `verdict` (`accepted`, `refused`; null until checked), `failed_check` (6.3 code), `run_id`, `repeats`, `last_repeat_at` (the same `request_id` delivered again, 6.3) |
-| `run_summary` | `run_id`, `request_id`, `state` (existing WES states), `steps` (json: id, state, `started_at`, `ended_at`), `started_at`, `ended_at`, `exit_code`, `workspace_path`, `manifest_path`, `log_stdout`, `log_stderr`, `node_logs` (json), `cancel_requested`, `egress_state` (6.5), `egress_files` (json: file, size, verdict, reason), `airlock_ticket`, `airlock_at`, `retain_until` |
+| `run_summary` | `run_id`, `request_id`, `state` (existing WES states), `steps` (json: id, state, `started_at`, `ended_at`), `started_at`, `ended_at`, `exit_code`, `workspace_path`, `manifest_path`, `log_stdout`, `log_stderr`, `node_logs` (json), `cancel_requested`, `egress_state` (6.5), `egress_files` (json: file, size, verdict, reason), `airlock_ticket`, `airlock_at`, `retain_until`. `state` is checked against the WES states in the database. The files, ticket and time are fixed once `egress_state` leaves `rules_pending`, and `retain_until` is set only on reaching `sent` or `withheld` |
 | `dataset_binding` | `dataset_id`, `source` (`config` or `page`), `type` (`localpath` today), `location` (relative to `BIOCHEF_LOCAL_ROOT`), `visa_value` (6.6), `bound_by`, `bound_at` |
 | `outgoing_message` | `id`, `run_id`, `kind` (`withheld_result` today), `document` (the signed document, canonical bytes), `created_at`, `sent_at`. One of each kind per run (6.5) |
 | `federation_list` | `version`, `raw`, `signature`, `nodes` (json), `received_at`. An older version than the newest stored is refused (7.4) |
@@ -250,10 +250,12 @@ The in memory `RunStore` stays, and `run_summary` is written from its state tran
 ```
 study_version:    pending ──approve──► approved ──withdraw──► withdrawn
                      │                    │
-                     └──refuse──► refused └──(newer version approved)──► superseded
+                     ├──refuse──► refused └──(newer version approved)──► superseded
+                     └──(newer version approved)──► superseded
 workflow_version: pending ──approve──► approved ──withdraw──► withdrawn
                      │                    │
-                     └──refuse──► refused └──(study version superseded)──► superseded
+                     ├──refuse──► refused └──(study version superseded or withdrawn)──► superseded or withdrawn
+                     └──(study version superseded or withdrawn)──► superseded or withdrawn
 ```
 
 Rules:
@@ -265,6 +267,9 @@ Rules:
 5. Workflow versions are approved **per study version**. Different parameter values give a different hash and so a different workflow version (mock: two variants of `gwas-qc 1.3.2`). Several versions of the same workflow can be approved at once in one study version.
 6. Withdrawing a workflow version is a signed decision of its own and does not need a new study version.
 7. When v3 of a study is approved, the workflow approvals of v2 do not carry over: each must be approved again, and the workflows of the superseded version move to `superseded` too.
+8. **Nothing waits for ever.** Approving v3 also moves any older version still `pending` to `superseded`, with its pending workflows, since none could be approved after v3. A version that arrives older than the approved one is stored `superseded`. No decision is written for these: this node never decided them. Undoing the approval of v3 puts them back to `pending` when they are newer than the version approved after the undo.
+9. Withdrawing a study version withdraws its pending and approved workflows in the same transaction. Undoing the withdrawal brings them back as they were; a workflow withdrawn by its own decision stays withdrawn.
+10. A decision is checked before anything moves: approving a version that cannot be approved changes nothing, even for a caller that catches the error and commits.
 
 ### 6.3 Request checks
 
@@ -421,7 +426,7 @@ Each screen below lists its route, what it reads, what it can do, and its states
 - Left: cards for every `pending` study version and workflow version, newest first. Card shows kind label, received time, name and version, one line summary of what changed, and a pill: "Re-approval needed" (new version of an approved study), "New" (new study), "New workflow version", or "Check failed · cannot be approved".
 - Clicking a study card loads its detail on the right (`hx-get="/ui/_/inbox/study/{id}"`, `hx-target="#detail"`, `hx-push-url`). A workflow card goes to the Workflow screen.
 - Study detail: compared with the approved version (link), "Proposed by <proposer>" pill (no tick: nothing verifies the signature yet, section 13), Members (name, role, "+" for new, identity status, "Show keys" toggle), Datasets on this node (binding status, required visa), Nodes (all on the signed site list), Result recipients, Output rules (diff against approved version in mono, red removed, green added, plus the Policy Engine verdict line with link), the DAC tick, optional comment, buttons **Approve and sign** and **Refuse and sign**, and the line "Approving v3 supersedes v2. Only one version of a study is valid at a time."
-- After a decision: the detail is replaced by a status line ("v3 approved and signed. v2 was superseded at the same time; its runs and logs stay in the study history.") with **Undo before the next poll**, which is allowed only while the decision has not been posted (`posted_to_coordinator_at` is null). Undo deletes the unsent decision and writes an audit event.
+- After a decision: the detail is replaced by a status line ("v3 approved and signed. v2 was superseded at the same time; its runs and logs stay in the study history.") with **Undo before the next poll**, which is allowed only while the decision has not started to leave (`posting_started_at` and `posted_to_coordinator_at` are null). The poll (part 8) sets `posting_started_at` with `repo.claim_for_posting` and commits before the POST, so an undo either runs first and nothing is sent, or runs after and is refused. Undo deletes the unsent decision and writes an audit event.
 - Failed identity: red alert naming the member, Approve disabled (`disabled` attribute, not hidden), Refuse available.
 - Empty state: "Nothing is waiting for this node."
 
