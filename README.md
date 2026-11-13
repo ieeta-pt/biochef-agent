@@ -608,7 +608,7 @@ A second process, on its own port, for the people who run a node inside a TRE. I
 
 `--dev` keeps its database, keys and audit trail in `~/.cache/biochef-agent-dev`. Its seed is invented data, and its Policy Engine is a fake that the page labels as one. Delete that directory for a fresh seed.
 
-It needs Python 3.11, 3.12 or 3.13 and refuses to start on any other.
+It needs Python 3.11 to 3.14, like `run.sh`, and refuses to start on any other.
 
 The agent has no accounts. The TRE decides who may open the page, and `BIOCHEF_UI_IDENTITY` says how the agent hears about it:
 
