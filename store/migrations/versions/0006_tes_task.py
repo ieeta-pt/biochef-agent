@@ -6,7 +6,7 @@ Revises: 0005
 
 from alembic import op
 import sqlalchemy as sa
-import store.models
+import store.types
 
 
 revision = '0006'
@@ -27,9 +27,9 @@ def upgrade():
     sa.Column('inputs', sa.JSON(), nullable=False),
     sa.Column('outputs', sa.JSON(), nullable=False),
     sa.Column('state', sa.String(), nullable=False),
-    sa.Column('created_at', store.models.UtcDateTime(), nullable=False),
-    sa.Column('started_at', store.models.UtcDateTime(), nullable=True),
-    sa.Column('ended_at', store.models.UtcDateTime(), nullable=True),
+    sa.Column('created_at', store.types.UtcDateTime(), nullable=False),
+    sa.Column('started_at', store.types.UtcDateTime(), nullable=True),
+    sa.Column('ended_at', store.types.UtcDateTime(), nullable=True),
     sa.Column('exit_code', sa.Integer(), nullable=True),
     sa.Column('stdout', sa.Text(), nullable=False),
     sa.Column('stderr', sa.Text(), nullable=False),

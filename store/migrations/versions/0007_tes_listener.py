@@ -6,7 +6,7 @@ Revises: 0006
 
 from alembic import op
 import sqlalchemy as sa
-import store.models
+import store.types
 
 
 revision = '0007'
@@ -21,8 +21,8 @@ def upgrade():
     sa.Column('holder', sa.String(), nullable=False),
     sa.Column('host', sa.String(), nullable=False),
     sa.Column('pid', sa.Integer(), nullable=False),
-    sa.Column('started_at', store.models.UtcDateTime(), nullable=False),
-    sa.Column('heartbeat_at', store.models.UtcDateTime(), nullable=False),
+    sa.Column('started_at', store.types.UtcDateTime(), nullable=False),
+    sa.Column('heartbeat_at', store.types.UtcDateTime(), nullable=False),
     sa.CheckConstraint('id = 1', name=op.f('ck_tes_listener_single_row')),
     sa.PrimaryKeyConstraint('id', name=op.f('pk_tes_listener'))
     )
