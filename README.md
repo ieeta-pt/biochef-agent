@@ -537,7 +537,7 @@ A second process, on its own port, for the people who run a node inside a TRE. I
 ./run-ui.sh --dev    # a fixed user on 127.0.0.1, marked in red on every page
 ```
 
-It needs Python 3.11, 3.12 or 3.13 and refuses to start on any other.
+It needs Python 3.11 to 3.14, like `run.sh`, and refuses to start on any other.
 
 The agent has no accounts. The TRE decides who may open the page, and `BIOCHEF_UI_IDENTITY` says how the agent hears about it:
 
