@@ -172,12 +172,10 @@ class Request(SQLModel, table=True):
     __table_args__ = (
         _one_of("verdict", Verdict),
         _one_of("failed_check", RefusalCode),
-        # The pairs repo.set_verdict refuses, refused here too: a refusal and
-        # only a refusal names a check, a join and only a join names a request.
+        # What repo.set_verdict refuses, refused here too: a refusal and only a
+        # refusal names a check.
         CheckConstraint("(COALESCE(verdict, '') = 'refused') = (failed_check IS NOT NULL)",
                         name="refusal_names_a_check"),
-        CheckConstraint("(COALESCE(verdict, '') = 'joined') = (joined_request_id IS NOT NULL)",
-                        name="join_names_a_request"),
         Index("request_received", "received_at"),
     )
 
