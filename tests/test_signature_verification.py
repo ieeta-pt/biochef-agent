@@ -592,7 +592,10 @@ def test_off_still_pulls_so_the_test_above_is_not_passing_for_the_wrong_reason(
     having done anything. With verification off, the same call must get far
     enough to reach the pull.
     """
-    registry = _RefusingRegistry(json.dumps({"layers": []}).encode())
+    registry = _RefusingRegistry(json.dumps({"layers": [{
+        "digest": "sha256:" + "0" * 64,
+        "annotations": {"org.opencontainers.image.title": "bundle.json"},
+    }]}).encode())
     monkeypatch.setattr(convert, "client", registry)
     monkeypatch.setattr(convert, "REGISTRY_URL", "reg.test")
     monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
