@@ -255,6 +255,8 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_PASSPORT_REQUIRE_VISA` | *(unset)* | a visa type a caller must hold to be let in |
 | `BIOCHEF_PASSPORT_REQUIRE_VISA_VALUE` | *(unset)* | the exact value that visa must carry |
 | `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess`, `apptainer` or `podman` |
+| `BIOCHEF_REQUIRE_NETWORK_ISOLATION` | `true` | refuses to start with a runner the agent does not itself keep off the network; `false` turns that off and is audited at start, see [What each runner guarantees](#what-each-runner-guarantees) |
+| `BIOCHEF_NETWORK_PROBE` | *(unset)* | `host:port` the agent can reach and a step must not, tried by the network check at start |
 | `BIOCHEF_PODMAN_MODE` | | `rootless` or `rootful`, required with `podman`, see [Running it](#running-it) |
 | `BIOCHEF_PODMAN_SELINUX` | | `disable` or `keep`, required with rootless `podman` |
 | `BIOCHEF_STEP_PIDS` | | the most processes a step may have, required with rootless `podman` |
@@ -411,6 +413,20 @@ The script runs a workspace only if it is a directory directly under `RUN_ROOT`,
 
 - `disable` runs each step with `--security-opt=label=disable`: no SELinux separation for the container, and the workspace mount works without relabelling anything. The other confinements stay: no network, no capabilities, `no-new-privileges`, the read-only root, the limits, the step's user and only the run's workspace mounted.
 - `keep` leaves podman's SELinux labelling on, so a step runs confined as `container_t`. The workspace is not relabelled, so on a host with SELinux enforcing, the directory runs are made in (`BIOCHEF_RUN_ROOT`) has to carry a label containers may use, such as `container_file_t`, or every step fails with permission denied. On a host without SELinux it changes nothing.
+
+### What each runner guarantees
+
+Each runner says, for every step, whether the agent keeps it off the network, whether it sees only its workspace and image, and whether it inherits the agent's environment. Each is `enforced` (the agent applies it to every step, and a step it cannot apply it to fails), `attested` (the operator says the backend applies it, and the agent cannot check) or `none`. The Node screen shows the three.
+
+| Runner | Network | Filesystem | Environment |
+|---|---|---|---|
+| `subprocess` | none | none, the host's | none, inherited |
+| `apptainer` | enforced with `--net --network none` in `BIOCHEF_APPTAINER_ARGS`, the default | enforced with `--contain` or `--containall` | enforced with `--cleanenv` or `--containall` |
+| `podman` | enforced | enforced | enforced |
+
+`BIOCHEF_REQUIRE_NETWORK_ISOLATION` is on unless set to `false`. On, the agent and the page refuse to start with a runner whose network guarantee is not `enforced`: `subprocess`, `apptainer` with the isolation flags removed, and any runner that only attests it. An attested isolation does not count, because the rule is for the case where nobody checks. So the default runner, `subprocess`, needs `BIOCHEF_REQUIRE_NETWORK_ISOLATION=false`, for development or a host with no container runtime. That choice is explicit, and the API process records it at every start as `node.runner.isolation_not_required` in the audit trail, with the runner it let in.
+
+At start, the API process runs one step through a runner whose network guarantee is `enforced`, the way every step runs. The step counts the IPv4 routes and IPv6 addresses on anything but loopback, read from its own network namespace, which must be none. With `BIOCHEF_NETWORK_PROBE=host:port`, the agent first connects to it itself, and the step then tries to as well, which must fail. Without the probe, only the interfaces are checked. The result goes to the audit trail as `node.runner.network_check` and, on a node, to the Node screen. If the step finds the network, the agent does not start. This catches a host where the isolation flag is accepted and has no effect.
 
 `BIOCHEF_APPTAINER_ARGS` defaults to `--contain --cleanenv --net --network none`. The last two give each step a network namespace with only loopback in it, so a tool cannot send data anywhere. On a host where apptainer refuses them the run fails, because carrying on with the network would be the worse outcome. Without `--contain`, apptainer binds the host's `/tmp` into the container, and that is where a run's directory lives unless `BIOCHEF_RUN_ROOT` says otherwise. Without it, a containerised tool is walled off from `/usr` and `/etc` while still able to read **every other run's data**. Without `--cleanenv`, the tool process also inherits the Agent's environment. Emptying this variable turns both protections off deliberately.
 
@@ -649,6 +665,10 @@ A binding names a folder and a run reads files: `node/datasets.file_in_binding` 
 A study version lists each member's keys next to an LS Login ID token. `node/identity.py` checks the token: signed by LS Login, through the keys at `BIOCHEF_LS_LOGIN_ISSUER`, made for `BIOCHEF_EDITOR_CLIENT_ID`, unexpired, and with a `sub` equal to the member's `ls_aai_id`. A member's name comes only from the `name` claim of a token that passed; the editor asks for the scope `openid profile` so that the token carries it.
 
 The token's nonce ties it to the member's keys. The agent builds the object `{"v": "biochef.member-keys.v1", "result_key": ..., "signing_key": ...}` from the keys the study version lists, serializes it with RFC 8785, and the nonce must be exactly the SHA-256 of those bytes in base64url without padding. `signing_key` is the public JWK with only `crv`, `kty`, `x` and `y`, the coordinates as 43 characters of base64url with their leading zeros, and `result_key` is the age recipient in lowercase. Keys in any other form are refused, not normalised. A member whose nonce does not match counts as not verified, with that reason shown on the page, and leaves no name. The test vector is in `tests/test_node_identity.py`.
+
+## Upgrading
+
+`UPGRADING.md` says what an existing deployment has to change, and why, and `CHANGELOG.md` lists the changes. Read both before updating an agent that is already installed: since `BIOCHEF_REQUIRE_NETWORK_ISOLATION` became on by default, an agent that runs `subprocess` stops at start until its configuration says what it wants.
 
 ## Before deploying this
 

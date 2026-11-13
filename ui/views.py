@@ -744,6 +744,11 @@ AUDIT_ROWS = 50
 
 EVENT_LABELS = {
     "node.egress.notice": "Notice of a withheld result signed",
+    "node.runner.isolation_not_required": lambda event: (
+        f'Network isolation turned off for the {event.get("runner") or "runner"} runner'),
+    "node.runner.network_check": lambda event: (
+        f'{event.get("runner") or "Runner"} network check '
+        f'{"passed" if event.get("ok") else "failed"}'),
 }
 """Words for the events that are not a decision, a request check or a run state. A text
 or a function of the event. An event with no entry here is shown by `_humanise`, so
@@ -767,6 +772,26 @@ def _coordinator_card(session, settings, now):
         return {"kind": "bad", "headline": f"Offline since {since}",
                 "detail": f"Last poll {last}"}
     return {"kind": "ok", "headline": "Online", "detail": f"Last poll {last}"}
+
+
+GUARANTEE_WORDS = {"enforced": "enforced by the agent",
+                   "attested": "left to the backend, not verified",
+                   "none": "none"}
+
+
+def _network_check(session, settings):
+    """The API process's check at start, or why there is none."""
+    if not settings.network_isolated:
+        return None
+    status = repo.node_status(session)
+    if status is None or status.network_checked_at is None:
+        return {"kind": "mute", "text": "Not checked at start yet"}
+    when = fmt.minute(status.network_checked_at)
+    if status.network_check_ok:
+        return {"kind": "ok", "text": f"Checked at start {when}: "
+                                      f"{status.network_check_detail}"}
+    return {"kind": "bad", "text": f"Check at start failed {when}: "
+                                   f"{status.network_check_detail}"}
 
 
 def _federation_card(session):
@@ -830,7 +855,7 @@ def _audit_row(session, event, undone=None):
     if undone is not None:
         kind, subject_id = undone.get("subject_type"), undone.get("subject_id")
     subject = (_subject_name(session, kind, subject_id) or subject_id
-               or event.get("request_id") or event.get("run_id")
+               or event.get("request_id") or event.get("run_id") or event.get("runner")
                or (f'decision {event["decision_id"]}' if event.get("decision_id")
                    else None) or "n/a")
     when = event.get("at")
@@ -896,6 +921,10 @@ def node_page(session, settings, keys, events, now):
         "coordinator": _coordinator_card(session, settings, now),
         "runner": settings.runner, "busy": repo.count_busy_runs(session),
         "slots": settings.max_concurrent_runs, "isolated": settings.network_isolated,
+        "guarantees": [(aspect.capitalize(), GUARANTEE_WORDS[value], value)
+                       for aspect, value in settings.guarantees],
+        "network_check": _network_check(session, settings),
+        "require_isolation": settings.require_network_isolation,
         "egress": ("Through the TRE airlock", "review in the agent")
         if settings.egress_mode == "airlock"
         else ("Review in the agent", "through the TRE airlock"),

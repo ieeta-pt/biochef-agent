@@ -25,7 +25,8 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from runner import PodmanRunner, _read_step_conf, PODMAN_STEP_CONF  # noqa: E402
+from runner import (PodmanRunner, _read_step_conf, PODMAN_STEP_CONF,  # noqa: E402
+                    check_network)
 
 SNAKEFILE = r'''
 rule all:
@@ -169,6 +170,12 @@ def main():
         failures.append(f"the overrun failed, but not by being killed: "
                         f"{outcome.stderr[-1500:]}")
     shutil.rmtree(over.path)
+
+    # The check the agent runs at start, through rootful podman.
+    result = check_network(runner, root=root, timeout_s=600, probe=("1.1.1.1", 53))
+    print(f"    network check: {result.ok}: {result.detail}", flush=True)
+    if not result.ok:
+        failures.append(f"the network check at start failed: {result.detail}")
 
     if failures:
         for failure in failures:

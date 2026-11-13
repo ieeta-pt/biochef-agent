@@ -864,5 +864,18 @@ def record_poll(session, *, ok, error=None, now=None):
     return row
 
 
+def record_network_check(session, *, ok, detail, now=None):
+    """The API process's check of the runner's network isolation, at start."""
+    row = session.get(NodeStatus, 1)
+    if row is None:
+        row = NodeStatus(id=1)
+        session.add(row)
+    row.network_checked_at = now or utcnow()
+    row.network_check_ok = ok
+    row.network_check_detail = detail
+    session.flush()
+    return row
+
+
 def node_status(session):
     return session.get(NodeStatus, 1)
