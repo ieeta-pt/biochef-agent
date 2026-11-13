@@ -677,7 +677,7 @@ def run_page(session, run, tab, settings, log="run"):
     good = sum(row.get("verdict") == "pass" for row in files)
     decision = _egress_decision(session, run.run_id)
     notice = repo.message_of(session, run.run_id, MessageKind.WITHHELD_RESULT)
-    can_undo = bool(decision and decision.posted_to_coordinator_at is None
+    can_undo = bool(decision and not repo.has_left(decision)
                     and run.egress_state in ("released", "withheld"))
     return {
         "id": run.run_id, "tab": tab, "log": log,

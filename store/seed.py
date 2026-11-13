@@ -293,7 +293,7 @@ def _seed_runs(session, now):
                   workspace_path="/var/lib/biochef/runs/run_7c04",
                   manifest_path="/var/lib/biochef/runs/run_7c04/run.json",
                   log_stdout="fixture log\n", egress_files=list(mock.OUTPUT_FILES))
-    _finish_egress(session, "run_7c04", EgressState.RULES_PENDING,
+    _finish_egress(session, "run_7c04", review_end, EgressState.RULES_PENDING,
                    EgressState.AWAITING_REVIEW)
 
     seeded_above = ("run_8f21", "run_8e90", "run_7c04")
