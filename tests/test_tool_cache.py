@@ -106,13 +106,13 @@ class FakeRegistry:
              "annotations": {"org.opencontainers.image.title": "tool"}},
         ]}
 
-    def pull(self, target, outdir):
-        self.pulls.append((target, outdir))
-        os.makedirs(outdir, exist_ok=True)
-        with open(os.path.join(outdir, "bundle.json"), "wb") as handle:
-            handle.write(self.bundle_bytes)
-        with open(os.path.join(outdir, "tool"), "wb") as handle:
-            handle.write(self.binary_bytes)
+    def download_blob(self, container, digest, outfile):
+        name = os.path.basename(outfile)
+        if name == "bundle.json":
+            self.pulls.append((container, os.path.dirname(outfile)))
+        contents = {"bundle.json": self.bundle_bytes, "tool": self.binary_bytes}
+        with open(outfile, "wb") as handle:
+            handle.write(contents[name])
 
 
 @pytest.fixture
@@ -166,12 +166,11 @@ def test_a_leftover_staging_directory_from_an_interrupted_pull_is_discarded(
 
 
 def test_failed_pull_removes_staging(registry):
-    def failing_pull(target, outdir):
-        os.makedirs(outdir, exist_ok=True)
-        Path(outdir, "half-written").write_text("interrupted")
+    def failing_download(container, digest, outfile):
+        Path(outfile).write_text("interrupted")
         raise RuntimeError("the registry went away")
 
-    registry.pull = failing_pull
+    registry.download_blob = failing_download
 
     with pytest.raises(RuntimeError):
         convert.fetch_tool("tool-1", "some/repo")
@@ -225,15 +224,16 @@ def test_same_tool_threads_share_one_pull(registry):
 
 
 def test_different_tools_pull_concurrently(registry):
-    original_pull = registry.pull
+    original_download = registry.download_blob
     inside_pull = threading.Barrier(2, timeout=2)
     failures = []
 
-    def overlapping_pull(target, outdir):
-        inside_pull.wait()
-        original_pull(target, outdir)
+    def overlapping_download(container, digest, outfile):
+        if os.path.basename(outfile) == "bundle.json":
+            inside_pull.wait()
+        original_download(container, digest, outfile)
 
-    registry.pull = overlapping_pull
+    registry.download_blob = overlapping_download
 
     def fetch(tool_id):
         try:
@@ -256,13 +256,14 @@ def test_different_tools_pull_concurrently(registry):
 
 def _shared_cache_worker(cache, start, pull_count):
     class Registry(FakeRegistry):
-        def pull(self, target, outdir):
-            with pull_count.get_lock():
-                pull_count.value += 1
-            os.makedirs(outdir, exist_ok=True)
-            time.sleep(0.15)
-            Path(outdir, "bundle.json").write_text(json.dumps(BUNDLE))
-            Path(outdir, "tool").write_text("#!/bin/sh\n")
+        def download_blob(self, container, digest, outfile):
+            if os.path.basename(outfile) == "bundle.json":
+                with pull_count.get_lock():
+                    pull_count.value += 1
+                time.sleep(0.15)
+                Path(outfile).write_text(json.dumps(BUNDLE))
+            else:
+                Path(outfile).write_text("#!/bin/sh\n")
 
     convert.TOOL_CACHE = cache
     convert.client = Registry()
