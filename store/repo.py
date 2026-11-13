@@ -23,7 +23,8 @@ from store.models import (DatasetBinding, Decision, FederationList, MemberKey,
 from store.states import (BUSY_RUN_STATES, CANCELLABLE_RUN_STATES,
                           EGRESS_ALLOWED, EGRESS_FINISHED, STUDY_ALLOWED,
                           WORKFLOW_ALLOWED, BindingSource, EgressState,
-                          RefusalCode, VersionState, Verdict)
+                          Action, RefusalCode, SubjectType, VersionState,
+                          Verdict)
 
 
 SHORT_ID_LENGTH = 8
@@ -304,11 +305,23 @@ def restore_version(session, row, state, now=None):
 
 
 def versions_replaced_at(session, version):
-    """The version this one superseded when it was approved, if any."""
-    return session.exec(select(StudyVersion).where(
-        StudyVersion.study_id == version.study_id,
-        StudyVersion.state == VersionState.SUPERSEDED.value,
-        StudyVersion.state_changed_at == version.state_changed_at)).first()
+    """The approved version this one superseded when it was approved, if any.
+
+    Older versions still pending are superseded at the same moment; the one that
+    was approved is told apart by the withdrawal written for it. A version that
+    was only ever pending has no decision at all.
+    """
+    for row in session.exec(select(StudyVersion).where(
+            StudyVersion.study_id == version.study_id,
+            StudyVersion.state == VersionState.SUPERSEDED.value,
+            StudyVersion.state_changed_at == version.state_changed_at)):
+        withdrawals = session.exec(select(func.count()).select_from(Decision).where(
+            Decision.subject_type == SubjectType.STUDY_VERSION.value,
+            Decision.subject_id == str(row.id),
+            Decision.action == Action.WITHDRAW.value)).one()
+        if withdrawals:
+            return row
+    return None
 
 
 # Workflow versions
