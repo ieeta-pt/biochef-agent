@@ -13,18 +13,19 @@ because two processes write here, and a value only one of them understands is
 the kind of thing nobody notices until the page cannot render it.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import (JSON, CheckConstraint, Column, DateTime, Index,
+from sqlalchemy import (JSON, CheckConstraint, Column, Index,
                         LargeBinary, Text, UniqueConstraint, event, inspect,
                         text)
-from sqlalchemy.types import TypeDecorator
 from sqlmodel import Field, Session, SQLModel
 
 from store.errors import ImmutableField
-from store.states import (Action, BindingSource, EgressState, MessageKind,
-                          RefusalCode, ResultRecipients, SubjectType,
+from store.types import UtcDateTime
+from store.states import (RUN_STATES, Action, BindingSource, EgressState,
+                          MessageKind, RefusalCode, ResultRecipients,
+                          SubjectType,
                           VersionState, Verdict)
 
 # Named constraints, because SQLite can only alter a table by rebuilding it and
@@ -38,29 +39,12 @@ SQLModel.metadata.naming_convention = {
 }
 
 
-class UtcDateTime(TypeDecorator):
-    """A moment in UTC. Refuses a naive datetime rather than guessing its zone.
-
-    SQLite stores no zone at all. Comparing a request's expiry with now is a
-    security check, so what goes in has to say what it means.
-    """
-
-    impl = DateTime
-    cache_ok = True
-
-    def process_bind_param(self, value, dialect):
-        if value is None:
-            return None
-        if value.tzinfo is None:
-            raise ValueError(f"naive datetime {value!r}: the store keeps UTC")
-        return value.astimezone(timezone.utc).replace(tzinfo=None)
-
-    def process_result_value(self, value, dialect):
-        return None if value is None else value.replace(tzinfo=timezone.utc)
-
-
 def _one_of(column, values, name=None):
-    allowed = ", ".join(f"'{member.value}'" for member in values)
+    """A CHECK that `column` holds one of `values`: an Enum, or a set of strings."""
+    names = [getattr(value, "value", value) for value in values]
+    if not isinstance(values, type):
+        names.sort()
+    allowed = ", ".join(f"'{value}'" for value in names)
     return CheckConstraint(f"{column} IN ({allowed})", name=name or column)
 
 
@@ -177,6 +161,10 @@ class Decision(SQLModel, table=True):
     at: datetime = _moment(nullable=False)
     object_raw: bytes = _raw()
     signature: str = Field(sa_column=Column(Text, nullable=False))
+    # Set in its own transaction just before the POST, so an undo can tell that
+    # the decision may already be at the coordinator. Both only ever go from
+    # null to a moment (see ONE_WAY).
+    posting_started_at: Optional[datetime] = _moment(nullable=True)
     posted_to_coordinator_at: Optional[datetime] = _moment(nullable=True)
 
 
@@ -185,6 +173,10 @@ class Request(SQLModel, table=True):
     __table_args__ = (
         _one_of("verdict", Verdict),
         _one_of("failed_check", RefusalCode),
+        # What repo.set_verdict refuses, refused here too: a refusal and only a
+        # refusal names a check.
+        CheckConstraint("(COALESCE(verdict, '') = 'refused') = (failed_check IS NOT NULL)",
+                        name="refusal_names_a_check"),
         Index("request_received", "received_at"),
     )
 
@@ -213,7 +205,8 @@ class Request(SQLModel, table=True):
 
 class RunSummary(SQLModel, table=True):
     __tablename__ = "run_summary"
-    __table_args__ = (_one_of("egress_state", EgressState),)
+    __table_args__ = (_one_of("egress_state", EgressState),
+                      _one_of("state", RUN_STATES))
 
     run_id: str = Field(primary_key=True)
     request_id: Optional[str] = Field(default=None,
@@ -298,6 +291,8 @@ class NodeStatus(SQLModel, table=True):
 IMMUTABLE = {
     StudyVersion: ("study_id", "version", "digest", "raw"),
     WorkflowVersion: ("study_id", "study_version_id", "digest", "raw"),
+    MemberKey: ("study_version_id", "member", "ls_aai_id", "signing_key",
+                "result_key", "binding_token"),
     Request: ("study_id", "study_version", "study_digest", "workflow_digest",
               "payload_digest", "raw"),
     OutgoingMessage: ("run_id", "kind", "document", "created_at"),
@@ -314,14 +309,50 @@ application, not the file: anything that can open the database can write to it.
 """
 
 
+ONE_WAY = {
+    Decision: ("posting_started_at", "posted_to_coordinator_at"),
+}
+"""Fields that may be set once, from null, and never changed or cleared.
+
+Setting `posted_to_coordinator_at` back to null would make a decision the
+coordinator already holds look undoable.
+"""
+
+EGRESS_FIELDS = ("egress_files", "airlock_ticket", "airlock_at")
+"""What a run's review is about. Written while the rules run, then fixed:
+release reads the passing files back from `egress_files`, so a later write
+would change what is sent."""
+
+_EGRESS_OPEN = {EgressState.NOT_READY.value, EgressState.RULES_PENDING.value}
+
+
+def _before(history):
+    """The value an attribute had when it was loaded, if it was."""
+    old = list(history.deleted) or list(history.unchanged)
+    return old[0] if old else None
+
+
 @event.listens_for(Session, "before_flush")
 def _refuse_changes_to_immutable_fields(session, _context, _instances):
     for instance in session.dirty:
-        fields = IMMUTABLE.get(type(instance), ())
+        kind = type(instance)
         state = inspect(instance)
-        for name in fields:
+        for name in IMMUTABLE.get(kind, ()):
             if state.attrs[name].history.has_changes():
-                raise ImmutableField(f"{type(instance).__name__}.{name}")
+                raise ImmutableField(f"{kind.__name__}.{name}")
+        for name in ONE_WAY.get(kind, ()):
+            history = state.attrs[name].history
+            if history.has_changes() and _before(history) is not None:
+                raise ImmutableField(f"{kind.__name__}.{name} is already set")
+        if kind is RunSummary:
+            egress = state.attrs["egress_state"].history
+            stages = {_before(egress), instance.egress_state}
+            if not stages <= _EGRESS_OPEN and any(
+                    state.attrs[name].history.has_changes()
+                    for name in EGRESS_FIELDS):
+                raise ImmutableField(
+                    f"RunSummary {instance.run_id}: egress files are fixed once "
+                    f"the rules have run")
 
 
 __all__ = ["Decision", "DatasetBinding", "FederationList", "MemberKey",

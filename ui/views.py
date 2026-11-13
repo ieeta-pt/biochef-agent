@@ -307,7 +307,7 @@ def _workflow_message(session, workflow, decision):
 def status_of(session, subject_type, row):
     """The line shown while a decision has not left this node, or None."""
     about = repo.decisions_about(session, subject_type, row.id)
-    if not about or about[0].posted_to_coordinator_at is not None:
+    if not about or repo.has_left(about[0]):
         return None
     decision = about[0]
     if decision.reason == review.SUPERSEDED:
@@ -680,7 +680,7 @@ def run_page(session, run, tab, settings, log="run"):
     good = sum(row.get("verdict") == "pass" for row in files)
     decision = _egress_decision(session, run.run_id)
     notice = repo.message_of(session, run.run_id, MessageKind.WITHHELD_RESULT)
-    can_undo = bool(decision and decision.posted_to_coordinator_at is None
+    can_undo = bool(decision and not repo.has_left(decision)
                     and run.egress_state in ("released", "withheld"))
     return {
         "id": run.run_id, "tab": tab, "log": log,

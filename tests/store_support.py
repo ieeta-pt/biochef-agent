@@ -22,7 +22,7 @@ def fresh_database(tmp_path):
 
 
 def add_version(session, version=1, *, study="st-01", members=("m-01",),
-                verified=True):
+                verified=True, result_key="age1x"):
     entries = [{"member": name} for name in members]
     row = repo.add_study_version(
         session, study_id=study, version=version,
@@ -32,7 +32,7 @@ def add_version(session, version=1, *, study="st-01", members=("m-01",),
     for name in members:
         repo.add_member_key(session, study_version_id=row.id, member=name,
                             ls_aai_id=f"{name}@example.org",
-                            signing_key={"kty": "EC"}, result_key="age1x",
+                            signing_key={"kty": "EC"}, result_key=result_key,
                             binding_token="token")
     session.flush()
     for name in members:
