@@ -33,9 +33,7 @@ def engine(tmp_path, monkeypatch):
     monkeypatch.setenv("BIOCHEF_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
     bind = fresh_database(tmp_path)[1]
     with db.writing(bind) as session:
-        version = add_version(session)
-        key = repo.member_keys(session, version.id)[0]
-        key.result_key = str(RESULT.to_public())
+        version = add_version(session, result_key=str(RESULT.to_public()))
         repo.add_request(session, request_id="req_1", study_id=version.study_id,
                          study_version=1, study_digest=version.digest,
                          workflow_digest="sha256:w", member="m-01", node=NODE,
@@ -197,10 +195,20 @@ def test_a_posted_decision_cannot_be_undone(engine):
         undo(engine, decision)
 
 
+def test_a_review_decision_on_its_way_cannot_be_undone(engine):
+    decision = review(engine, egress.release)
+    with db.writing(engine) as session:
+        repo.claim_for_posting(session, decision, now=NOW)
+    with pytest.raises(Conflict, match="already been sent"):
+        undo(engine, decision)
+    assert run_of(engine).egress_state == "released"
+
+
 def test_a_sent_result_cannot_be_undone(engine):
     decision = review(engine, egress.release)
     with db.writing(engine) as session:
-        repo.set_egress_state(session, "run_1", EgressState.SENT, NOW)
+        repo.set_egress_state(session, "run_1", EgressState.SENT, NOW,
+                              retain_seconds=KEEP)
     with pytest.raises(Conflict, match="moved on"):
         undo(engine, decision)
 
@@ -270,7 +278,7 @@ def test_a_workspace_that_is_gone_waits_rather_than_sends(engine):
     coordinator = egress.FakeCoordinator()
     with db.writing(engine) as session:
         egress.send_released(session, KEYS, coordinator, lambda run: None, node=NODE,
-                             now=NOW)
+                             now=NOW, keep_seconds=KEEP)
     assert coordinator.posted == [] and run_of(engine).egress_state == "released"
 
 
@@ -317,7 +325,7 @@ def test_withholding_keeps_a_signed_notice_waiting_to_be_sent(engine):
 
 
 def test_the_notice_is_the_canonical_form_of_what_was_signed(engine):
-    review(engine, egress.withhold)
+    review(engine, egress.withhold, keep_seconds=KEEP)
     row = notice(engine)
     assert decisions.canonical(json.loads(row.document)) == row.document
 
@@ -338,7 +346,7 @@ def test_the_airlock_releasing_keeps_no_notice(engine):
 
 
 def test_the_notice_is_audited(engine, tmp_path):
-    review(engine, egress.withhold)
+    review(engine, egress.withhold, keep_seconds=KEEP)
     event = [row for row in audit.read(str(tmp_path / "audit.jsonl"))
              if row["event"] == "node.egress.notice"][0]
     assert (event["run_id"], event["decision"], event["message_id"]) == (
@@ -347,12 +355,12 @@ def test_the_notice_is_audited(engine, tmp_path):
 
 
 def test_undoing_a_withholding_drops_its_notice(engine):
-    undo(engine, review(engine, egress.withhold))
+    undo(engine, review(engine, egress.withhold, keep_seconds=KEEP))
     assert notice(engine) is None
 
 
 def test_a_withholding_whose_notice_went_cannot_be_undone(engine):
-    decision = review(engine, egress.withhold)
+    decision = review(engine, egress.withhold, keep_seconds=KEEP)
     with db.writing(engine) as session:
         repo.mark_message_sent(session, notice(engine).id, now=NOW)
     with pytest.raises(Conflict, match="already been told"):
@@ -362,14 +370,15 @@ def test_a_withholding_whose_notice_went_cannot_be_undone(engine):
 
 
 def test_withholding_again_after_an_undo_keeps_a_new_notice(engine):
-    undo(engine, review(engine, egress.withhold))
+    undo(engine, review(engine, egress.withhold, keep_seconds=KEEP))
     with db.writing(engine) as session:
-        egress.withhold(session, KEYS, node=NODE, run_id="run_1", user="j.silva", now=NOW)
+        egress.withhold(session, KEYS, node=NODE, run_id="run_1", user="j.silva", now=NOW,
+                        keep_seconds=KEEP)
     assert notice(engine) is not None
 
 
 def test_unsent_messages_are_listed_and_sent_once(engine):
-    review(engine, egress.withhold)
+    review(engine, egress.withhold, keep_seconds=KEEP)
     with db.writing(engine) as session:
         waiting = repo.unsent_messages(session)
         assert [row.run_id for row in waiting] == ["run_1"]
@@ -390,7 +399,7 @@ def test_no_trail_no_notice(engine, monkeypatch):
 
 
 def test_a_notice_cannot_be_rewritten(engine):
-    review(engine, egress.withhold)
+    review(engine, egress.withhold, keep_seconds=KEEP)
     with pytest.raises(Exception):
         with db.writing(engine) as session:
             repo.message_of(session, "run_1", MessageKind.WITHHELD_RESULT).document = b"x"

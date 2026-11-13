@@ -80,3 +80,24 @@ def _apptainer_binary(monkeypatch, _fake_apptainer):
     none of them can run the host's by accident.
     """
     monkeypatch.setenv("BIOCHEF_APPTAINER_BINARY", _fake_apptainer)
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "catalog: runs with tool references resolved through the signed "
+        "catalog, which is the service's default",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _tool_catalog_off_unless_the_test_is_about_it(request, monkeypatch):
+    """Most tests drive fetch_tool against a stub registry that has no catalog.
+
+    They are about the cache, the logs or the signature check, not about which
+    manifest a name resolves to, so they run with the catalog off -- the mode a
+    development registry without a catalog uses. Tests of the catalog itself
+    are marked `catalog` and get the real default instead.
+    """
+    if "catalog" not in request.keywords:
+        monkeypatch.setenv("BIOCHEF_TOOL_CATALOG", "off")

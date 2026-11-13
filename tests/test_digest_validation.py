@@ -134,6 +134,7 @@ class _Registry:
         self.written = written
         self.vouched = written if vouched is None else vouched
         self.manifest = _manifest_for(self.vouched)
+        self.pulled = False
 
     def get_container(self, target):
         return target
@@ -142,6 +143,7 @@ class _Registry:
         return self.manifest
 
     def pull(self, target, outdir):
+        self.pulled = True
         os.makedirs(outdir, exist_ok=True)
         for name, content in self.written.items():
             with open(os.path.join(outdir, name), "wb") as f:
@@ -221,6 +223,54 @@ def test_a_directory_layer_is_refused_rather_than_skipped(tmp_path, monkeypatch)
     convert.tools.clear()
     try:
         with pytest.raises(convert.ToolIntegrityError, match="directory archive"):
+            convert.fetch_tool("tool-1", "tool:latest")
+        assert not registry.pulled, "oras extracts it during the pull"
+    finally:
+        convert.tools.clear()
+
+
+def test_a_layer_without_a_title_is_refused(tmp_path, monkeypatch):
+    """Its hash would match, which is why hashing alone never caught it.
+
+    oras saves an untitled layer under its digest, so the staged file is exactly
+    the blob the manifest names. The bundle's own files are all still present,
+    so the image is a genuine bundle with something added to it.
+    """
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+    registry = _Registry(GENUINE)
+    added = b"\x1f\x8b an added layer"
+    digest = "sha256:" + hashlib.sha256(added).hexdigest()
+    registry.written = {**GENUINE, digest: added}
+    registry.manifest["layers"].append({
+        "digest": digest,
+        "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+    })
+    monkeypatch.setattr(convert, "client", registry)
+    convert.tools.clear()
+    try:
+        with pytest.raises(convert.ToolIntegrityError, match="has no title"):
+            convert.fetch_tool("tool-1", "tool:latest")
+        assert not registry.pulled, "the pull must not start"
+        assert not os.path.exists(tmp_path / "cache" / "tool")
+    finally:
+        convert.tools.clear()
+
+
+def test_a_cached_bundle_is_not_trusted_once_its_manifest_gains_a_layer(
+        tmp_path, monkeypatch):
+    """The cache is compared with the manifest, so it must refuse the same way."""
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+    registry = _Registry(GENUINE)
+    monkeypatch.setattr(convert, "client", registry)
+    convert.tools.clear()
+    try:
+        convert.fetch_tool("tool-1", "tool:latest")
+        registry.manifest["layers"].append({
+            "digest": "sha256:" + "0" * 64,
+            "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+            "annotations": None,
+        })
+        with pytest.raises(convert.ToolIntegrityError, match="has no title"):
             convert.fetch_tool("tool-1", "tool:latest")
     finally:
         convert.tools.clear()

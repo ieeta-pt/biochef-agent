@@ -127,7 +127,7 @@ def _refusal(session, decision, subject):
     action = Action(decision.action)
     if action not in _REVERSALS:
         return "this kind of decision cannot be undone here"
-    if decision.posted_to_coordinator_at is not None:
+    if repo.has_left(decision):
         return "it has already been sent to the coordinator"
 
     subject_type = SubjectType(decision.subject_type)
@@ -152,8 +152,8 @@ def _refusal(session, decision, subject):
                for row in repo.workflow_versions(session, subject.id)):
             return "workflows have been decided under this version"
         replaced = repo.versions_replaced_at(session, subject)
-        if (replaced is not None and _withdrawal_of(session, replaced)
-                .posted_to_coordinator_at is not None):
+        if (replaced is not None
+                and repo.has_left(_withdrawal_of(session, replaced))):
             return "the withdrawal it caused has already been sent"
     if restored is VersionState.APPROVED:
         if is_study:
@@ -161,6 +161,15 @@ def _refusal(session, decision, subject):
                 return "another version of this study is approved now"
         elif study_version.state != VersionState.APPROVED.value:
             return "its study version is no longer approved"
+    elif is_study:
+        # Back to pending under a newer approved version, it could never be
+        # approved: it would wait in the Inbox for ever.
+        current = repo.approved_version(session, subject.study_id)
+        if current is not None and current.version > subject.version:
+            return f"v{current.version} is approved now"
+    elif study_version.state not in (VersionState.PENDING.value,
+                                     VersionState.APPROVED.value):
+        return "its study version is no longer open"
     return None
 
 
@@ -185,6 +194,41 @@ def _restore_replaced(session, version, replaced, now):
             VersionState.APPROVED if was_approved else VersionState.PENDING, now)
 
 
+def _withdrawn_with(session, version):
+    """The workflows a study version's withdrawal took with it: withdrawn at
+    the same moment, and not by a withdrawal of their own."""
+    moved = []
+    for row in repo.workflow_versions(session, version.id):
+        if (row.state != VersionState.WITHDRAWN.value
+                or row.state_changed_at != version.state_changed_at):
+            continue
+        about = repo.decisions_about(session, SubjectType.WORKFLOW_VERSION, row.id)
+        if about and about[0].action == Action.WITHDRAW.value:
+            continue
+        moved.append((row, bool(about) and about[0].action == Action.APPROVE.value))
+    return moved
+
+
+def _reopen_waiting(session, study_id, now):
+    """Put back to pending the versions an undone approval superseded while
+    they waited, with their workflows.
+
+    Found by what they are rather than by when they moved, because one may have
+    arrived after the approval and been stored superseded: no decision was ever
+    made about it here, and it is newer than whatever is approved now.
+    """
+    current = repo.approved_version(session, study_id)
+    for row in repo.study_versions(session, study_id):
+        if (row.state != VersionState.SUPERSEDED.value
+                or repo.decisions_about(session, SubjectType.STUDY_VERSION, row.id)
+                or (current is not None and row.version <= current.version)):
+            continue
+        repo.restore_version(session, row, VersionState.PENDING, now)
+        for workflow in repo.workflow_versions(session, row.id):
+            if workflow.state == VersionState.SUPERSEDED.value:
+                repo.restore_version(session, workflow, VersionState.PENDING, now)
+
+
 def undo(session, decision_id, *, user, now=None):
     """Take a decision back, with everything it moved, and say who did."""
     now = now or repo.utcnow()
@@ -192,16 +236,18 @@ def undo(session, decision_id, *, user, now=None):
     subject = _subject(session, decision)
     reason = _refusal(session, decision, subject)
     if reason is not None:
-        if decision.posted_to_coordinator_at is not None:
+        if repo.has_left(decision):
             raise AlreadyPosted(f"decision {decision_id}: {reason}")
         raise Conflict(f"This decision cannot be undone: {reason}.")
 
     action = Action(decision.action)
     made, restored = _REVERSALS[action]
+    is_study = decision.subject_type == SubjectType.STUDY_VERSION.value
     replaced = None
-    if (decision.subject_type == SubjectType.STUDY_VERSION.value
-            and action is Action.APPROVE):
+    if is_study and action is Action.APPROVE:
         replaced = repo.versions_replaced_at(session, subject)
+    withdrawn_with = (_withdrawn_with(session, subject)
+                      if is_study and action is Action.WITHDRAW else [])
 
     if replaced is not None:
         withdrawal = _withdrawal_of(session, replaced)
@@ -209,5 +255,11 @@ def undo(session, decision_id, *, user, now=None):
         decisions.undo(session, withdrawal.id, user=user)
     else:
         repo.restore_version(session, subject, restored, now)
+    for workflow, was_approved in withdrawn_with:
+        repo.restore_version(
+            session, workflow,
+            VersionState.APPROVED if was_approved else VersionState.PENDING, now)
+    if is_study and action is Action.APPROVE:
+        _reopen_waiting(session, subject.study_id, now)
     decisions.undo(session, decision.id, user=user)
     return subject
