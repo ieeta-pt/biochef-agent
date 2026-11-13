@@ -430,3 +430,123 @@ def test_undo_says_why_not_before_anyone_tries(engine, two_versions):
     with db.reading(engine) as session:
         row = repo.get_decision(session, decision)
         assert "sent" in review.undo_refusal(session, row)
+
+
+# What the store moves with a decision, and puts back with its undo
+
+
+def test_withdrawing_a_version_takes_its_workflows_and_undo_returns_them(
+        engine, two_versions):
+    v1, _, approved, waiting = two_versions
+    with db.writing(engine) as session:
+        alone = add_workflow(session, v1, "sha256:w3").id
+        review.approve_workflow(session, KEYS, node=NODE, workflow_id=alone,
+                                user="j.silva", now=NOW)
+        review.withdraw_workflow(session, KEYS, node=NODE, workflow_id=alone,
+                                 user="j.silva", now=NOW + timedelta(minutes=5))
+        decision = review.withdraw_study(session, KEYS, node=NODE, version_id=v1,
+                                         user="j.silva", now=LATER).id
+    assert workflow_states(engine, approved, waiting, alone) == [
+        "withdrawn", "withdrawn", "withdrawn"]
+    with db.writing(engine) as session:
+        review.undo(session, decision, user="j.silva", now=LATEST)
+    assert states(engine, v1) == ["approved"]
+    assert workflow_states(engine, approved, waiting, alone) == [
+        "approved", "pending", "withdrawn"]
+
+
+def test_undoing_an_approval_reopens_the_versions_it_superseded_while_waiting(
+        engine, two_versions):
+    v1, v2, *_ = two_versions
+    with db.writing(engine) as session:
+        workflow = add_workflow(session, v2, "sha256:v2w").id
+        v3 = add_version(session, 3).id
+        decision = approve(session, v3, now=LATER).id
+    assert states(engine, v1, v2, v3) == ["superseded", "superseded", "approved"]
+    assert workflow_states(engine, workflow) == ["superseded"]
+    with db.writing(engine) as session:
+        review.undo(session, decision, user="j.silva", now=LATEST)
+    assert states(engine, v1, v2, v3) == ["approved", "pending", "pending"]
+    assert workflow_states(engine, workflow) == ["pending"]
+
+
+def test_undoing_an_approval_reopens_a_version_that_arrived_late(engine):
+    with db.writing(engine) as session:
+        v3 = add_version(session, 3).id
+        decision = approve(session, v3).id
+        v2 = add_version(session, 2).id
+    assert states(engine, v2) == ["superseded"]
+    with db.writing(engine) as session:
+        review.undo(session, decision, user="j.silva", now=LATER)
+    assert states(engine, v2, v3) == ["pending", "pending"]
+
+
+def test_undoing_an_approval_keeps_what_an_earlier_approval_superseded(engine):
+    """v1 went when v2 was approved, and v2 is approved again after the undo."""
+    with db.writing(engine) as session:
+        v1 = add_version(session, 1).id
+        v2 = add_version(session, 2).id
+        approve(session, v2)
+        v3 = add_version(session, 3).id
+        decision = approve(session, v3, now=LATER).id
+    with db.writing(engine) as session:
+        review.undo(session, decision, user="j.silva", now=LATEST)
+    assert states(engine, v1, v2, v3) == ["superseded", "approved", "pending"]
+
+
+def test_a_refusal_cannot_come_back_under_a_newer_approval(engine, two_versions):
+    """Pending again under v3, v2 could never be approved."""
+    v1, v2, *_ = two_versions
+    with db.writing(engine) as session:
+        refusal = review.refuse_study(session, KEYS, node=NODE, version_id=v2,
+                                      user="j.silva", now=LATER).id
+        v3 = add_version(session, 3).id
+        approve(session, v3, now=LATER)
+    with db.reading(engine) as session:
+        assert "v3 is approved now" in review.undo_refusal(
+            session, repo.get_decision(session, refusal))
+    with pytest.raises(Conflict):
+        with db.writing(engine) as session:
+            review.undo(session, refusal, user="j.silva", now=LATEST)
+    assert states(engine, v2) == ["refused"]
+
+
+def test_a_workflow_refusal_cannot_come_back_under_a_closed_version(
+        engine, two_versions):
+    v1, v2, _, waiting = two_versions
+    with db.writing(engine) as session:
+        refusal = review.refuse_workflow(session, KEYS, node=NODE,
+                                         workflow_id=waiting, user="j.silva",
+                                         now=LATER).id
+        approve(session, v2, now=LATER)
+    with pytest.raises(Conflict, match="no longer open"):
+        with db.writing(engine) as session:
+            review.undo(session, refusal, user="j.silva", now=LATEST)
+    assert workflow_states(engine, waiting) == ["refused"]
+
+
+def test_a_decision_on_its_way_cannot_be_undone(engine, two_versions):
+    """Claimed by the poll and not yet answered: it may be at the coordinator."""
+    v1, v2, *_ = two_versions
+    decision = approved_second(engine, v2)
+    with db.writing(engine) as session:
+        repo.claim_for_posting(session, decision, now=LATEST)
+    with db.reading(engine) as session:
+        assert review.undo_refusal(session, repo.get_decision(session, decision))
+    with pytest.raises(AlreadyPosted):
+        with db.writing(engine) as session:
+            review.undo(session, decision, user="j.silva")
+    assert states(engine, v1, v2) == ["superseded", "approved"]
+
+
+def test_an_approval_whose_withdrawal_is_on_its_way_stays(engine, two_versions):
+    v1, v2, *_ = two_versions
+    decision = approved_second(engine, v2)
+    withdrawal = next(row.id for row in about(engine, v1)
+                      if row.action == Action.WITHDRAW.value)
+    with db.writing(engine) as session:
+        repo.claim_for_posting(session, withdrawal, now=LATEST)
+    with pytest.raises(Conflict, match="withdrawal it caused"):
+        with db.writing(engine) as session:
+            review.undo(session, decision, user="j.silva")
+    assert states(engine, v1, v2) == ["superseded", "approved"]
