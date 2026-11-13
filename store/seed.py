@@ -249,9 +249,14 @@ def _older_requests(session, versions, workflows, now):
     return rows
 
 
-def _finish_egress(session, run_id, *stages):
+KEEP_SECONDS = 3600
+"""Retention of the seeded runs, the default of BIOCHEF_KEEP_OUTPUTS."""
+
+
+def _finish_egress(session, run_id, now, *stages):
     for stage in stages:
-        repo.set_egress_state(session, run_id, stage)
+        repo.set_egress_state(session, run_id, stage, now,
+                              retain_seconds=KEEP_SECONDS)
 
 
 def _seed_runs(session, now):
@@ -272,7 +277,7 @@ def _seed_runs(session, now):
                   egress_files=list(mock.OUTPUT_FILES),
                   airlock_ticket="airlock-0001",
                   airlock_at=moment + timedelta(minutes=1))
-    _finish_egress(session, "run_8f21", EgressState.RULES_PENDING,
+    _finish_egress(session, "run_8f21", moment, EgressState.RULES_PENDING,
                    EgressState.AWAITING_AIRLOCK)
 
     repo.save_run(session, "run_8e90", state="RUNNING", request_id="req_8e90",
@@ -292,7 +297,7 @@ def _seed_runs(session, now):
                   workspace_path="/var/lib/biochef/runs/run_7c04",
                   manifest_path="/var/lib/biochef/runs/run_7c04/run.json",
                   log_stdout="fixture log\n", egress_files=list(mock.OUTPUT_FILES))
-    _finish_egress(session, "run_7c04", EgressState.RULES_PENDING,
+    _finish_egress(session, "run_7c04", review_end, EgressState.RULES_PENDING,
                    EgressState.AWAITING_REVIEW)
 
     seeded_above = ("run_8f21", "run_8e90", "run_7c04")
@@ -303,7 +308,7 @@ def _seed_runs(session, now):
         ended = now - mock.hours(19)
         repo.save_run(session, run_id, state="COMPLETE", request_id=request_id,
                       started_at=ended - mock.hours(1), ended_at=ended, exit_code=0)
-        _finish_egress(session, run_id, EgressState.RULES_PENDING,
+        _finish_egress(session, run_id, ended, EgressState.RULES_PENDING,
                        EgressState.AWAITING_AIRLOCK, EgressState.RELEASED,
                        EgressState.SENT)
 

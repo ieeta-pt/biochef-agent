@@ -333,6 +333,19 @@ def test_undo_is_gone_once_the_decision_is_posted(client, engine, v3):
     assert "Undo before the next poll" not in client.get(url).text
 
 
+def test_undo_is_gone_once_the_poll_has_claimed_the_decision(client, engine, v3):
+    """Claimed and not yet answered: the POST may already have arrived."""
+    response = post(client, f"/ui/_/inbox/study/{v3}/refuse")
+    url = response.headers["hx-redirect"]
+    assert "v3 refused and signed" in client.get(url).text
+    with db.writing(engine) as session:
+        for row in repo.unposted_decisions(session):
+            repo.claim_for_posting(session, row.id)
+    page = client.get(url).text
+    assert "Undo before the next poll" not in page
+    assert "v3 refused and signed" not in page
+
+
 def test_undo_is_not_offered_once_something_ran_under_the_decision(client, engine,
                                                                    monkeypatch):
     pending = workflow_id(engine, "gwas-qc", "1.4.0")
@@ -432,7 +445,7 @@ def test_a_version_that_lists_no_members_cannot_be_approved(engine):
     assert re.search(r"<button[^>]*\bdisabled\b[^>]*>Approve", text)
 
 
-def test_an_older_version_cannot_replace_a_newer_one(engine):
+def test_an_older_version_arriving_late_is_superseded_and_not_offered(engine):
     with db.writing(engine) as session:
         v2 = repo.study_version_named(session, mock.CARDIO, 2)
         repo.withdraw_study_version(session, v2.id)
@@ -448,9 +461,10 @@ def test_an_older_version_cannot_replace_a_newer_one(engine):
                             binding_token="t")
         session.flush()
         repo.mark_identity_verified(session, older.id, "m-01", {"sub": "a@b"})
+        assert older.state == "superseded"
     text = client_for(settings(), bind=engine).get(f"/ui/inbox/study/{older.id}").text
-    assert "an older version cannot replace it" in text
-    assert re.search(r"<button[^>]*\bdisabled\b[^>]*>Approve", text)
+    assert "Superseded" in text
+    assert not re.search(r"<button[^>]*>Approve", text)
 
 
 # Studies (02)
