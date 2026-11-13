@@ -6,7 +6,7 @@ Revises: 0004
 
 from alembic import op
 import sqlalchemy as sa
-import store.models
+import store.types
 
 
 revision = '0005'
@@ -17,7 +17,7 @@ depends_on = None
 
 def upgrade():
     with op.batch_alter_table('node_status') as batch:
-        batch.add_column(sa.Column('network_checked_at', store.models.UtcDateTime(),
+        batch.add_column(sa.Column('network_checked_at', store.types.UtcDateTime(),
                                    nullable=True))
         batch.add_column(sa.Column('network_check_ok', sa.Boolean(), nullable=True))
         batch.add_column(sa.Column('network_check_detail', sa.String(), nullable=True))
