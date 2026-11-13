@@ -224,6 +224,8 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_NODE_SIGNING_KEY` | | path of the node's Ed25519 private key, see [The node's keys](#the-nodes-keys) |
 | `BIOCHEF_NODE_ENCRYPTION_KEY` | | path of the node's X25519 private key |
 | `BIOCHEF_NODE_NAME` | | this node's name, required by the UI |
+| `BIOCHEF_LS_LOGIN_ISSUER` | | LS Login issuer URL, for checking members' ID tokens |
+| `BIOCHEF_EDITOR_CLIENT_ID` | | the editor's LS Login client id, the audience of those tokens |
 | `BIOCHEF_UI_HOST` | `127.0.0.1` | interface the UI binds to |
 | `BIOCHEF_UI_PORT` | `8081` | UI port |
 | `BIOCHEF_UI_IDENTITY` | | `header` or `dev`, no default, see [The page for a node's data manager](#the-page-for-a-nodes-data-manager) |
@@ -549,6 +551,12 @@ The agent has no accounts. The TRE decides who may open the page, and `BIOCHEF_U
 The page refuses to start without `BIOCHEF_AUDIT_LOG`, because every decision made there has to reach the trail, and without the node's signing key or a migrated database. `run-ui.sh` starts `python -m ui`, which keeps uvicorn's proxy headers off. If you run `uvicorn ui.app:app` yourself, pass `--no-proxy-headers`, because otherwise uvicorn rewrites the client address that the identity check depends on.
 
 Everything the page loads is served by the agent: htmx, the fonts and the stylesheet are in `ui/static/`, and `ui/static.sha256` records the vendored files. `ui/static/app.css` is built and committed, so nothing else is needed at runtime. After changing a template or `ui/tailwind/input.css`, run `make css`, which downloads the pinned Tailwind CLI, checks it against `ui/tailwind/SHA256SUMS` and rebuilds the file. CI fails if the committed file differs.
+
+## Member identity
+
+A study version lists each member's keys next to an LS Login ID token. `node/identity.py` checks the token: signed by LS Login, through the keys at `BIOCHEF_LS_LOGIN_ISSUER`, made for `BIOCHEF_EDITOR_CLIENT_ID`, unexpired, and with a `sub` equal to the member's `ls_aai_id`. A member's name comes only from the `name` claim of a token that passed; the editor asks for the scope `openid profile` so that the token carries it.
+
+The token's nonce ties it to the member's keys. The agent builds the object `{"v": "biochef.member-keys.v1", "result_key": ..., "signing_key": ...}` from the keys the study version lists, serializes it with RFC 8785, and the nonce must be exactly the SHA-256 of those bytes in base64url without padding. `signing_key` is the public JWK with only `crv`, `kty`, `x` and `y`, the coordinates as 43 characters of base64url with their leading zeros, and `result_key` is the age recipient in lowercase. Keys in any other form are refused, not normalised. A member whose nonce does not match counts as not verified, with that reason shown on the page, and leaves no name. The test vector is in `tests/test_node_identity.py`.
 
 ## Before deploying this
 
