@@ -24,7 +24,7 @@ A step that can reach the network can send the data it read anywhere, and keepin
 Choose one:
 
 1. **Use a runner that isolates the network.**
-   - `apptainer`, with the default `BIOCHEF_APPTAINER_ARGS`.
+   - `apptainer` or `singularity`, with the default `BIOCHEF_APPTAINER_ARGS` and `BIOCHEF_APPTAINER_BINARY` (next section).
    - `podman`, rootless or rootful.
 
    See "Running it" and "What each runner guarantees" in the README.
@@ -34,3 +34,21 @@ Choose one:
 
 - A runner whose network isolation is enforced now runs one step when the API process starts, to show that the step has no network. If the step finds a route or an address besides loopback, or cannot read its routes, the agent does not start, and the audit trail says why (`node.runner.network_check`). With `BIOCHEF_NETWORK_PROBE=host:port`, the step also tries to reach a host the agent itself can reach.
 - On a node, run `python -m store migrate` after updating, for migration 0005.
+
+## Apptainer needs the path of its binary
+
+### What you will see
+
+An agent with `BIOCHEF_RUNNER=apptainer` stops at start with:
+
+```
+BIOCHEF_APPTAINER_BINARY='': BIOCHEF_RUNNER=apptainer needs the absolute path of the apptainer binary, and it has no default
+```
+
+### Why
+
+Snakemake has no setting for the binary. It runs `apptainer` if one is on `PATH`, and `singularity` otherwise. Apptainer's packages also install a `singularity` that is apptainer. So which program ran each step depended on `PATH`. The agent now names the binary, checks what it says it is, and puts a link to it first on Snakemake's `PATH`.
+
+### What to do
+
+Set `BIOCHEF_APPTAINER_BINARY` to the absolute path of the binary, for example the output of `command -v apptainer`. The agent refuses to start if the binary does not say `apptainer version`. For SingularityCE, use `BIOCHEF_RUNNER=singularity`, whose binary must say `singularity-ce version`.

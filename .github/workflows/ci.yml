@@ -231,6 +231,47 @@ jobs:
         run: |
           python ci/runner_parity.py
 
+  singularity:
+    name: singularity, not as root
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      - name: Install SingularityCE
+        # The published .deb for Ubuntu 24.04, pinned and checked against the
+        # digest GitHub publishes for it. It installs the setuid starter and an
+        # AppArmor profile that lets SingularityCE make user namespaces.
+        env:
+          SINGULARITY_VERSION: "4.6.0"
+          SINGULARITY_SHA256: "94971e1f2979d77927cc9a098362ee38aad8dc338cb6da51413d545b1bed15aa"
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/singularity.deb \
+            "https://github.com/sylabs/singularity/releases/download/v${SINGULARITY_VERSION}/singularity-ce_${SINGULARITY_VERSION}-noble_amd64.deb"
+          echo "${SINGULARITY_SHA256}  /tmp/singularity.deb" | sha256sum -c -
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends /tmp/singularity.deb
+          singularity --version
+
+      - name: With the setuid starter
+        run: BIOCHEF_APPTAINER_BINARY="$(command -v singularity)" python ci/singularity_check.py
+
+      - name: Without it, in user namespaces only
+        # `allow setuid = no` makes SingularityCE run without the setuid starter,
+        # so nothing in the step's start has root at all.
+        run: |
+          sudo sed -i 's/^allow setuid = yes$/allow setuid = no/' /etc/singularity/singularity.conf
+          grep -x 'allow setuid = no' /etc/singularity/singularity.conf
+          BIOCHEF_APPTAINER_BINARY="$(command -v singularity)" python ci/singularity_check.py
+
   podman-rootful:
     name: rootful podman 3.0.1
     runs-on: ubuntu-24.04

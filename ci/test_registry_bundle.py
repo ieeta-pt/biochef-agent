@@ -6,6 +6,7 @@ This checks the two runners, not the Agent's ORAS fetch or evidence-verification
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import urllib.request
@@ -95,7 +96,8 @@ def main():
         source.write_bytes(binary)
         os.chmod(source, 0o700)
         _run(SubprocessRunner(), root)
-        _run(ApptainerRunner(cache_dir=str(Path(root) / "apptainer-cache")), root)
+        _run(ApptainerRunner(cache_dir=str(Path(root) / "apptainer-cache"),
+                             binary=shutil.which("apptainer")), root)
     print(f"OK: {PACKAGE}@{MANIFEST_DIGEST} ran under both runners")
 
 
