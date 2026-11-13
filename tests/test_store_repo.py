@@ -183,13 +183,16 @@ def test_versions_of_different_studies_are_independent(engine):
 
 
 def test_an_older_version_cannot_replace_a_newer_one(engine):
+    """Approving v3 supersedes the v2 still waiting, so v2 has nowhere to go."""
     with db.writing(engine) as session:
         v2 = add_version(session, 2).id
         v3 = add_version(session, 3).id
         repo.approve_study_version(session, v3, now=NOW)
-    with pytest.raises(Conflict):
+    with pytest.raises(IllegalTransition):
         with db.writing(engine) as session:
             repo.approve_study_version(session, v2, now=NOW)
+    assert state_of(engine, v2) == "superseded"
+    assert state_of(engine, v3) == "approved"
 
 
 def test_concurrent_approvals_leave_exactly_one_approved(engine):
