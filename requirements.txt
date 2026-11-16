@@ -88,3 +88,4 @@ PyJWT==2.13.0
 cryptography==50.0.1
 alembic==1.20.1
 Mako==1.4.3
+rfc8785==0.1.4

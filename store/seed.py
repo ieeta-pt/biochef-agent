@@ -4,11 +4,11 @@ For development and for reproducing the mockups, never for a real node. It
 refuses a database that already holds anything, so that a mistyped
 BIOCHEF_DB_URL cannot mix invented approvals into a node's record.
 
-Decisions carry the signature `unsigned-fixture` until node signing exists.
-Nothing could verify them as a real signature, which is the point.
+Decisions are signed with a key generated on the spot and then thrown away, so
+they have the shape of real ones and no node vouches for them. They are not
+written to the audit trail: nobody decided anything.
 
-Display names come out of the fixture tokens, and tokens are not really signed
-either. Member ids stay opaque everywhere else.
+Display names come out of the fixture tokens, which nobody signed. Member ids stay opaque everywhere else.
 """
 
 import argparse
@@ -22,6 +22,8 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from sqlalchemy import func
 from sqlmodel import select
 
+from node import decisions
+from node.keys import generate
 from store import db, migrate, repo
 from store.errors import StoreError
 from store.fixtures import mock
@@ -29,7 +31,6 @@ from store.models import Study
 from store.states import (Action, BindingSource, EgressState, SubjectType,
                           Verdict)
 
-UNSIGNED = "unsigned-fixture"
 SYSTEM_USER = "agent"
 
 
@@ -58,20 +59,15 @@ def _mock_digest(ends, seed):
     return f"sha256:{head}{middle}{tail}"
 
 
-def _decide(session, subject_type, subject_id, action, user, at, *, subject_hash=None,
-            reason=None, dac_confirmed=None):
-    document = {
-        "schema": "biochef.node-decision.v1", "node": mock.NODE,
-        "subject_type": subject_type.value, "subject_id": str(subject_id),
-        "subject_hash": subject_hash, "action": action.value, "user": user,
-        "at": at.isoformat(timespec="seconds"), "reason": reason,
-    }
-    if dac_confirmed is not None:
-        document["dac_confirmed"] = dac_confirmed
-    return repo.record_decision(
-        session, subject_type=subject_type, subject_id=subject_id, action=action,
-        user=user, object_raw=_bytes(document), signature=UNSIGNED, at=at,
-        subject_hash=subject_hash, reason=reason, dac_confirmed=dac_confirmed)
+def _decide(session, keys, subject_type, subject_id, action, user, at, *,
+            subject_hash=None, reason=None, dac_confirmed=None):
+    """Sign and store, leaving the audit trail alone: nobody decided anything."""
+    document = decisions.build(
+        node=mock.NODE, subject_type=subject_type, subject_id=subject_id,
+        action=action, user=user, at=at, subject_hash=subject_hash, reason=reason,
+        dac_confirmed=dac_confirmed)
+    object_raw, signature = decisions.sign(document, keys)
+    return decisions.store(session, document, object_raw, signature)
 
 
 def _fixture_token(name, ls_aai_id):
@@ -91,7 +87,7 @@ def _token_claims(token):
     return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
 
 
-def _seed_studies(session, now):
+def _seed_studies(session, keys, now):
     versions = {}
     previous = {}
     for (study, number, goal, proposer, names, dataset, nodes, rules, age,
@@ -130,30 +126,30 @@ def _seed_studies(session, now):
             else:
                 repo.mark_identity_failed(session, row.id, member, error)
         session.flush()
-        _apply_study_state(session, row, state, at)
+        _apply_study_state(session, keys, row, state, at)
     return versions
 
 
-def _apply_study_state(session, row, state, at):
+def _apply_study_state(session, keys, row, state, at):
     subject = SubjectType.STUDY_VERSION
     decided = at + timedelta(hours=1)
     if state == "pending":
         return
     if state in ("approved", "superseded", "withdrawn"):
         replaced = repo.approve_study_version(session, row.id, now=decided)
-        _decide(session, subject, row.id, Action.APPROVE, "j.silva", decided,
+        _decide(session, keys, subject, row.id, Action.APPROVE, "j.silva", decided,
                 subject_hash=row.digest, dac_confirmed=True)
         if replaced is not None:
-            _decide(session, subject, replaced.id, Action.WITHDRAW, SYSTEM_USER,
+            _decide(session, keys, subject, replaced.id, Action.WITHDRAW, SYSTEM_USER,
                     decided, subject_hash=replaced.digest, reason="superseded")
     if state == "withdrawn":
         withdrawn = decided + timedelta(days=5)
         repo.withdraw_study_version(session, row.id, now=withdrawn)
-        _decide(session, subject, row.id, Action.WITHDRAW, "j.silva", withdrawn,
+        _decide(session, keys, subject, row.id, Action.WITHDRAW, "j.silva", withdrawn,
                 subject_hash=row.digest)
 
 
-def _seed_workflows(session, versions, now):
+def _seed_workflows(session, keys, versions, now):
     workflows = {}
     for (key, study, number, name, version, ends, values, state,
          age) in mock.WORKFLOWS:
@@ -174,7 +170,7 @@ def _seed_workflows(session, versions, now):
         if state == "approved":
             decided = at + timedelta(hours=1)
             repo.approve_workflow_version(session, row.id, now=decided)
-            _decide(session, SubjectType.WORKFLOW_VERSION, row.id, Action.APPROVE,
+            _decide(session, keys, SubjectType.WORKFLOW_VERSION, row.id, Action.APPROVE,
                     "j.silva", decided, subject_hash=digest)
     return workflows
 
@@ -201,7 +197,7 @@ def _add_request(session, versions, workflows, now, *, request_id, study, number
     return at
 
 
-def _seed_requests(session, versions, workflows, now):
+def _seed_requests(session, keys, versions, workflows, now):
     pending_verdicts = []
     for (request_id, study, number, key, member, age, verdict, failed, joined,
          run) in mock.REQUESTS:
@@ -218,7 +214,7 @@ def _seed_requests(session, versions, workflows, now):
         repo.set_verdict(session, request_id, Verdict(verdict), failed_check=failed,
                          joined_request_id=joined, run_id=run)
         if verdict == "refused":
-            _decide(session, SubjectType.REQUEST, request_id, Action.REFUSE,
+            _decide(session, keys, SubjectType.REQUEST, request_id, Action.REFUSE,
                     SYSTEM_USER, at, reason=failed)
 
 
@@ -301,29 +297,31 @@ def _generated_runs(session):
     return rows
 
 
-def _seed_bindings(session, now):
+def _seed_bindings(session, keys, now):
     for dataset_id, source, location, by in mock.BINDINGS:
         at = now - mock.days(2)
         repo.bind_dataset(session, dataset_id=dataset_id,
                           source=BindingSource(source), type="localpath",
                           location=location, bound_by=by, now=at)
         if source == "page":
-            _decide(session, SubjectType.DATASET_BINDING, dataset_id, Action.BIND,
+            _decide(session, keys, SubjectType.DATASET_BINDING, dataset_id, Action.BIND,
                     by, at)
 
 
-def _seed_node(session, now):
+def _seed_node(session, keys, now):
     nodes = [{"node": node} for node in mock.FEDERATION_NODES]
+    raw = _bytes({"version": mock.FEDERATION_VERSION, "nodes": nodes})
     repo.store_federation_list(
-        session, version=mock.FEDERATION_VERSION,
-        raw=_bytes({"version": mock.FEDERATION_VERSION, "nodes": nodes}),
-        signature=UNSIGNED, nodes=nodes, now=now - mock.days(1))
+        session, version=mock.FEDERATION_VERSION, raw=raw,
+        signature=decisions.signature_of(raw, keys), nodes=nodes,
+        now=now - mock.days(1))
     repo.record_poll(session, ok=True, now=now)
 
 
-def seed(bind=None, now=None):
+def seed(bind=None, now=None, keys=None):
     """Fill the database. Refuses one that is behind or already holds data."""
     bind = bind or db.engine()
+    keys = keys or generate()
     if not migrate.is_current(bind):
         raise StoreError("the schema is not current; run: python -m store migrate")
     now = now or repo.utcnow()
@@ -331,12 +329,12 @@ def seed(bind=None, now=None):
         if session.exec(select(func.count()).select_from(Study)).one():
             raise StoreError("this database already holds data; the seed only "
                              "fills an empty one")
-        versions = _seed_studies(session, now)
-        workflows = _seed_workflows(session, versions, now)
-        _seed_requests(session, versions, workflows, now)
+        versions = _seed_studies(session, keys, now)
+        workflows = _seed_workflows(session, keys, versions, now)
+        _seed_requests(session, keys, versions, workflows, now)
         _seed_runs(session, now)
-        _seed_bindings(session, now)
-        _seed_node(session, now)
+        _seed_bindings(session, keys, now)
+        _seed_node(session, keys, now)
 
 
 def main(argv=None):
