@@ -263,7 +263,7 @@ Rules:
 1. **Only one approved version of a study at a time.** Approving v3 moves the approved v2 to `superseded` in the **same transaction**, and writes two decisions: `approve v3` and `withdraw v2` (reason `superseded`), both signed and both posted. Both name the user who approved v3. A database constraint enforces the rule. Runs, logs and decisions of v2 stay readable in the study's history. A version moved this way is shown as "Superseded".
 2. While v3 is `pending`, v2 stays `approved` and keeps serving requests. If v3 is refused, v2 is untouched.
 3. A study version can be approved only if **every** member has `identity_verified = true` (section 7.3). Otherwise the Approve button is disabled and the page says which member failed and why (mock: "Rare variants pilot v1").
-4. Before approving a study version the data manager ticks "The data access committee has granted access for this study". Store it in the decision (`dac_confirmed: true`). The tick stays even with the visa check: visas arrive only inside each request, so at approval there is nothing to check.
+4. Before approving a study version the data manager ticks "The data access committee has granted access for this study". Store it in the decision (`dac_confirmed: true`). The tick stays even with the visa check: visas are checked on each request (check 9, 6.3), not at approval.
 5. Workflow versions are approved **per study version**. Different parameter values give a different hash and so a different workflow version (mock: two variants of `gwas-qc 1.3.2`). Several versions of the same workflow can be approved at once in one study version.
 6. Withdrawing a workflow version is a signed decision of its own and does not need a new study version.
 7. When v3 of a study is approved, the workflow approvals of v2 do not carry over: each must be approved again, and the workflows of the superseded version move to `superseded` too.
@@ -285,7 +285,7 @@ A request is checked in this exact order. The first failure stops the checks, re
 | 6 | Not seen before, by `request_id`, which the member signs. The same signed request delivered again **joins** the run if it was accepted, and gets the **same refusal** if it was refused, even when the reason has since gone. Its row keeps the first verdict and counts the repeat. A new `request_id` is a new request, even with the same payload | `replay` when the same `request_id` arrives on a different signed request |
 | 7 | Payload decrypts with this node's encryption key, and its digest equals `payload_digest` | `cannot_decrypt` |
 | 8 | Workflow digest recomputed from the decrypted tools and parameter values equals `workflow_digest` | `hash_mismatch` |
-| 9 | The member's visas allow the named datasets (reuse `passports.py` visa checking): for each dataset, a visa of the required type whose value is exactly the binding's `visa_value` (6.6). A binding with no `visa_value` matches no visa | `visa_missing` |
+| 9 | The member's visas allow the named datasets (reuse `passports.py` visa checking): for each dataset, a visa of the required type whose value is exactly the binding's `visa_value` (6.6). A binding with no `visa_value` matches no visa. Where the node gets the member's visas is open (section 13, item 11): inside the job, or fetched by the node with LS Login offline access. This check is the same either way | `visa_missing` |
 | 10 | Every named dataset has a binding on this node | `dataset_not_bound` |
 
 Write this as a pure function `verify(request, store, keys, now) -> Verdict` with one test per row, plus tests for repeats. Every verdict writes an audit event. A refusal is also a signed decision posted to the coordinator, so the requester sees why.
@@ -296,7 +296,7 @@ Repeats, in detail:
 - Only the same signed `job_request` is a repeat. The rows are not changed by anything else delivered under the id: a `replay` is refused with a signed decision, since the member signed it, and a delivery that fails checks 1 to 5 is only audited.
 - A repeat writes the audit event of check 6 and no new decision.
 
-**Blocked on the agent API**: `ieeta-pt/biochef-coordinator#6` fixes the shape of a request, a study version and the encrypted payload, but not the agent side. Until the agent API is in `biochef-coordinator`, build and test against fixtures in `tests/fixtures/federation/` that follow those models. The payload holds the member's visas and a WES request.
+**Blocked on the agent API**: `ieeta-pt/biochef-coordinator#6` fixes the shape of a request, a study version and the encrypted payload, but not the agent side. Until the agent API is in `biochef-coordinator`, build and test against fixtures in `tests/fixtures/federation/` that follow those models. The payload holds a WES request. Whether it also holds the member's visas is open (section 13, item 11).
 
 ### 6.4 Run states
 
@@ -593,6 +593,7 @@ Still open. Ask `jorgeMFS` before building anything that depends on these.
 8. Formats the coordinator's agent API has to settle, assumed until then and listed in `node/verify.py` and `node/federation.py`: what a member's signature covers, what `payload_digest` covers, the payload's shape, and the signature and shape of the site list.
 9. Sending what waits in `outgoing_message` is part 8, and so is telling the requester which rules were not verified, if `ieeta-pt/biochef-coordinator#6` gets a field for it. `Partial` signs the statement but not its `decision`, so a withheld result is told apart by its empty `subject`.
 10. Member names from the `name` claim (7.3). The member token's scope is `openid profile`, so the token carries `name`. This depends on `ieeta-pt/biochef-coordinator#6` carrying `binding_token` as it does now, and on the test with the mock AAI.
+11. Source of visas: inside the job, or fetched by the node with LS Login offline access (pending the refresh token test). The check itself does not change.
 
 ## 14. Runners, and how the agent meets a TRE's task engine
 
