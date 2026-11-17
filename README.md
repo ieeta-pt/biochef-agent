@@ -200,7 +200,10 @@ request.
 
 which creates a virtualenv, installs `requirements.txt`, and starts the service
 on the FastAPI default port. `snakemake` is one of the pinned requirements, so
-nothing else needs installing.
+nothing else needs installing. It needs Python 3.11, 3.12, 3.13 or 3.14, the
+versions CI tests, and refuses to start on any other. On 3.14, `immutables`
+0.21 has no wheel, so pip builds it from source and needs a C compiler (gcc or
+clang).
 
 Configuration is by environment variable, and `example.env` lists them:
 
@@ -217,6 +220,9 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_RUN_ROOT` | the system temp directory | where a run's private directory is created |
 | `BIOCHEF_RUN_TIMEOUT` | `900` | seconds before a run's whole process group is killed |
 | `BIOCHEF_AUDIT_LOG` | *(unset)* | path to an append-only JSONL audit trail; unset writes none |
+| `BIOCHEF_DB_URL` | `sqlite:////var/lib/biochef/agent.db` | the node's database, see [The node's store](#the-nodes-store) |
+| `BIOCHEF_NODE_SIGNING_KEY` | | path of the node's Ed25519 private key, see [The node's keys](#the-nodes-keys) |
+| `BIOCHEF_NODE_ENCRYPTION_KEY` | | path of the node's X25519 private key |
 | `BIOCHEF_KEEP_WORKSPACE` | `false` | leave a run's directory behind, for debugging |
 | `BIOCHEF_MAX_UPLOAD_BYTES` | `536870912` | largest request body accepted, in bytes |
 | `BIOCHEF_MAX_RUNS` | `256` | maximum run records retained for polling |
@@ -237,6 +243,9 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_CONTAINER_IMAGE` | `docker://debian:stable-slim` | image each step runs in, under the `apptainer` runner |
 | `BIOCHEF_APPTAINER_CACHE` | `apptainer-cache` | where pulled container images are kept between runs |
 | `BIOCHEF_APPTAINER_ARGS` | `--contain --cleanenv` | extra flags for apptainer itself |
+| `BIOCHEF_TOOL_CATALOG` | `required` | `required` or `off`: whether every tool is resolved through the signed catalog |
+| `BIOCHEF_CATALOG_PUBLIC_JWK` | *(the web app's key)* | the catalog's EC P-256 public key, as JSON, for a registry with its own catalog key |
+| `BIOCHEF_CATALOG_PACKAGE` | `biochef-plugins-index` | the repository the catalog is published under |
 | `BIOCHEF_SIGNING_MODE` | `off` | `off`, `warn`, or `strict` — whether a bundle must be signed to run |
 | `BIOCHEF_SIGNING_POLICY` | *(unset)* | path to the Hub's `biochef.signing-policy.v1` document |
 | `BIOCHEF_COSIGN` | `cosign` | the cosign executable to verify with |
@@ -296,6 +305,21 @@ instead. The container is the boundary between an untrusted tool binary and the
 machine, so on any deployment holding data that matters, `apptainer` is the
 setting you want.
 
+`BIOCHEF_TOOL_CATALOG` defaults to `required`: a workflow names a package, and
+the Hub's signed catalog decides which manifest that is. The catalog is fetched
+from the registry, its ES256 signature checked against the same key the web app
+pins, and every reference resolved to the catalog's digest before anything is
+fetched. A bare package name, `latest` or the catalog's version all resolve to
+it. Any other tag, a digest the catalog does not list, or a package it does not
+contain is refused. The exception is `strict` signing: an exact digest of a
+package the catalog lists runs if its own signature, SBOM and provenance verify,
+so that a workflow pinned to an older version survives a republish. A version
+dropped from the catalog stays runnable that way while its signature is valid.
+A catalog older than one this service has already accepted is refused too, and
+the newest sequence is recorded next to the tool cache. A tag is a name anyone who
+can write to the registry can move; the catalog is not. `off` sends references
+to the registry as written, for a development registry that has no catalog.
+
 `BIOCHEF_SIGNING_MODE` defaults to `off`, which is what this service did before
 it could verify anything and is named so that it reads as a decision. The Hub
 signs and attests every bundle it publishes; `strict` makes a bundle that does
@@ -309,7 +333,8 @@ manifest whose digest could not be established are all refusals. A verification
 step that passes when it could not run is worse than none, because it is
 believed.
 
-In `strict`, the caller must provide an immutable digest, and the Agent also
+In `strict`, the reference must be an immutable digest. The catalog supplies
+it; with the catalog `off`, the caller must. The Agent also
 checks the CycloneDX and SLSA evidence against the files it executes.
 Cosign and SLSA Verifier must be installed in the Agent's environment; the Agent
 does not download them at runtime. `warn` reports failed checks and
@@ -471,6 +496,29 @@ and HTTP 503 capacity refusal as `/runs`.
    whole process group is killed if it overruns.
 5. Each declared output is read back and base64-encoded into the response.
 6. The run's directory is removed, whether it succeeded or not.
+
+## The node's store
+
+What a node has decided lives in a database, because an approval has to outlast the process that made it. `store/` holds the tables of [the agent UI specification](docs/agent-ui/SPEC.md), section 6.1, and all access goes through `store/repo.py`. The API does not use it yet.
+
+```sh
+export BIOCHEF_DB_URL=sqlite:////var/lib/biochef/agent.db
+python -m store migrate                  # create or upgrade the tables
+python -m store downgrade base           # remove them
+python -m store.seed --fixture mock      # invented data, for development only
+```
+
+SQLite only, in WAL mode, because two processes open the file. Any other `BIOCHEF_DB_URL` is refused at start: concurrent approvals rely on SQLite's write lock, and no other database has been tested. The seed refuses a database that already holds data, and signs its decisions with a key it generates and throws away.
+
+## The node's keys
+
+A node has two keys: Ed25519 signs its decisions and results, and X25519 decrypts the payloads of requests. Create them outside this repository:
+
+```sh
+python -m node.keys init --out /etc/biochef/keys
+```
+
+It prints both public fingerprints, for registering the node, and refuses to replace a key that exists. The files must stay readable by their owner only. Point `BIOCHEF_NODE_SIGNING_KEY` and `BIOCHEF_NODE_ENCRYPTION_KEY` at them; a key that is missing, exposed, inside the repository or of the wrong type is refused.
 
 ## Before deploying this
 
