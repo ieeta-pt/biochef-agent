@@ -19,6 +19,9 @@ apptainer-cache/
 Snakefile
 intermediate.json
 
+# Private keys never belong here.
+*.pem
+
 # Test and CI artifacts.
 .coverage
 results-*.xml
