@@ -8,19 +8,16 @@ Which parts are enforced changes with every merge; what the agent is *for* does
 not. Check the source and deployment configuration before treating a control
 as active. Gaps are named with the issue that tracks them.
 
-What `master` runs today is an HTTP service: a caller sends a workflow to
-`/convert`, `/runs` or the WES endpoints and reads the results back over the same
-API. `BIOCHEF_AUTH` decides who may call it: `none` by default, a shared
-`bearer` token, or a GA4GH `passport`. It has no coordinator client yet.
+The status of each control is in [Implementation status](#implementation-status)
+at the end; the rest of this document describes the design.
 
-In a TRE the agent is deployed the other way round. Nothing connects into a
-TRE: the agent runs inside it, opens every connection, and polls the
-coordinator over mTLS with a per-site certificate from the federation PKI,
-checking the coordinator's certificate against the federation CA. Researchers
-never talk to the agent. The same trust questions apply to both flows, but in
-the TRE the destination and the authorization decision move to the
-agent-to-coordinator boundary. What that deployment needs and `master` does not
-have yet is listed under [Planned](#planned).
+The agent runs inside a TRE, next to the data. Nothing connects into a TRE: the
+agent opens every connection, and polls the coordinator over mTLS with a
+per-site certificate from the federation PKI, checking the coordinator's
+certificate against the federation CA. Researchers never talk to the agent.
+The agent can also run as a standalone HTTP service that accepts workflows
+directly, with `BIOCHEF_AUTH` deciding who may call it. That is a development
+and transition mode, outside the TRE deployment this model covers.
 
 ## What the agent is for, and why that decides everything else
 
@@ -40,7 +37,7 @@ ordinary case here rather than an escalation.
 
 The required protections also form a security contract between the Agent and the site. Data owners and the site's governance process decide permitted use and release and the Agent applies those rules, supported by site-managed controls.
 
-The TRE defines which tools may run and who may access each dataset. The data access committee (DAC) decides data access. The node's data manager then approves each study, version by version, and each workflow in it, and the agent signs each decision with the node key. For each job, the Agent checks that a member of an approved study version signed it, that it runs an approved workflow, and that the member's visas allow the datasets it reads. It runs the job only if local rules permit it, and checks permission to release results to the study's result recipients.
+The TRE defines which tools may run and who may access each dataset. The data access committee (DAC) decides data access. The node's data manager then approves each study, version by version, and each workflow in it, and the Agent signs each decision with the node key. For each job, the Agent checks that a member of an approved study version signed it, that it runs an approved workflow, and that the member's visas allow the datasets it reads. It runs the job only if local rules permit it, and releases results only through the output rules and the TRE's release procedure, to the study's result recipients.
 
 The TRE must provide trusted policy and configuration, approved data-access permissions, and an execution environment that isolates jobs and enforces CPU, memory, disk and process limits. It also defines retention rules, protects audit records and provides the local output-release procedure. Execution limits must hold at the host, storage or scheduler, not only in the workflow description.
 
@@ -50,38 +47,39 @@ The Agent must use those controls when admitting and running a job. A workflow o
 
 **The member** is a researcher listed in a study, with a signing key and a
 result key tied to their LS Login identity. A job is a member's signed
-submission. The Agent must check that the signing key is the member's and that
-the member may use the requested data. It is important to consider that an
-authenticated member can still submit a hostile job.
+submission, encrypted for each node it runs on. The Agent checks that the
+signing key is the member's and that the member may use the requested data. It
+is important to consider that an authenticated member can still submit a
+hostile job.
 
 **The data manager** is the person at a node who approves studies and
 workflows, in the agent's page inside the TRE, with the TRE's own login. The
 DAC decides data access, and the data manager approves once it has. Each
-decision is signed with the node key. Audit records must identify who decided.
+decision is signed with the node key, and audit records identify who decided.
 
-**The caller or coordinator** supplies a workflow and its inputs. Untrusted as a
-source of tasks even after its identity is established. The coordinator stores
-and delivers studies, jobs and results, and never reads a job or a result. It
-may relay only jobs a member signed, and the Agent must verify the signature
-and the approved study version rather than accept the coordinator's word.
-Approval for one job does not permit additional or changed jobs. On `master`
-today the caller is whoever reaches the HTTP API.
+**The coordinator** stores and delivers studies, jobs and results, and never
+reads a job or a result. It is untrusted as a source of tasks even after its
+identity is established. It may relay only jobs a member signed, and the Agent
+verifies the signature and the approved study version rather than accept the
+coordinator's word. Approval for one job does not permit additional or changed
+jobs. The Agent and the coordinator authenticate each other with mTLS, and
+authenticating the coordinator does not establish a member's identity or
+permissions. Audit records identify the member who submitted each job and the
+data manager who approved it.
 
-In a TRE, the Agent and the coordinator authenticate each other with mTLS, and
-the Agent authorizes each task against local data and execution policy.
-Authenticating the coordinator does not establish a member's identity or
-permissions. Audit records must identify the member who submitted each job and
-the data manager who approved it.
+**The TRE's own workflow engines** may send the node a task through the TES
+API, a listener of its own inside the TRE that needs a bearer token, and TLS
+when it is not on loopback. Its tasks run through the same runner, with the
+same guarantees, and it reads no study, request or dataset binding. In this
+document, a caller is whoever hands the Agent a task: the coordinator, or one
+of these engines.
 
 **The identity provider** is LS Login, always: every researcher logs in with
 it. BioChef's Keycloak sits in front of it, brokers it as its only identity
 provider and issues the tokens the coordinator trusts; it is never an identity
 provider itself. Nodes never use the Keycloak token as authorization. They rely
 on the members' LS Login ID tokens, the visas and mTLS. Identity checks do not
-by themselves prove job approval or data access. On `master`,
-`BIOCHEF_AUTH=passport` checks a GA4GH Passport and verifies each of its visas
-against issuers the deployment names (**#79**); a required visa is a condition
-of being let in, not an authorization model.
+by themselves prove job approval or data access.
 
 **The workflow description** is task-supplied data. Its node ids, parameter
 values, and edge handles may reach a generated Snakefile or a filename, so they
@@ -90,28 +88,24 @@ must be validated rather than trusted as a description.
 **The tool bundle** comes from the registry, and the task selects which one:
 the `repo` for each node is a field in the request. The Agent resolves every
 tool through the hub's signed catalogue, which decides which manifest a package
-is; the catalogue is required by default since **#100**
-(`BIOCHEF_TOOL_CATALOG=required`). It checks pulled bytes against manifest
-digests (**#9**) and offers signature and evidence verification in `strict`
-mode (**#14**). Signature checks are still off by default
-(`BIOCHEF_SIGNING_MODE=off`); a TRE deployment must enable them with an
-appropriate local policy. Verification does not prove that a correctly signed
-tool is safe. Bundle-supplied strings remain untrusted input (**#42**).
+is, checks pulled bytes against manifest digests, and verifies the signature
+and evidence against the site's local policy. Verification does not prove that
+a correctly signed tool is safe. Bundle-supplied strings remain untrusted input
+(**#42**).
 
 The TRE decides which tools may run under its local policy. Before execution, the Agent must check that policy permits the selected tool artifact for the job.
 
 **The tool binary, once running, is untrusted.** This is the one most easily got
-wrong. It is arbitrary compiled code, fetched from a registry. With the default
-subprocess runner it executes with the Agent's privileges against whatever the
-deployment can see. The optional container runner changes that access but does
-not itself establish complete confinement. A tool can read, write, and spawn
-processes wherever its runtime permits. "The attacker is already executing
-code on the host" is not a precondition to be argued away here; it is Tuesday.
+wrong. It is arbitrary compiled code, fetched from a registry. A tool can read,
+write, and spawn processes wherever its runtime permits. "The attacker is
+already executing code on the host" is not a precondition to be argued away
+here; it is Tuesday.
 
-In a TRE, each workflow step must run in a container of its own, with no
-network, only its own workspace and a clean environment, and the Agent must
-refuse a runner that cannot enforce that, unless the TRE turns the rule off on
-purpose. `master` does not enforce that rule yet; see [Planned](#planned).
+Each workflow step runs in a container of its own, with no network, only its
+own workspace and a clean environment. The Agent refuses to start with a runner
+that cannot enforce network isolation, unless the TRE turns that rule off on
+purpose, and checks at start that a step cannot reach the network. A container
+limits what the tool can reach; it does not make the tool trusted.
 
 Tools must receive only the data and resources approved for their run. They must not inherit the Agent's credentials or access its configuration and policy.
 
@@ -126,12 +120,10 @@ In a TRE, only its administrators may configure the Agent and its policy. The Ag
 
 ## Keys and envelopes
 
-In a TRE, trust in a job rests on keys, not on the connection it arrived over.
+Trust in a job rests on keys, not on the connection it arrived over.
 
-- The node has two keys that never leave it: an Ed25519 approval key that signs
-  its decisions and results, and an X25519 encryption key that jobs are
-  encrypted for. `master` has both, and writes every decision it signs to the
-  audit trail (**#109**).
+- The node has two keys that never leave it: an approval key that signs its
+  decisions and results, and an encryption key that jobs are encrypted for.
 - A member's signing and result keys are tied to them by an LS Login ID token
   whose nonce is the hash of the keys. The node checks that token before the
   data manager approves a study version.
@@ -143,23 +135,30 @@ In a TRE, trust in a job rests on keys, not on the connection it arrived over.
   fetched by the node with LS Login offline access (pending the refresh token
   test). The check itself does not change.
 
-Apart from the node keys and signed decisions, these checks are
-[planned](#planned).
+## Outputs
+
+Outputs leave a node only one way. Each output is checked against the study's
+output rules by the Policy Engine; files the rules hold back never leave. The
+rest go to the TRE's airlock, or wait for the data manager to release or
+withhold them in the agent's page. Only released outputs are encrypted for the
+result recipients, signed with the node key and sent to the coordinator. Rules
+that need a file's contents and cannot be checked are marked "not verified",
+and that marking travels with the release decision.
 
 ## Boundaries
 
 | boundary | what crosses it | what has to hold |
 |---|---|---|
-| coordinator → agent, polled by the agent over mTLS | study versions with the members' keys and ID tokens, and jobs signed by a member and encrypted for this node; on `master` today, workflow JSON and uploaded files or data references sent to the HTTP API | authenticate both ends; verify the member's signature, the approved study version and workflow, and the visas, then authorize the task locally; validate names, inputs and shell-bound values |
+| coordinator → agent, polled by the agent over mTLS | study versions with the members' keys and ID tokens, and jobs signed by a member and encrypted for this node | authenticate both ends; verify the member's signature, the approved study version and workflow, and the visas, then authorize the task locally; validate names, inputs and shell-bound values |
+| TRE engine → TES API | one command in one image, with files in and out | require a token, and TLS off loopback; run it through the same runner and its guarantees; validate names, inputs and shell-bound values |
 | identity evidence → agent | members' LS Login ID tokens and GA4GH visas | check each token's issuer keys, audience, subject, nonce and expiry; check each visa's issuer, value, age and that it belongs to the member; apply local access rules |
 | registry → agent | the signed catalogue, bundle metadata, tool binaries | verify the catalogue, immutable artifact identity and required evidence, and check local tool approval before execution; still treat content as untrusted |
 | agent → tool | a working directory, argv, local data access | confine filesystem, process privileges, and network access to the approved run |
 | tool → agent | files in that directory | read as data, never followed out of the run |
-| agent → caller/coordinator | on `master`, the response body; in a TRE, results signed by the node and encrypted for the result recipients | apply local output policy before any data leaves; authorize the destination and record the transfer |
+| agent → coordinator | results signed by the node and encrypted for the result recipients | apply the output rules and the TRE's release before any data leaves; authorize the destination and record the transfer |
 
-That last row is the one worth dwelling on. On `master`, the response body is
-a data-exit path. In a TRE, the result sent to the coordinator is the
-corresponding path. Anything that lets a tool cause
+That last row is the one worth dwelling on: the result sent to the coordinator
+is the data-exit path. Anything that lets a tool cause
 the Agent to read a file it did not produce — a symbolic link, a hard link, an
 output slot pre-filled by an upload — can turn an authorized result channel into
 exfiltration. Findings of that shape are not "the caller deceiving itself";
@@ -206,36 +205,6 @@ These are gaps or limits of assurance, not excluded threats. A protected TRE dep
   not this one: the Agent does not rely on anything the browser verified, and
   checks each bundle itself against its own configured policy.
 
-## Planned
-
-Designed in #106 (`docs/agent-ui/SPEC.md`) and in draft PRs. None of it is on
-`master`, so none of it is a current protection.
-
-- **Polling the coordinator over mTLS**, so the agent needs no inbound port,
-  and posting its signed decisions there (#106, sections 1.1 and 7.5).
-- **The data manager's page**, inside the TRE with the TRE's own login, where
-  studies, workflows, requests, runs, datasets and releases are decided (#106,
-  sections 1 and 8).
-- **Request checks**, in order: the member's signature, this node, the approved
-  study version and workflow, expiry, replay, decryption, the workflow digest,
-  the visas against each dataset's `visa_value`, and the dataset bindings
-  (#106, section 6.3).
-- **The member identity check**: the LS Login ID token that ties a member's
-  keys to them, checked before a study version is approved (#106, section 7.3).
-- **Output rules and release**: each output checked against the study's output
-  rules by the Policy Engine, then handed to the TRE's airlock or released by
-  the data manager. Until the Policy Engine is connected, rules that need a
-  file's contents are marked "not verified" (#106, section 6.5).
-- **Per-runner guarantees**: each runner states whether a step can reach the
-  network, see more than its workspace, or inherit the agent's environment, and
-  the agent refuses to start with a runner whose network isolation is not
-  enforced unless that rule is turned off explicitly. Covers apptainer without
-  network, podman, singularity and a TES runner (#120 to #124; #106, section
-  14.1).
-- **A TES API** that lets the TRE's own workflow engines send the node a task,
-  on a listener of its own (#125; #106, section 14.4). It adds an inbound path
-  inside the TRE, which this document will need to cover when it lands.
-
 ## Applying it
 
 When judging whether something is a defect, ask:
@@ -246,3 +215,35 @@ When judging whether something is a defect, ask:
    with the Agent's execution being redirected?
 
 A "yes" to 2 counts. That is the correction this document exists to record.
+
+## Implementation status
+
+What the code does today, so that nobody counts on a control that does not
+exist yet.
+
+| Control | State | Where |
+|---|---|---|
+| Agent polls the coordinator over mTLS, with no inbound port | Not started | #106, work plan part 8; waits for the agent API in biochef-coordinator |
+| Until polling lands, the agent listens on an inbound HTTP port and `BIOCHEF_AUTH` defaults to `none` | On master | `main.py`, `auth.py` |
+| Signed catalogue, required by default | On master | #100 |
+| Pulled bytes checked against manifest digests | On master | #9 |
+| Tool signature and evidence verification | On master, off by default (`BIOCHEF_SIGNING_MODE=off`) | #14 |
+| GA4GH visas, each verified against its own issuer | On master | #79 |
+| Node keys, and signed decisions written to the audit trail | On master | #109 |
+| Data manager's page, behind the TRE's login | In PR | #110 |
+| Study and workflow approval, signed with the node key | In PR | #112 |
+| Member ID token check, nonce bound to the keys | In PR | #114 |
+| Dataset bindings with their visa value | In PR | #115 |
+| Request checks: member signature, node, approved study and workflow, expiry, replay, decryption, digest, visas per dataset | In PR | #116 |
+| Output rules (the agent's own check), held outputs, airlock or manual release, results signed and encrypted for the recipients | In PR | #117 |
+| Audit check on the node page | In PR | #118 |
+| Signed node list from the federation | In PR | #119 |
+| Each step in a container of its own with no network | In PR | #120 (apptainer), #121 (podman), #123 (singularity); on master the default runner is `subprocess` and apptainer is optional (#15) |
+| Refusing a runner without network isolation, and the check at start | In PR | #122 |
+| TES runner and TES API | In PR | #124, #125 |
+| Policy Engine | Not started | protocol and fake in #112 and #117 |
+| Connection to a TRE's airlock | Not started | protocol and fake in #117; the interface is TRE specific |
+| Posting decisions and results to the coordinator | Not started | #106, work plan part 8 |
+| Authorization between callers | Not started | #90 |
+| Bounds on disk use, workflow size and output size | Not started | #91 |
+| Bundle-supplied strings quoted before the shell | Not started | #42 |
