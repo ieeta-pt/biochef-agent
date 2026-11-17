@@ -173,10 +173,8 @@ These are gaps or limits of assurance, not excluded threats. A protected TRE dep
 
 - **A malicious tool escaping its working directory.** Snakemake's `--directory`
   sets an origin, not a jail: a rule whose output is `../escaped` can write
-  outside it. A container runner now exists (**#15**), but the default runner is
-  still a subprocess and this document does not establish that a deployment
-  confines all filesystem, process, and network access. A run directory alone
-  cannot do that.
+  outside it. A run directory alone cannot confine filesystem, process, and
+  network access; that has to come from the runner and the deployment.
 - **A malicious but correctly signed tool.** Digest and signature checks can
   bind the bytes to an identity and policy; they cannot establish benign
   behavior or rule out a compromised publisher.
@@ -187,9 +185,8 @@ These are gaps or limits of assurance, not excluded threats. A protected TRE dep
   slot counts runs, not what one run consumes.
 - **No authorization between callers.** Authentication names a caller; nothing
   then decides what that caller may read. Any authenticated caller can read any
-  run's outputs, logs and manifest by run id (**#90**). Passports (**#79**) make
-  callers distinguishable, so on a shared Agent this is access across projects
-  today.
+  run's outputs, logs and manifest by run id (**#90**). Once callers are
+  distinguishable, that is access across projects on a shared Agent.
 
 ## Trusted assumptions and exclusions
 
@@ -223,8 +220,8 @@ exist yet.
 
 | Control | State | Where |
 |---|---|---|
+| Until polling lands, the agent listens on an inbound HTTP port and `BIOCHEF_AUTH` defaults to `none`. Meanwhile a site must set `BIOCHEF_AUTH` to `bearer` or `passport` and restrict who can reach the port | Gap (on master) | `main.py`, `auth.py` |
 | Agent polls the coordinator over mTLS, with no inbound port | Not started | #106, work plan part 8; waits for the agent API in biochef-coordinator |
-| Until polling lands, the agent listens on an inbound HTTP port and `BIOCHEF_AUTH` defaults to `none` | On master | `main.py`, `auth.py` |
 | Signed catalogue, required by default | On master | #100 |
 | Pulled bytes checked against manifest digests | On master | #9 |
 | Tool signature and evidence verification | On master, off by default (`BIOCHEF_SIGNING_MODE=off`) | #14 |
@@ -247,3 +244,5 @@ exist yet.
 | Authorization between callers | Not started | #90 |
 | Bounds on disk use, workflow size and output size | Not started | #91 |
 | Bundle-supplied strings quoted before the shell | Not started | #42 |
+
+Updated each time a control lands on master.
