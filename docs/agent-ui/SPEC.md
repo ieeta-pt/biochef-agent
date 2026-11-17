@@ -593,7 +593,7 @@ Still open. Ask `jorgeMFS` before building anything that depends on these.
 8. Formats the coordinator's agent API has to settle, assumed until then and listed in `node/verify.py` and `node/federation.py`: what a member's signature covers, what `payload_digest` covers, the payload's shape, and the signature and shape of the site list.
 9. Sending what waits in `outgoing_message` is part 8, and so is telling the requester which rules were not verified, if `ieeta-pt/biochef-coordinator#6` gets a field for it. `Partial` signs the statement but not its `decision`, so a withheld result is told apart by its empty `subject`.
 10. Member names from the `name` claim (7.3). The member token's scope is `openid profile`, so the token carries `name`. This depends on `ieeta-pt/biochef-coordinator#6` carrying `binding_token` as it does now, and on the test with the mock AAI.
-11. Source of visas: inside the job, or fetched by the node with LS Login offline access (pending the refresh token test). The check itself does not change.
+11. Source of visas: inside the job, or fetched by the node with LS Login offline access (pending the refresh token test). The check itself does not change. For the option where visas travel inside the job, how the editor obtains the member's Passport is also open.
 
 ## 14. Runners, and how the agent meets a TRE's task engine
 
