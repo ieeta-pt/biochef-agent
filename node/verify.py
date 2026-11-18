@@ -47,6 +47,8 @@ class Outcome(str, Enum):
     ACCEPTED = Verdict.ACCEPTED.value
     REFUSED = Verdict.REFUSED.value
     JOINED = "joined"
+    HELD = "held"
+    """Received and left unchecked: the site list has expired (7.4)."""
 
 
 @dataclass(frozen=True)
