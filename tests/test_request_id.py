@@ -411,10 +411,8 @@ def test_an_unhandled_exception_comes_back_without_one():
     a catch-all handler would not help -- starlette gives Exception to that
     same outermost layer.
 
-    Found to matter more than expected while auditing: /convert answers 500 to
-    a workflow that is merely malformed (#86), so the uncorrelatable response
-    is reachable by ordinary client error rather than only by a crash. The fix
-    belongs in #86 -- stop answering 500 to bad input -- not here.
+    Since #86 a malformed workflow is a 400 and carries an id, so only a
+    genuine crash reaches this.
 
     If this ever starts failing, the limitation has been lifted and the
     docstring in requestid.py should stop claiming it.
