@@ -192,7 +192,10 @@ def load():
                                "BIOCHEF_NODE_NAME", "it names this node"),
         "policy_engine_url": _policy_engine(
             _setting(os.getenv("BIOCHEF_POLICY_ENGINE_URL"))),
-        "required_visa": _setting(os.getenv("BIOCHEF_PASSPORT_REQUIRE_VISA")),
+        "required_visa": _required(
+            _setting(os.getenv("BIOCHEF_PASSPORT_REQUIRE_VISA")),
+            "BIOCHEF_PASSPORT_REQUIRE_VISA",
+            "every request is checked for a visa of that type"),
         "egress_mode": _egress_mode(),
         **_node_facts(),
         **_bindings(),

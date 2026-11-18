@@ -520,7 +520,7 @@ def test_a_decision_is_posted_once(engine):
 
 
 def test_every_refusal_code_can_be_recorded(engine):
-    assert len(RefusalCode) == 10
+    assert len(RefusalCode) == 11
     with db.writing(engine) as session:
         for index, code in enumerate(RefusalCode):
             add_request(session, f"req_{index}")
