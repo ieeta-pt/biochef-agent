@@ -20,6 +20,7 @@ import base64
 import logging
 
 import audit
+import profiles
 from workspace import UnsafeName, check_name, make_workspace
 from auth import AuthenticationMiddleware, NoAuth, get_auth
 from runs import (IllegalTransition, RunCapacityError, RunState, RunStore,
@@ -32,6 +33,12 @@ from bodylimit import BodySizeLimitMiddleware, MAX_UPLOAD_BYTES
 from evidence_verification import EvidenceVerificationError
 from runner import SubprocessRunner, get_runner
 from signing import SignatureError
+
+# The service is starting, so say what it is configured to permit. convert
+# applied the profile at import, because every setting here is read at import;
+# this is the first point at which saying so is not a side effect of somebody
+# importing a module.
+print(profiles.describe(PROFILE))
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
