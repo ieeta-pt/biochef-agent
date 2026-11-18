@@ -138,9 +138,11 @@ STUDY_REQUEST_COUNTS = {CARDIO: 14, SEPSIS: 6}
 """The counts on mock 02. Older requests are generated up to these."""
 
 BINDINGS = (
-    (CARDIO_DATASET, "config", "cardio/2019_2024/", "config file"),
-    (SEPSIS_DATASET, "config", "sepsis/icu_v4/", "config file"),
-    (MICROBIOME_DATASET, "page", "micro/16s_2023/", "j.silva"),
+    (CARDIO_DATASET, "config", "cardio/2019_2024/", "config file",
+     f"https://dac.example.org/datasets/{CARDIO_DATASET}"),
+    (SEPSIS_DATASET, "config", "sepsis/icu_v4/", "config file",
+     f"https://dac.example.org/datasets/{SEPSIS_DATASET}"),
+    (MICROBIOME_DATASET, "page", "micro/16s_2023/", "j.silva", None),
 )
 
 OUTPUT_FILES = (

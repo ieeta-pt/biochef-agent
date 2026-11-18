@@ -9,6 +9,7 @@ from fastapi import Request
 from fastapi.responses import Response
 
 import audit
+from node.datasets import BindingError
 from node.decisions import DecisionError
 from store import db
 from store.errors import (AlreadyPosted, IdentityNotVerified, IllegalTransition,
@@ -51,7 +52,7 @@ def act(request, work, *, then=None):
             raise
         return fragment(request, "partials/alert.html", status_code=409,
                         message=_explain(failure))
-    except DecisionError as failure:
+    except (DecisionError, BindingError) as failure:
         return fragment(request, "partials/alert.html", status_code=409,
                         message=_explain(failure))
     header = {"HX-Redirect": then} if then else {"HX-Refresh": "true"}

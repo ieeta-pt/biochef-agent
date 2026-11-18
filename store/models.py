@@ -237,6 +237,9 @@ class DatasetBinding(SQLModel, table=True):
     source: str
     type: str
     location: str
+    # The value the data access committee puts in a visa for this dataset, usually
+    # a URL. A dataset id is this node's name for the data, and visas do not use it.
+    visa_value: Optional[str] = None
     bound_by: str
     bound_at: datetime = _moment(nullable=False)
 
