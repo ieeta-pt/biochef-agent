@@ -231,12 +231,14 @@ itself, not derived from run states, because `/convert` holds a slot for a whole
 synchronous conversion without ever creating a run record — an agent with every
 slot busy converting would otherwise report itself entirely free.
 
-`runs.in_flight` is the asynchronous subset of that: the states that occupy a
-slot, `INITIALIZING`, `RUNNING` and `CANCELING`. The gap between it and
-`slots.busy` is exactly the `/convert` calls in progress. A `QUEUED` run is
-admitted and waiting rather than executing, so it is reported separately and is
-not counted as busy. `by_state` is walked from the run store rather than kept as
-a tally, so it cannot drift from what the store holds.
+`runs.in_flight` is the asynchronous subset of that: the runs whose worker holds
+a slot right now, as the worker records it, so the gap between it and
+`slots.busy` is exactly the `/convert` calls in progress. It is not read from
+the states. A run cancelled while `QUEUED` is `CANCELING` until its turn comes,
+and holds no slot meanwhile. A `QUEUED` run is admitted and waiting rather than
+executing, so it is reported separately and is not counted as busy. `by_state`
+is walked from the run store rather than kept as a tally, so it cannot drift
+from what the store holds.
 
 **`runs.accepting` is a separate question from free slots, and free slots do not
 answer it.** `BIOCHEF_MAX_RUNS` bounds how many run records are retained, and a

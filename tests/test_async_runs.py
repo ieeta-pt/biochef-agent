@@ -789,3 +789,56 @@ def test_capacity_shows_a_real_run_holding_a_real_slot(service, monkeypatch):
         assert client.get("/capacity").json()["slots"]["busy"] == 0, (
             "the slot was not given back once the run finished"
         )
+
+
+def test_a_run_cancelled_in_the_queue_is_not_counted_in_flight(service,
+                                                               monkeypatch):
+    """One slot, run A executing, run B cancelled while it waited.
+
+    B is CANCELING until its turn comes, and holds no slot meanwhile. Counting
+    CANCELING as in flight reported 2 here against a slots.busy of 1.
+    """
+    import threading
+
+    from fastapi.testclient import TestClient
+
+    inside = threading.Event()
+    release = threading.Event()
+    original = main.run_snakemake
+
+    def blocking_run(ws, timeout_s=None, **kwargs):
+        inside.set()
+        release.wait(timeout=10)
+        return original(ws, timeout_s=timeout_s, **kwargs)
+
+    monkeypatch.setattr(main, "run_snakemake", blocking_run)
+    monkeypatch.setattr(main, "MAX_CONCURRENT_RUNS", 1)
+    main._slots_by_loop.clear()
+    main._occupied_by_loop.clear()
+
+    try:
+        with TestClient(main.app) as client:
+            first = _submit(client).json()["run_id"]
+            assert inside.wait(timeout=10), "the run never reached the runner"
+            second = _submit(client).json()["run_id"]
+            assert client.get(f"/runs/{second}").json()["state"] == "QUEUED"
+            cancel = client.post(f"/runs/{second}/cancel").json()
+            assert cancel["state"] == "CANCELING"
+
+            held = client.get("/capacity").json()
+            assert held["slots"]["busy"] == 1
+            assert held["runs"]["by_state"].get("CANCELING") == 1
+            assert held["runs"]["in_flight"] == 1, (
+                "a run cancelled while it waited was counted as holding a slot"
+            )
+
+            release.set()
+            assert _poll(client, first)["state"] == "COMPLETE"
+            assert _poll(client, second)["state"] == "CANCELED"
+            after = client.get("/capacity").json()
+            assert after["runs"]["in_flight"] == 0
+            assert after["slots"]["busy"] == 0
+    finally:
+        release.set()
+        main._slots_by_loop.clear()
+        main._occupied_by_loop.clear()

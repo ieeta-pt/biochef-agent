@@ -298,28 +298,48 @@ def test_queued_runs_are_not_counted_as_busy():
     as busy would have a hub route away from an agent that is in fact free."""
     store = RunStore()
     waiting, running = store.create(), store.create()
+    store.hold_slot(running.run_id, True)
     store.advance(running.run_id, RunState.INITIALIZING)
     store.advance(running.run_id, RunState.RUNNING)
 
-    counts = store.state_counts()
-    busy = sum(counts.get(s.value, 0) for s in main.BUSY_STATES)
-    assert counts[RunState.QUEUED.value] == 1
-    assert busy == 1, "a queued run was counted against the slots"
+    assert store.state_counts()[RunState.QUEUED.value] == 1
+    assert store.in_flight() == 1, "a queued run was counted against the slots"
 
 
-def test_canceling_still_holds_its_slot():
+def test_a_run_cancelled_while_queued_holds_no_slot():
+    """CANCELING is not a slot. Cancelled from the queue, a run settles only
+    when its turn comes, and until then it holds nothing."""
+    store = RunStore()
+    running, cancelled = store.create(), store.create()
+    store.hold_slot(running.run_id, True)
+    store.advance(running.run_id, RunState.INITIALIZING)
+    store.advance(running.run_id, RunState.RUNNING)
+    store.advance(cancelled.run_id, RunState.CANCELING)
+
+    assert store.state_counts()[RunState.CANCELING.value] == 1
+    assert store.in_flight() == 1
+
+
+def test_a_run_cancelled_while_running_keeps_its_slot():
     """The worker has not let go of it yet."""
-    assert RunState.CANCELING in main.BUSY_STATES
+    store = RunStore()
+    run = store.create()
+    store.hold_slot(run.run_id, True)
+    store.advance(run.run_id, RunState.INITIALIZING)
+    store.advance(run.run_id, RunState.RUNNING)
+    store.advance(run.run_id, RunState.CANCELING)
+    assert store.in_flight() == 1
 
 
 def test_a_finished_run_frees_its_slot():
     store = RunStore()
     run = store.create()
+    store.hold_slot(run.run_id, True)
     store.advance(run.run_id, RunState.INITIALIZING)
     store.advance(run.run_id, RunState.RUNNING)
+    store.hold_slot(run.run_id, False)
     store.advance(run.run_id, RunState.COMPLETE)
-    busy = sum(store.state_counts().get(s.value, 0) for s in main.BUSY_STATES)
-    assert busy == 0
+    assert store.in_flight() == 0
 
 
 def test_the_counts_are_walked_and_not_tallied():
@@ -595,10 +615,8 @@ def test_an_agent_can_be_entirely_free_and_still_refuse_everything():
     the next submission is refused with 503.
     """
     store = _at_the_cap()
-    counts = store.state_counts()
-    busy = sum(counts.get(s.value, 0) for s in main.BUSY_STATES)
 
-    assert busy == 0, "nothing is executing"
+    assert store.in_flight() == 0, "nothing is executing"
     assert store.accepting() is False, "and yet no further work can be admitted"
 
 

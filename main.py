@@ -615,17 +615,25 @@ async def _execute(run_id: str, biochef_workflow: str, inputs):
         # slot frees. Acquiring before anything else means a queued run has not
         # yet made a workspace or pulled a tool.
         async with _slots():
-            # Asked for while queued, and never started. Nothing was executed,
-            # so there is nothing to kill -- only a state to settle.
-            if RUNS.get(run_id).state is RunState.CANCELING:
-                _advance(run_id, RunState.CANCELED)
-                return
-            results = await run_in_threadpool(
-                perform_run, biochef_workflow, inputs, progress, started,
-                finished, logs,
-                cancel_requested=lambda: _was_cancelled(run_id),
-                on_progress=step_progress, on_outputs=outputs, retain=retain,
-                on_manifest=manifest, run_id=run_id)
+            # What /capacity counts as in flight. Held for as long as the slot
+            # is, and no longer, so a run cancelled while it waited never
+            # counts and one that has just been given its slot already does.
+            RUNS.hold_slot(run_id, True)
+            try:
+                # Asked for while queued, and never started. Nothing was
+                # executed, so there is nothing to kill -- only a state to
+                # settle.
+                if RUNS.get(run_id).state is RunState.CANCELING:
+                    _advance(run_id, RunState.CANCELED)
+                    return
+                results = await run_in_threadpool(
+                    perform_run, biochef_workflow, inputs, progress, started,
+                    finished, logs,
+                    cancel_requested=lambda: _was_cancelled(run_id),
+                    on_progress=step_progress, on_outputs=outputs,
+                    retain=retain, on_manifest=manifest, run_id=run_id)
+            finally:
+                RUNS.hold_slot(run_id, False)
     except HTTPException as refusal:
         if _was_cancelled(run_id):
             _advance(run_id, RunState.CANCELED)
@@ -854,12 +862,6 @@ set one. A CI template substituting an empty variable produces exactly that,
 and "   " reported as a version is believed as readily as a real one.
 """
 
-# The states that occupy an execution slot. QUEUED is admitted and waiting, so
-# counting it as busy would have a hub route away from an agent that is in fact
-# free; CANCELING still holds the slot until the worker lets go of it.
-BUSY_STATES = (RunState.INITIALIZING, RunState.RUNNING, RunState.CANCELING)
-
-
 @app.get("/health")
 async def health():
     """Up. Nothing else.
@@ -927,10 +929,11 @@ async def capacity():
             "free": MAX_CONCURRENT_RUNS - busy,
         },
         "runs": {
-            # Runs occupying a slot: INITIALIZING, RUNNING, CANCELING. Not the
-            # same as slots.busy, which also counts synchronous /convert.
-            "in_flight": sum(counts.get(state.value, 0)
-                             for state in BUSY_STATES),
+            # Runs whose worker holds a slot, as the worker records it. Not
+            # read from the states: a run cancelled while queued is CANCELING
+            # and holds none. Not the same as slots.busy, which also counts
+            # synchronous /convert.
+            "in_flight": RUNS.in_flight(),
             # Admitted and waiting for a slot, so not counted as busy: an agent
             # with a queue still has free slots the moment one is released, and
             # a hub told otherwise would route away from a site that is free.
