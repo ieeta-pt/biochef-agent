@@ -8,6 +8,7 @@ from store.repo import MAX_NAME_LENGTH
 from tests.ui_support import (LOOPBACK, PAGES, PROXY, USER_HEADER, client_for,
                               dev_settings, header_settings, proxy_client)
 from ui.app import create_app
+from ui.csrf import MAX_FORM_BYTES
 from ui.identity import MAX_USER_LENGTH, WEBSOCKET_REFUSED, who
 
 
@@ -125,6 +126,14 @@ def test_dev_identity_from_elsewhere_gets_nothing(path):
     assert client_for(dev_settings(), "10.0.0.5").get(path).status_code == 401
 
 
+def test_a_body_over_the_cap_from_nobody_is_still_refused_as_nobody():
+    # Identity answers before the body cap, so a stranger learns nothing else.
+    client = client_for(header_settings(), "10.9.9.9")
+    response = client.post(PAGES[0], content=b"x" * (2 * MAX_FORM_BYTES),
+                           headers={USER_HEADER: "j.silva"})
+    assert response.status_code == 401
+
+
 def test_a_refused_request_leaves_no_cookie():
     assert "set-cookie" not in client_for(header_settings(), PROXY).get(PAGES[0]).headers
 
@@ -166,7 +175,7 @@ def test_a_websocket_is_closed_for_everyone(path, who_asks):
     with pytest.raises(WebSocketDisconnect) as closed:
         with client.websocket_connect(path, headers=headers):
             pass
-    assert closed.value.code == WEBSOCKET_REFUSED
+    assert closed.value.code == WEBSOCKET_REFUSED == 1008  # RFC 6455 policy violation
 
 
 def test_lifespan_still_reaches_the_app():
