@@ -21,7 +21,8 @@ def main():
         print(refused, file=sys.stderr)
         return 1
     current = configured.state.settings
-    uvicorn.run(configured, host=current.host, port=current.port, proxy_headers=False)
+    uvicorn.run(configured, host=current.host, port=current.port, proxy_headers=False,
+                server_header=False)
     return 0
 
 
