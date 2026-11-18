@@ -2,9 +2,8 @@ import sys
 import types
 from pathlib import Path
 
-# convert.py builds an ORAS client and logs in at import time, so importing it
-# in a test would try to reach the registry. Neither the client nor FastAPI is
-# used by the conversion itself.
+# Nothing here may reach the registry, whichever test first needs the client.
+# Neither the client nor FastAPI is used by the conversion itself.
 if "oras" not in sys.modules:
     oras = types.ModuleType("oras")
     client = types.ModuleType("oras.client")
