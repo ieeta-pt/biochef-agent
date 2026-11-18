@@ -136,7 +136,8 @@ def test_a_port_is_a_port(dev, port):
 
 
 @pytest.mark.parametrize("url", ["javascript:alert(1)", "data:text/html,x",
-                                 "policy.tre", "https://"])
+                                 "policy.tre", "https://", "javascript://x/%0aalert(1)",
+                                 "ftp://policy.tre/"])
 def test_the_policy_engine_link_cannot_run_anything(dev, url):
     dev.setenv("BIOCHEF_POLICY_ENGINE_URL", url)
     with pytest.raises(SettingsError, match="BIOCHEF_POLICY_ENGINE_URL"):
@@ -161,10 +162,13 @@ def test_cookies_are_secure_behind_the_proxy_only(dev):
 
 
 def run_python(*args):
+    # Set to empty rather than left out: ui/settings.py loads .env, and dotenv
+    # does not override a variable that is set, so a developer's .env stays out.
     env = {"PATH": os.environ["PATH"], "HOME": os.environ.get("HOME", "/"),
-           "PYTHONDONTWRITEBYTECODE": "1"}
+           "PYTHONDONTWRITEBYTECODE": "1",
+           **{name: "" for name in (*NAMES, "BIOCHEF_AUDIT_LOG", "BIOCHEF_NODE_NAME")}}
     return subprocess.run([sys.executable, *args], cwd=REPO_ROOT, env=env,
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, timeout=60)
 
 
 def test_the_asgi_entry_refuses_to_start_unconfigured():
@@ -194,7 +198,8 @@ def test_the_command_keeps_proxy_headers_off(dev, monkeypatch):
     monkeypatch.setattr(entry.uvicorn, "run",
                         lambda app, **options: seen.update(options))
     assert entry.main() == 0
-    assert seen == {"host": "127.0.0.1", "port": 8081, "proxy_headers": False}
+    assert seen == {"host": "127.0.0.1", "port": 8081, "proxy_headers": False,
+                    "server_header": False}
 
 
 
