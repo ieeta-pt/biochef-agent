@@ -227,7 +227,7 @@ exist yet.
 | Tool signature and evidence verification | On master, off by default (`BIOCHEF_SIGNING_MODE=off`) | #14 |
 | GA4GH visas, each verified against its own issuer | On master | #79 |
 | Node keys, and signed decisions written to the audit trail | On master | #109 |
-| Data manager's page, behind the TRE's login | In PR | #110 |
+| Data manager's page, behind the TRE's login | On master | #110 |
 | Study and workflow approval, signed with the node key | In PR | #112 |
 | Member ID token check, nonce bound to the keys | In PR | #114 |
 | Dataset bindings with their visa value | In PR | #115 |
