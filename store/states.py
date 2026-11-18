@@ -82,6 +82,7 @@ class RefusalCode(str, Enum):
     WRONG_NODE = "wrong_node"
     STUDY_NOT_APPROVED = "study_not_approved"
     WORKFLOW_NOT_APPROVED = "workflow_not_approved"
+    DATASET_NOT_IN_STUDY = "dataset_not_in_study"
     EXPIRED = "expired"
     REPLAY = "replay"
     CANNOT_DECRYPT = "cannot_decrypt"
