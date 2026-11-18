@@ -148,6 +148,40 @@ until the run ends. This setting is a retention bound, not a peak resource
 limit. Logs may contain sensitive tool output; this prototype has no local
 log-release policy for TRE use.
 
+### A workflow you got wrong is your error, not the agent's
+
+A `biochef_workflow` this service cannot read is a `400` naming what was wrong:
+not valid JSON, no `nodes`, a node without an `id`, a tool node whose
+`data.repo` is not a string, an edge that is a number. On `/runs` the same
+mistakes settle the run as `EXECUTOR_ERROR`, which is WES's word for the
+submission or its tools, rather than `SYSTEM_ERROR`, which is this service
+saying it broke.
+
+Both used to be the other way round. `/convert` answered `500` to nine of ten
+malformed documents and `/runs` recorded five of six as `SYSTEM_ERROR`, in both
+cases carrying the Python exception's own text — so a caller was told `'id'`, or
+`'int' object is not subscriptable`. A hub triaging a federated run would have
+gone looking for a fault here.
+
+The document is checked **before** a run directory exists, so a refused
+submission leaves nothing behind.
+
+The check is on shape only, and it is explicit rather than a `try/except`
+around the parse. Catching `KeyError` and `TypeError` there would cover every
+field for free and would also turn a genuine bug in our own parsing into a tidy
+`400`, telling a caller their workflow was wrong when it was not. The cost is
+that the check knows which fields the parser reads; a test drives a matrix of
+malformed documents through both routes and asserts none of them reaches a
+`500`, and another asserts that an internal fault still does.
+
+Whether a repo exists, whether a tool has the operation named, whether an
+edge's handles match — those need the registry, so they are answered once the
+bundle has been pulled. They are refusals too: naming an input or output
+handle the tool does not declare is a `400` listing what it does declare,
+rather than the `500` it used to be. A parameter the recipe does not declare is
+ignored. An enabled parameter with no value is a `400`, unless the recipe makes
+it required, in which case its default is used.
+
 Both take the same fields:
 
 | field | what it is |
@@ -220,6 +254,9 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_RUN_ROOT` | the system temp directory | where a run's private directory is created |
 | `BIOCHEF_RUN_TIMEOUT` | `900` | seconds before a run's whole process group is killed |
 | `BIOCHEF_AUDIT_LOG` | *(unset)* | path to an append-only JSONL audit trail; unset writes none |
+| `BIOCHEF_DB_URL` | `sqlite:////var/lib/biochef/agent.db` | the node's database, see [The node's store](#the-nodes-store) |
+| `BIOCHEF_NODE_SIGNING_KEY` | | path of the node's Ed25519 private key, see [The node's keys](#the-nodes-keys) |
+| `BIOCHEF_NODE_ENCRYPTION_KEY` | | path of the node's X25519 private key |
 | `BIOCHEF_KEEP_WORKSPACE` | `false` | leave a run's directory behind, for debugging |
 | `BIOCHEF_MAX_UPLOAD_BYTES` | `536870912` | largest request body accepted, in bytes |
 | `BIOCHEF_MAX_RUNS` | `256` | maximum run records retained for polling |
@@ -493,6 +530,29 @@ and HTTP 503 capacity refusal as `/runs`.
    whole process group is killed if it overruns.
 5. Each declared output is read back and base64-encoded into the response.
 6. The run's directory is removed, whether it succeeded or not.
+
+## The node's store
+
+What a node has decided lives in a database, because an approval has to outlast the process that made it. `store/` holds the tables of [the agent UI specification](docs/agent-ui/SPEC.md), section 6.1, and all access goes through `store/repo.py`. The API does not use it yet.
+
+```sh
+export BIOCHEF_DB_URL=sqlite:////var/lib/biochef/agent.db
+python -m store migrate                  # create or upgrade the tables
+python -m store downgrade base           # remove them
+python -m store.seed --fixture mock      # invented data, for development only
+```
+
+SQLite only, in WAL mode, because two processes open the file. Any other `BIOCHEF_DB_URL` is refused at start: concurrent approvals rely on SQLite's write lock, and no other database has been tested. The seed refuses a database that already holds data, and signs its decisions with a key it generates and throws away.
+
+## The node's keys
+
+A node has two keys: Ed25519 signs its decisions and results, and X25519 decrypts the payloads of requests. Create them outside this repository:
+
+```sh
+python -m node.keys init --out /etc/biochef/keys
+```
+
+It prints both public fingerprints, for registering the node, and refuses to replace a key that exists. The files must stay readable by their owner only. Point `BIOCHEF_NODE_SIGNING_KEY` and `BIOCHEF_NODE_ENCRYPTION_KEY` at them; a key that is missing, exposed, inside the repository or of the wrong type is refused.
 
 ## Before deploying this
 
