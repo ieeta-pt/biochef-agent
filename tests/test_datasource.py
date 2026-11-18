@@ -379,12 +379,10 @@ def test_a_run_can_take_an_input_from_a_non_upload_source(tmp_path, monkeypatch)
                 {"digest": digest(binary), "mediaType": "application/octet-stream",
                  "annotations": {"org.opencontainers.image.title": "tool"}}]}
 
-        def pull(self, target, outdir):
-            os.makedirs(outdir, exist_ok=True)
-            with open(os.path.join(outdir, "bundle.json"), "wb") as f:
-                f.write(bundle)
-            with open(os.path.join(outdir, "tool"), "wb") as f:
-                f.write(binary)
+        def download_blob(self, container, digest, outfile):
+            contents = {"bundle.json": bundle, "tool": binary}
+            with open(outfile, "wb") as f:
+                f.write(contents[os.path.basename(outfile)])
 
     monkeypatch.setattr(convert, "client", _Registry())
     convert.tools.clear()
@@ -462,12 +460,10 @@ def test_a_source_the_deployment_does_not_permit_is_refused(tmp_path, monkeypatc
                 {"digest": digest(binary), "mediaType": "application/octet-stream",
                  "annotations": {"org.opencontainers.image.title": "tool"}}]}
 
-        def pull(self, target, outdir):
-            os.makedirs(outdir, exist_ok=True)
-            with open(os.path.join(outdir, "bundle.json"), "wb") as f:
-                f.write(bundle)
-            with open(os.path.join(outdir, "tool"), "wb") as f:
-                f.write(binary)
+        def download_blob(self, container, digest, outfile):
+            contents = {"bundle.json": bundle, "tool": binary}
+            with open(outfile, "wb") as f:
+                f.write(contents[os.path.basename(outfile)])
 
     monkeypatch.setattr(convert, "client", _Registry())
     convert.tools.clear()
