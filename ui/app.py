@@ -9,6 +9,7 @@ headers, identity, CSRF, the body cap, then the route. The cap is the one the
 CSRF check applies to a form, for every request: nothing here takes an upload.
 """
 
+import retention
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -16,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from bodylimit import BodySizeLimitMiddleware
 from node import datasets
 from node import keys as node_keys
-from node.policy import FakePolicyEngine
+from node.policy import FakePolicyEngine, LocalRules
 from store import db, migrate
 from store.errors import NotFound
 from ui import settings as ui_settings
@@ -24,7 +25,7 @@ from ui.csrf import MAX_FORM_BYTES, CsrfMiddleware
 from ui.identity import IdentityMiddleware
 from ui.render import HERE
 from ui.routes import datasets as datasets_screen
-from ui.routes import decisions, inbox, node, requests, studies, workflows
+from ui.routes import decisions, inbox, node, requests, runs, studies, workflows
 from ui.security import SecurityHeadersMiddleware
 
 
@@ -36,9 +37,10 @@ def create_app(settings, *, bind, keys, policy=None):
     app.state.keys = keys
     app.state.policy = policy
     app.state.binding_conflicts = []
+    app.state.keep_seconds = retention.KEEP_OUTPUTS_SECONDS
 
-    for screen in (inbox, studies, workflows, decisions, requests, datasets_screen,
-                   node):
+    for screen in (inbox, studies, workflows, decisions, requests, runs,
+                   datasets_screen, node):
         app.include_router(screen.router)
     app.mount("/ui/static", StaticFiles(directory=HERE / "static"), name="static")
 
@@ -68,8 +70,9 @@ def configured_app():
     if not migrate.is_current(bind):
         raise ui_settings.SettingsError("the database schema is not current; run: "
                                         "python -m store migrate")
-    # Development has no Policy Engine to ask, and the page labels this one.
-    policy = FakePolicyEngine() if settings.identity == ui_settings.DEV else None
+    # Development has no Policy Engine to ask, and the page labels this one. A
+    # node has none yet either, and says what its own check leaves open.
+    policy = FakePolicyEngine() if settings.identity == ui_settings.DEV else LocalRules()
     keys = node_keys.load()
     app = create_app(settings, bind=bind, keys=keys, policy=policy)
     if settings.bindings_file:
