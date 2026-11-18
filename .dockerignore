@@ -1,0 +1,15 @@
+# Everything a build does not need, so an edit to a test or a doc does not
+# invalidate the dependency layer.
+.git
+.github
+venv/
+tool-cache/
+apptainer-cache/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+results-*.xml
+tests/
+docs/
+.env

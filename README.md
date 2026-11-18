@@ -539,6 +539,14 @@ and HTTP 503 capacity refusal as `/runs`.
 5. Each declared output is read back and base64-encoded into the response.
 6. The run's directory is removed, whether it succeeded or not.
 
+## Running the whole stack locally
+
+`docs/self-hosting.md` brings up a registry, this agent and the editor with one
+`docker compose up`, and explains what to do with them. It is the agent's own
+development stack — no authentication anywhere, plain HTTP — and the document
+says so. The full local TRE, with the coordinator and a silo, is `make up` in
+biochef-infra, which builds the agent from this repository's `Dockerfile`.
+
 ## The node's store
 
 What a node has decided lives in a database, because an approval has to outlast the process that made it. `store/` holds the tables of [the agent UI specification](docs/agent-ui/SPEC.md), section 6.1, and all access goes through `store/repo.py`. The API does not use it yet.
