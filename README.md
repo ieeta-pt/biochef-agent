@@ -258,6 +258,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_NODE_SIGNING_KEY` | | path of the node's Ed25519 private key, see [The node's keys](#the-nodes-keys) |
 | `BIOCHEF_NODE_ENCRYPTION_KEY` | | path of the node's X25519 private key |
 | `BIOCHEF_NODE_NAME` | | this node's name, required by the UI |
+| `BIOCHEF_FEDERATION_KEY` | | path of the PEM public key that signs the site list |
 | `BIOCHEF_COORDINATOR_POLL_SECONDS` | `30` | how often the coordinator is polled; three intervals with no success shows it as offline |
 | `BIOCHEF_EGRESS_MODE` | | `airlock` or `manual`, required by the UI, and what makes an agent a node, see [Egress](#egress) |
 | `BIOCHEF_DATASET_BINDINGS_FILE` | | YAML file of dataset bindings, locked on the page |
@@ -597,6 +598,10 @@ In `header` mode:
 The page refuses to start without `BIOCHEF_AUDIT_LOG`, because every decision made there has to reach the trail, and without the node's signing key or a migrated database. `run-ui.sh` starts `python -m ui`, which keeps uvicorn's proxy headers off. If you run `uvicorn ui.app:app` yourself, pass `--no-proxy-headers`. Otherwise uvicorn takes the client address from `X-Forwarded-For` for any connection from 127.0.0.1, so any local process can pose as a trusted proxy and name any user.
 
 Everything the page loads is served by the agent: htmx, the fonts and the stylesheet are in `ui/static/`, and `ui/static.sha256` records the vendored files. `ui/static/app.css` is built and committed, so nothing else is needed at runtime. After changing a template or `ui/tailwind/input.css`, run `make css`, which downloads the pinned Tailwind CLI, checks it against `ui/tailwind/SHA256SUMS` and rebuilds the file. CI fails if the committed file differs.
+
+## The site list
+
+`node/federation.py` keeps the site list, the list of nodes in the federation, only with a valid signature from `BIOCHEF_FEDERATION_KEY`, and refuses a version older than the newest one held, because going backwards is how a removed node comes back. A list carries an expiry, and one already past it is refused. While the list held has expired, a request delivered to the node is kept unchecked, audited as `node.request.held`, and checked on the first delivery after a current list arrives, and the Node screen shows "Expired since" in place of "Up to date". Otherwise a node that stopped receiving lists would keep trusting the last one, including a node removed or a key replaced since. Nothing receives a list yet: the coordinator client does that. The format is an assumption until the coordinator defines it, and the module says which one.
 
 ## The Node screen
 
