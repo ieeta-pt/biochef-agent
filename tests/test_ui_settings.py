@@ -26,6 +26,7 @@ def env(monkeypatch, tmp_path):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("BIOCHEF_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
     monkeypatch.setenv("BIOCHEF_NODE_NAME", "Example TRE (test)")
+    monkeypatch.setenv("BIOCHEF_PASSPORT_REQUIRE_VISA", "ControlledAccessGrants")
     return monkeypatch
 
 
@@ -163,9 +164,15 @@ def test_cookies_are_secure_behind_the_proxy_only(dev):
 
 
 def test_the_visa_comes_from_the_passport_setting(dev):
-    assert settings.load().required_visa is None
-    dev.setenv("BIOCHEF_PASSPORT_REQUIRE_VISA", "ControlledAccessGrants")
     assert settings.load().required_visa == "ControlledAccessGrants"
+
+
+def test_no_page_without_a_required_visa(dev):
+    """Every request is checked for a visa, so a node has to say which."""
+    dev.delenv("BIOCHEF_PASSPORT_REQUIRE_VISA")
+    with pytest.raises(settings.SettingsError,
+                       match="BIOCHEF_PASSPORT_REQUIRE_VISA"):
+        settings.load()
 
 
 # What a decision needs, checked at start

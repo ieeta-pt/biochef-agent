@@ -114,24 +114,24 @@ WORKFLOWS = (
 )
 
 # (id, study, version, workflow key, member, received, verdict, failed check,
-#  joined request, run). Mock 04 lists the first six, mock 02 adds the last two.
+#  repeats, run). Mock 04 lists the first five, mock 02 adds the last two. Mock 04
+#  had a sixth row for a repeat; a repeat is the same request_id, so it is now the
+#  count on req_8f21 (section 6.3).
 REQUESTS = (
     ("req_8e90", SEPSIS, 1, "sepsis-cohort", "Marta Reis", hours(1), "accepted",
-     None, None, "run_8e90"),
+     None, 0, "run_8e90"),
     ("req_8f40", CARDIO, 2, "gwas-140", "Rui Matos", hours(2), "refused",
-     "workflow_not_approved", None, None),
+     "workflow_not_approved", 0, None),
     ("req_8f33", SEPSIS, 1, "sepsis-cohort", "Paulo Neves", hours(3), "refused",
-     "visa_missing", None, None),
-    ("req_8f22", CARDIO, 2, "gwas-maf01", "Rui Matos", hours(5), "joined", None,
-     "req_8f21", "run_8f21"),
+     "visa_missing", 0, None),
     ("req_8f21", CARDIO, 2, "gwas-maf01", "Rui Matos", hours(6), "accepted",
-     None, None, "run_8f21"),
+     None, 1, "run_8f21"),
     ("req_7c03", CARDIO, 2, "gwas-maf01", "Ana Costa", hours(20), "accepted",
-     None, None, "run_7c03"),
+     None, 0, "run_7c03"),
     ("req_7b88", CARDIO, 2, "cohort", "Ana Costa", days(4), "accepted", None,
-     None, "run_7b88"),
+     0, "run_7b88"),
     ("req_7a10", CARDIO, 2, "gwas-maf01", "Rui Matos", days(5), "refused",
-     "expired", None, None),
+     "expired", 0, None),
 )
 
 STUDY_REQUEST_COUNTS = {CARDIO: 14, SEPSIS: 6}

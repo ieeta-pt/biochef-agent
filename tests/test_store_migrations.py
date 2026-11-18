@@ -61,6 +61,33 @@ def test_the_command_line_migrates_the_configured_database(tmp_path):
     assert migrate.is_current(engine)
 
 
+def test_joined_rows_go_and_the_rest_keep_their_verdict(tmp_path):
+    """0003: a joined row was a second request_id, which is now a request of its own."""
+    url = f"sqlite:///{tmp_path}/old.db"
+    migrate.upgrade(url, "0002")
+    engine = db.make_engine(url)
+    columns = ("request_id, study_id, study_version, study_digest, workflow_digest, "
+               "member, node, datasets, not_after, payload_digest, raw, received_at, "
+               "verdict, joined_request_id")
+    values = ("'{0}', 's', 1, 'd', 'w', 'm', 'n', '[]', '2026-01-01 00:00:00', 'p', "
+              "x'00', '2026-01-01 00:00:00', '{1}', {2}")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            f"INSERT INTO request ({columns}) VALUES ({values.format('req_1', 'accepted', 'NULL')})")
+        connection.exec_driver_sql(
+            f"INSERT INTO request ({columns}) VALUES ({values.format('req_2', 'joined', chr(39) + 'req_1' + chr(39))})")
+    migrate.upgrade(url)
+    with engine.connect() as connection:
+        rows = connection.exec_driver_sql(
+            "SELECT request_id, verdict, repeats FROM request").all()
+        names = {column["name"] for column in inspect(connection).get_columns("request")}
+    assert rows == [("req_1", "accepted", 0)]
+    assert "joined_request_id" not in names
+    with pytest.raises(Exception, match="CHECK"):
+        with engine.begin() as connection:
+            connection.exec_driver_sql("UPDATE request SET verdict = 'joined'")
+
+
 def test_a_password_with_a_percent_sign_reaches_alembic():
     config = migrate._config("postgresql://u:p%40ss@host/db")
     assert config.get_main_option("sqlalchemy.url") == "postgresql://u:p%40ss@host/db"

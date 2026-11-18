@@ -514,8 +514,7 @@ def get_request(session, request_id):
     return _get(session, Request, request_id)
 
 
-def set_verdict(session, request_id, verdict, *, failed_check=None,
-                joined_request_id=None, run_id=None):
+def set_verdict(session, request_id, verdict, *, failed_check=None, run_id=None):
     """Record the outcome of the checks, once.
 
     The combinations are refused here, so a screen never has to work out what a
@@ -526,26 +525,42 @@ def set_verdict(session, request_id, verdict, *, failed_check=None,
         raise Conflict(f"request {request_id} already has a verdict")
     if (verdict is Verdict.REFUSED) != (failed_check is not None):
         raise Conflict("a refusal needs a failed check, and only a refusal has one")
-    if (verdict is Verdict.JOINED) != (joined_request_id is not None):
-        raise Conflict("a joined request names the request it joined, and only "
-                       "a joined request does")
     if failed_check is not None:
         failed_check = RefusalCode(failed_check).value
     row.verdict = verdict.value
     row.failed_check = failed_check
-    row.joined_request_id = joined_request_id
     row.run_id = run_id
     return row
 
 
-def first_with_payload(session, payload_digest, *, excluding):
-    """The earliest checked request carrying this payload, for the replay check."""
-    return session.exec(
-        select(Request)
-        .where(Request.payload_digest == payload_digest,
-               Request.request_id != excluding,
-               Request.verdict.is_not(None))
-        .order_by(Request.received_at, Request.request_id)).first()
+def find_request(session, request_id):
+    """The request with this id, or None: how a repeat is told from a new one."""
+    return session.get(Request, request_id)
+
+
+def request_as_delivered(*, request_id, study_id, study_version, study_digest,
+                         workflow_digest, member, node, datasets, not_after,
+                         payload_digest, raw, now=None):
+    """A delivery as a Request, never added to the session.
+
+    A repeat is checked like a new request and must not replace the one stored,
+    so it is checked as this.
+    """
+    return Request(
+        request_id=request_id, study_id=study_id, study_version=study_version,
+        study_digest=study_digest, workflow_digest=workflow_digest, member=member,
+        node=node, datasets=datasets, not_after=not_after,
+        payload_digest=payload_digest, raw=raw, received_at=now or utcnow())
+
+
+def note_repeat(session, request_id, now=None):
+    """The same request delivered again. Its verdict does not change."""
+    row = get_request(session, request_id)
+    if row.verdict is None:
+        raise Conflict(f"request {request_id} has not been checked yet")
+    row.repeats += 1
+    row.last_repeat_at = now or utcnow()
+    return row
 
 
 def requests_since(session, since, verdicts=None):
@@ -576,10 +591,10 @@ def count_requests_of_workflow(session, study_id, study_version, digest):
 
 
 def count_requests_run_under(session, study_id, study_version, digest=None):
-    """Requests already accepted or joined under a version, or under a workflow."""
+    """Requests already accepted under a version, or under a workflow."""
     query = select(func.count()).select_from(Request).where(
         Request.study_id == study_id, Request.study_version == study_version,
-        Request.verdict.in_([Verdict.ACCEPTED.value, Verdict.JOINED.value]))
+        Request.verdict == Verdict.ACCEPTED.value)
     if digest is not None:
         query = query.where(Request.workflow_digest == digest)
     return session.exec(query).one()

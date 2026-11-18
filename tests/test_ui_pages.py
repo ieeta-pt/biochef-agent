@@ -19,7 +19,7 @@ def test_every_page_opens_for_a_trusted_user(path):
     assert f">{TITLES[path]}</h1>" in response.text
 
 
-@pytest.mark.parametrize("path", ["/ui/requests", "/ui/node"])
+@pytest.mark.parametrize("path", ["/ui/node"])
 def test_a_screen_still_to_come_says_so(path):
     assert "not built yet" in proxy_client().get(path).text
 

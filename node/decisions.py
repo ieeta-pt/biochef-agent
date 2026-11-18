@@ -147,7 +147,7 @@ def store(session, document, object_raw, signature):
         signature=signature)
 
 
-def _require_a_trail():
+def require_a_trail():
     # audit.record does nothing at all when no trail is configured, which is a
     # fair default for the API and not for a decision. A signed approval with no
     # audit event looks fine until someone needs the event.
@@ -159,7 +159,7 @@ def decide(session, keys, *, node, subject_type, subject_id, action, user,
            at=None, subject_hash=None, comment=None, dac_confirmed=None,
            reason=None):
     """Build, sign, store and audit one decision."""
-    _require_a_trail()
+    require_a_trail()
     document = build(
         node=node, subject_type=subject_type, subject_id=subject_id,
         action=action, user=user, at=at or repo.utcnow(),
@@ -181,7 +181,7 @@ def undo(session, decision_id, *, user):
     The decision goes; the trail keeps its event and gains this one, so that an
     undone decision is still visible to whoever reads the trail.
     """
-    _require_a_trail()
+    require_a_trail()
     if not user:
         raise DecisionError("an undo records who made it")
     repo.delete_unposted_decision(session, decision_id)
