@@ -1,4 +1,4 @@
-"""The ten checks of a request, in the order of section 6.3.
+"""The eleven checks of a request, in the order of section 6.3.
 
 `verify` reads and decides, and changes nothing: recording the result is
 node/requests.py. The first failure stops the rest, so what it returns says how
@@ -14,12 +14,12 @@ each is an assumption here until the API settles it:
 - the payload is JSON with `visas`, a list of JWTs, and `workflow`, whose digest
   is over its RFC 8785 form.
 
-Check 6 is about the request_id, which the member signs. The same request_id
+Check 7 is about the request_id, which the member signs. The same request_id
 delivered again joins the run when the first was accepted and gets the same
 refusal when it was refused, whatever has changed since: a refused request is
 sent again under a new request_id. A new request_id is a new request, even with
 the same payload. The same request_id on a different signed request is a replay.
-Check 5 comes first, so `not_after` is how long a request_id is held to this.
+Check 6 comes first, so `not_after` is how long a request_id is held to this.
 """
 
 import base64
@@ -124,8 +124,19 @@ def _workflow_approved(request, session):
                                   request.workflow_digest) is not None
 
 
+def _datasets_in_study(request, session):
+    """Check 5. A member of two studies holds visas for the datasets of both, so
+    without this a request under one study could read the other's data under the
+    first one's approval and output rules."""
+    version = repo.study_version_named(session, request.study_id,
+                                       request.study_version)
+    named = request.datasets
+    return (isinstance(named, list) and isinstance(version.datasets, list)
+            and all(dataset in version.datasets for dataset in named))
+
+
 def _decrypted(document, request, keys):
-    """Check 7: the payload as an object, or None."""
+    """Check 8: the payload as an object, or None."""
     try:
         payload = document["payload"]
         if payload["enc"] != "age-x25519":
@@ -144,7 +155,7 @@ def _decrypted(document, request, keys):
 
 
 def _workflow_digest(payload):
-    """Check 8's recomputation. None when the workflow cannot be put in canonical form."""
+    """Check 9's recomputation. None when the workflow cannot be put in canonical form."""
     workflow = payload.get("workflow")
     if not isinstance(workflow, dict):
         return None
@@ -171,7 +182,7 @@ def _signed_part(raw):
 
 
 def _repeat(seen, document):
-    """Check 6 for a request_id already here."""
+    """Check 7 for a request_id already here."""
     if seen.verdict is None:
         raise ValueError(f"{seen.request_id} has to be checked before its repeats")
     if _signed_part(seen.raw) != document.get("job_request"):
@@ -185,7 +196,7 @@ def _repeat(seen, document):
 def _visa_values(request, session):
     """The visa value of each named dataset that is bound, None where it has none.
 
-    An unbound dataset is left to check 10, which says what is wrong with it.
+    An unbound dataset is left to check 11, which says what is wrong with it.
     """
     bindings = [repo.dataset_binding(session, dataset) for dataset in request.datasets]
     return [row.visa_value for row in bindings if row is not None]
@@ -195,7 +206,7 @@ def verify(request, store, keys, now, *, node, visas):
     """The verdict on one request. `store` is a session, and is only read.
 
     `request` is the stored row of a new request, or the unstored delivery of one
-    already here (repo.request_as_delivered), which check 6 tells apart.
+    already here (repo.request_as_delivered), which check 7 tells apart.
     """
     session = store
     document = _document(request)
@@ -208,6 +219,8 @@ def verify(request, store, keys, now, *, node, visas):
         return _refused(RefusalCode.STUDY_NOT_APPROVED)
     if not _workflow_approved(request, session):
         return _refused(RefusalCode.WORKFLOW_NOT_APPROVED)
+    if not _datasets_in_study(request, session):
+        return _refused(RefusalCode.DATASET_NOT_IN_STUDY)
     if request.not_after <= now:
         return _refused(RefusalCode.EXPIRED)
 
@@ -221,7 +234,7 @@ def verify(request, store, keys, now, *, node, visas):
     if _workflow_digest(payload) != request.workflow_digest:
         return _refused(RefusalCode.HASH_MISMATCH)
     if not visas.allow(payload.get("visas"), _member_id(request, session),
-                       _visa_values(request, session)):
+                       _visa_values(request, session), now):
         return _refused(RefusalCode.VISA_MISSING)
     if any(repo.dataset_binding(session, dataset) is None
            for dataset in request.datasets):

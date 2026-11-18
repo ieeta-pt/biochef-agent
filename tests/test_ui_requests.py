@@ -53,11 +53,12 @@ def test_the_verdicts_of_the_mock(client):
         assert verdict in text
 
 
-def test_the_panel_lists_all_ten_checks(client):
+def test_the_panel_lists_all_eleven_checks(client):
     text = client.get("/ui/requests?selected=req_8f21").text
-    assert text.count('<li class="flex gap-2') == 10
+    assert text.count('<li class="flex gap-2') == 11
     assert "Addressed to this node" in text
-    assert text.count("✓") >= 10
+    assert "Datasets named by the study" in text
+    assert text.count("✓") >= 11
 
 
 def panel(text):
@@ -66,7 +67,7 @@ def panel(text):
 
 def test_a_refusal_marks_the_failure_and_what_was_not_reached(client):
     text = panel(client.get("/ui/requests?selected=req_8f40").text)
-    assert text.count("· not reached") == 6
+    assert text.count("· not reached") == 7
     assert "✗" in text
     assert text.index("Workflow hash approved") < text.index("✗") + 80
     assert "The refusal is signed with the node key" in text

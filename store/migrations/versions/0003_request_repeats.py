@@ -3,6 +3,8 @@
 A request delivered again is counted on its own row, so the `joined` verdict, the
 column naming the request joined and the index for finding one by payload go.
 
+The same section adds check 5, so a refusal can also name `dataset_not_in_study`.
+
 Revision ID: 0003
 Revises: 0002
 """
@@ -16,6 +18,18 @@ revision = '0003'
 down_revision = '0002'
 branch_labels = None
 depends_on = None
+
+BEFORE_CHECK_5 = ('bad_signature', 'wrong_node', 'study_not_approved',
+                  'workflow_not_approved', 'expired', 'replay', 'cannot_decrypt',
+                  'hash_mismatch', 'visa_missing', 'dataset_not_bound')
+WITH_CHECK_5 = ('bad_signature', 'wrong_node', 'study_not_approved',
+                'workflow_not_approved', 'dataset_not_in_study', 'expired',
+                'replay', 'cannot_decrypt', 'hash_mismatch', 'visa_missing',
+                'dataset_not_bound')
+
+
+def _codes(codes):
+    return ", ".join(f"'{code}'" for code in codes)
 
 
 def upgrade():
@@ -35,10 +49,18 @@ def upgrade():
                                    nullable=False))
         batch.add_column(sa.Column('last_repeat_at', store.types.UtcDateTime(),
                                    nullable=True))
+        batch.drop_constraint(op.f('ck_request_failed_check'), type_='check')
+        batch.create_check_constraint(op.f('ck_request_failed_check'),
+                                      f"failed_check IN ({_codes(WITH_CHECK_5)})")
 
 
 def downgrade():
+    # A refusal that names check 5 has no code before it.
+    op.execute("DELETE FROM request WHERE failed_check = 'dataset_not_in_study'")
     with op.batch_alter_table('request') as batch:
+        batch.drop_constraint(op.f('ck_request_failed_check'), type_='check')
+        batch.create_check_constraint(op.f('ck_request_failed_check'),
+                                      f"failed_check IN ({_codes(BEFORE_CHECK_5)})")
         batch.drop_column('last_repeat_at')
         batch.drop_column('repeats')
         batch.drop_constraint(op.f('ck_request_verdict'), type_='check')
