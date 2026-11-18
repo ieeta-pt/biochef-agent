@@ -2,6 +2,7 @@
 
 import json
 import os
+from urllib.parse import unquote
 
 import audit
 import passports
@@ -21,45 +22,95 @@ class RequestError(Exception):
 
 
 class VisaCheck:
-    """Whether a member's visas allow the named datasets (check 9).
+    """Whether a member's visas allow the named datasets (check 10).
 
-    A dataset needs a visa of the node's required type, from an issuer the node
-    trusts, whose value is exactly the visa value of the dataset's binding and
-    whose subject is this member. A binding with no visa value matches no visa.
-    The subject matters: a visa is a statement about a person, and one issued to
-    somebody else proves nothing about this one.
+    Every request is checked, so a node cannot run without saying which visa it
+    requires, whom it trusts to issue one and how old one may be. A dataset needs
+    a visa of the required type, from a trusted issuer, whose value is exactly the
+    visa value of the dataset's binding, that belongs to the member and is no
+    older than the limit. A binding with no visa value matches no visa.
+
+    A visa belongs to the member when its subject is the member's LS AAI id, or
+    when a LinkedIdentities visa of the member, from a trusted issuer and itself
+    within the limit, names the visa's subject and issuer. Without this, any
+    valid visa for the dataset would pass: a visa is a statement about a person,
+    and one issued to somebody else proves nothing about this one.
+
+    The age counts from the visa's `asserted` time. A visa that does not say when
+    it was asserted cannot be shown to be within the limit, so it does not count.
     """
 
-    def __init__(self, required_type, trusted_issuers=(), keyset_for=None):
-        if required_type and not trusted_issuers:
-            raise ValueError("BIOCHEF_PASSPORT_REQUIRE_VISA is set but "
-                             "BIOCHEF_PASSPORT_VISA_ISSUERS is empty")
+    LINKED = "LinkedIdentities"
+
+    def __init__(self, required_type, trusted_issuers, max_age, keyset_for=None):
+        if not required_type:
+            raise ValueError("BIOCHEF_PASSPORT_REQUIRE_VISA is not set: every "
+                             "request is checked for a visa of that type")
+        if not trusted_issuers:
+            raise ValueError("BIOCHEF_PASSPORT_VISA_ISSUERS is empty: no visa "
+                             "could ever count")
+        if (not isinstance(max_age, int) or isinstance(max_age, bool)
+                or max_age <= 0):
+            raise ValueError("BIOCHEF_PASSPORT_VISA_MAX_AGE must be a positive "
+                             "number of seconds")
         self.required_type = required_type
         self.trusted_issuers = frozenset(trusted_issuers)
+        self.max_age = max_age
         self.keyset_for = keyset_for or self._keyset
         self._keysets = {}
 
     @classmethod
     def from_settings(cls):
         issuers = os.getenv("BIOCHEF_PASSPORT_VISA_ISSUERS") or ""
+        max_age = (os.getenv("BIOCHEF_PASSPORT_VISA_MAX_AGE") or "").strip()
+        try:
+            seconds = int(max_age)
+        except ValueError:
+            raise ValueError("BIOCHEF_PASSPORT_VISA_MAX_AGE must be a positive "
+                             "number of seconds; there is no default, because "
+                             "it is the data access committee's to set") from None
         return cls((os.getenv("BIOCHEF_PASSPORT_REQUIRE_VISA") or "").strip() or None,
-                   [item.strip() for item in issuers.split(",") if item.strip()])
+                   [item.strip() for item in issuers.split(",") if item.strip()],
+                   seconds)
 
     def _keyset(self, issuer):
         if issuer not in self._keysets:
             self._keysets[issuer] = passports.KeySet(passports.jwks_url_for(issuer))
         return self._keysets[issuer]
 
-    def allow(self, tokens, ls_aai_id, values):
+    def _fresh(self, visa, now):
+        asserted = visa.get("asserted")
+        if not isinstance(asserted, int) or isinstance(asserted, bool):
+            return False
+        return now.timestamp() - asserted <= self.max_age
+
+    def _linked(self, visas, ls_aai_id):
+        """The (subject, issuer) pairs the member's LinkedIdentities visas name."""
+        pairs = set()
+        for visa in visas:
+            if visa.get("type") != self.LINKED or visa.get("sub") != ls_aai_id:
+                continue
+            value = visa.get("value")
+            if not isinstance(value, str):
+                continue
+            for entry in value.split(";"):
+                subject, _, issuer = entry.partition(",")
+                if subject and issuer:
+                    pairs.add((unquote(subject), unquote(issuer)))
+        return pairs
+
+    def allow(self, tokens, ls_aai_id, values, now):
         """`values`: the visa value of each dataset, None for one that has none."""
-        if not self.required_type:
-            return True
         if not isinstance(tokens, list) or ls_aai_id is None or None in values:
             return False
         accepted, _ = passports.verify_visas(
             [token for token in tokens if isinstance(token, str)],
             trusted_issuers=self.trusted_issuers, keyset_for=self.keyset_for)
-        own = [visa for visa in accepted if visa.get("sub") == ls_aai_id]
+        fresh = [visa for visa in accepted if self._fresh(visa, now)]
+        linked = self._linked(fresh, ls_aai_id)
+        own = [visa for visa in fresh
+               if visa.get("sub") == ls_aai_id
+               or (visa.get("sub"), visa.get("iss")) in linked]
         return all(passports.satisfies(own, self.required_type, value)
                    for value in values)
 
@@ -90,7 +141,7 @@ def deliver(session, keys, raw, *, node, visas, now=None):
     """Everything one delivery from the coordinator gets. Returns the Result.
 
     A new request_id is received and checked. One already here is a repeat: its
-    stored verdict stays as it is, and the delivery gets what check 6 says.
+    stored verdict stays as it is, and the delivery gets what check 7 says.
     """
     now = now or repo.utcnow()
     fields = _fields(raw)
