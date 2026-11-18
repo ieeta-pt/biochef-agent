@@ -3,7 +3,8 @@
 The agent has no accounts and no passwords: the TRE decides who may open the
 page, and this only reads the answer. So the whole question is whether the answer
 can be believed, and it is refused rather than guessed whenever it cannot. That
-covers static files too: nothing is served to someone unknown.
+covers static files too: nothing is served to someone unknown. Websockets are
+closed for everyone, since the page uses none and CSRF does not cover them.
 
 The header is believed only from an address in BIOCHEF_UI_TRUSTED_PROXIES, and
 that address has to be the one the socket reports. run-ui.sh turns off uvicorn's
@@ -13,12 +14,21 @@ proxy headers because otherwise uvicorn rewrites it from X-Forwarded-For.
 import ipaddress
 
 from starlette.responses import PlainTextResponse
+from starlette.websockets import WebSocketClose
 
 from ui.settings import DEV
 
 # RFC 9110 requires this header on a 401. The scheme is not one a browser can
 # answer, because the only way in is through the TRE.
 CHALLENGE = {"WWW-Authenticate": "TRE-Proxy"}
+
+# The name goes in the audit trail and in signed decisions, so it gets the same
+# ceiling the store puts on a member's name (store/repo.py MAX_NAME_LENGTH).
+# Not imported from there, because the page does not load the store yet.
+MAX_USER_LENGTH = 128
+
+# RFC 6455 "policy violation": the generic refusal.
+WEBSOCKET_REFUSED = 1008
 
 
 def _address(scope):
@@ -47,7 +57,9 @@ def _named_user(scope, name):
         return None
     # The name goes in the audit trail and in signed decisions. isprintable also
     # refuses line breaks and other separators.
-    return user if user and user.isprintable() else None
+    if not user or len(user) > MAX_USER_LENGTH or not user.isprintable():
+        return None
+    return user
 
 
 def who(scope, settings):
@@ -70,7 +82,11 @@ class IdentityMiddleware:
         self.settings = settings
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
+        if scope["type"] == "websocket":
+            # Closed before the app sees it. Otherwise a websocket route would
+            # be served to anyone, and one under /ui/static/ crashes StaticFiles.
+            return await WebSocketClose(code=WEBSOCKET_REFUSED)(scope, receive, send)
+        if scope["type"] != "http":  # lifespan
             return await self.app(scope, receive, send)
         user = who(scope, self.settings)
         if user is None:
