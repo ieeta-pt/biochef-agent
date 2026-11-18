@@ -83,10 +83,9 @@ class IO(BaseModel):
     catalogue omit the key, and one -- `samtools.markdup.outputs.out` -- sets it
     empty on purpose.
 
-    The emitter only ever tests it for truth, so nothing downstream changes.
-    But typing this as `str = ""` would have collapsed the two at parse time and
-    published that collapse as a contract, which is exactly the distinction #34
-    has to be able to make when it is settled.
+    The emitter follows the frontend: a flag names the path, `""` makes it
+    positional, and `None` leaves it off the command line (#34). Typing this as
+    `str = ""` would have collapsed the two at parse time.
     """
 
 

@@ -48,8 +48,7 @@ BUNDLES = {
         "fixed", [FILE_IN],
         [{"name": "out", "types": ["T"], "mode": "file", "flag": "-o",
           "filename": "result.txt"}]),
-    # ivar.trim and five other ivar operations. The output path also lands on
-    # the command line, which is #34; this file records it until that is decided.
+    # ivar.trim and five other ivar operations.
     "unflagged": _tool(
         "unflagged", [FILE_IN],
         [{"name": "out", "types": ["T"], "mode": "file",
