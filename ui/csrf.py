@@ -9,10 +9,10 @@ a route added later cannot forget it.
 import hmac
 import re
 import secrets
-from http.cookies import SimpleCookie
 from urllib.parse import parse_qs
 
 from starlette.datastructures import Headers
+from starlette.requests import cookie_parser
 from starlette.responses import PlainTextResponse
 
 HEADER_NAME = "x-csrf-token"
@@ -37,13 +37,11 @@ def cookie_name(secure):
 
 
 def _cookie_token(headers, name):
-    jar = SimpleCookie()
-    try:
-        jar.load(headers.get("cookie", ""))
-    except Exception:  # http.cookies raises its own error on a malformed header
-        return None
-    morsel = jar.get(name)
-    return morsel.value if morsel and TOKEN.fullmatch(morsel.value) else None
+    # The browser sends every cookie of this host, whoever set it, so another
+    # app's cookie must not hide ours. http.cookies stops at the first cookie it
+    # cannot parse; Starlette's parser, the one behind request.cookies, skips it.
+    value = cookie_parser(headers.get("cookie", "")).get(name)
+    return value if value and TOKEN.fullmatch(value) else None
 
 
 def _matches(sent, token):
@@ -86,7 +84,10 @@ class CsrfMiddleware:
         headers.append((b"set-cookie", attributes.encode()))
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope["path"].startswith(STATIC_PREFIX):
+        # Static files need no session, but only reading them is skipped, so a
+        # route that ever changes state there still cannot forget the check.
+        if scope["type"] != "http" or (scope["path"].startswith(STATIC_PREFIX)
+                                       and scope["method"] in SAFE_METHODS):
             return await self.app(scope, receive, send)
 
         headers = Headers(scope=scope)

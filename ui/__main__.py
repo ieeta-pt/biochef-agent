@@ -20,7 +20,7 @@ def main():
         print(refused, file=sys.stderr)
         return 1
     uvicorn.run(create_app(configured), host=configured.host, port=configured.port,
-                proxy_headers=False)
+                proxy_headers=False, server_header=False)
     return 0
 
 

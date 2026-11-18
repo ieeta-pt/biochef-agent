@@ -544,7 +544,14 @@ The agent has no accounts. The TRE decides who may open the page, and `BIOCHEF_U
 - `header`: a reverse proxy passes the user name in `BIOCHEF_UI_IDENTITY_HEADER`. The header counts only from an address in `BIOCHEF_UI_TRUSTED_PROXIES`. Anything else is a 401, static files included.
 - `dev`: `BIOCHEF_UI_DEV_USER`, from a loopback address only. It refuses to start on any other `BIOCHEF_UI_HOST`.
 
-The page refuses to start without `BIOCHEF_AUDIT_LOG`, because every decision made there has to reach the trail. `run-ui.sh` starts `python -m ui`, which keeps uvicorn's proxy headers off. If you run `uvicorn ui.app:app` yourself, pass `--no-proxy-headers`, because otherwise uvicorn rewrites the client address that the identity check depends on.
+In `header` mode:
+
+- The proxy has to set the header itself, replacing any value the browser sent. If it passes one through or appends to it, the browser names the user.
+- Every process that can connect from a trusted address can name any user. If you trust `127.0.0.1`, that includes every local process and every workflow step: `subprocess` runs steps on this host, and `apptainer` with the default `BIOCHEF_APPTAINER_ARGS` shares its network. Prefer a proxy on its own address.
+- The browser has to reach the proxy over https. The CSRF cookie is `__Host-` and `Secure`, so over plain http the browser drops it, and every change on the page is refused with 403. Only `localhost` is exempt.
+- Publish the page at the root of its own host, for example `https://agent.tre.example/`, not under a path such as `/agent/`. The pages link to `/ui/...`, and the cookie needs `Path=/`.
+
+The page refuses to start without `BIOCHEF_AUDIT_LOG`, because every decision made there has to reach the trail. `run-ui.sh` starts `python -m ui`, which keeps uvicorn's proxy headers off. If you run `uvicorn ui.app:app` yourself, pass `--no-proxy-headers`. Otherwise uvicorn takes the client address from `X-Forwarded-For` for any connection from 127.0.0.1, so any local process can pose as a trusted proxy and name any user.
 
 Everything the page loads is served by the agent: htmx, the fonts and the stylesheet are in `ui/static/`, and `ui/static.sha256` records the vendored files. `ui/static/app.css` is built and committed, so nothing else is needed at runtime. After changing a template or `ui/tailwind/input.css`, run `make css`, which downloads the pinned Tailwind CLI, checks it against `ui/tailwind/SHA256SUMS` and rebuilds the file. CI fails if the committed file differs.
 
