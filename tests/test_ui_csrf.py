@@ -212,6 +212,21 @@ def test_only_reading_static_files_skips_the_check(client):
                        headers={"X-CSRF-Token": token}).status_code == 405
 
 
+@pytest.mark.parametrize("method", ["put", "patch", "delete"])
+def test_writing_to_static_files_is_checked_whatever_the_method(client, method):
+    client.get(PAGES[0])
+    assert getattr(client, method)("/ui/static/app.css").status_code == 403
+
+
+def test_the_check_comes_before_the_body_cap(client):
+    # A request that cannot prove it read the page is refused as that, whatever
+    # its size, and the cap never reads its body.
+    client.get(PAGES[0])
+    big = client.post(ECHO, content="x" * (2 * csrf.MAX_FORM_BYTES),
+                      headers={"Content-Type": "application/octet-stream"})
+    assert big.status_code == 403
+
+
 def test_get_carries_no_requirement(client):
     assert client.get(PAGES[0]).status_code == 200
 
