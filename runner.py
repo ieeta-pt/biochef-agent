@@ -78,6 +78,15 @@ class Runner:
         """What this provider is, for an operator reading a log or an error."""
         return self.name
 
+    umask = -1
+    """The umask the command starts with; -1 keeps the agent's."""
+
+    def before_run(self, ws) -> None:
+        """Anything the workspace needs before the command starts."""
+
+    def after_run(self, ws) -> None:
+        """Anything the group kill cannot reach. Called on every way out of `run`."""
+
     def run(self, ws, timeout_s: int, on_start=None, on_finish=None,
             on_line=None) -> RunResult:
         """Launch the command in its own process group and bound how long it lives.
@@ -93,9 +102,10 @@ class Runner:
         person does not spend time proving it, and kept because it says what is
         meant rather than relying on that identity.
         """
+        self.before_run(ws)
         process = subprocess.Popen(
             self.command(ws),
-            cwd=ws.path, start_new_session=True,
+            cwd=ws.path, start_new_session=True, umask=self.umask,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             encoding="utf-8", errors="replace",
         )
@@ -210,6 +220,7 @@ class Runner:
                 reader.join(timeout=10)
             raise
         finally:
+            self.after_run(ws)
             # Reached by every path, and by now the group is either reaped
             # normally or killed above -- including the paths that raise, which
             # is why the kill is in an except rather than only in the timeout.
@@ -405,9 +416,311 @@ class ApptainerRunner(Runner):
         return argv
 
 
+PODMAN_SELINUX = ("disable", "keep")
+PODMAN_MODES = ("rootless", "rootful")
+
+PODMAN_STEP_CONF = "/etc/biochef-agent/podman-step.conf"
+"""podman-step-root's configuration, at a path fixed in that script.
+
+Not a setting on purpose: under rootful podman this file decides who a step runs
+as and what it may use, so the agent, which is not trusted with root, must not be
+able to point the script at another one.
+"""
+
+_PIDS_SHAPE = re.compile(r"\A[1-9][0-9]{0,6}\Z")
+_MEMORY_SHAPE = re.compile(r"\A[1-9][0-9]{0,9}[kmg]\Z")
+_ID_SHAPE = re.compile(r"\A[1-9][0-9]{0,9}\Z")
+_ROOT_SHAPE = re.compile(r"\A/[A-Za-z0-9._/-]*[A-Za-z0-9._-]\Z")
+
+_STEP_CONF_KEYS = ("RUN_ROOT", "STEP_UID", "STEP_GID", "IMAGE", "PIDS", "MEMORY",
+                   "SELINUX")
+
+
+def _owned_by(path, owner):
+    """Owned by `owner` and writable by nobody else, the path and its directory."""
+    for each in (path, os.path.dirname(path)):
+        info = os.stat(each, follow_symlinks=False)
+        if info.st_uid != owner or info.st_mode & 0o022:
+            return False
+    return True
+
+
+def _read_step_conf(path, owner):
+    """The values podman-step-root will use, read with the same rules it applies."""
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise ValueError(f"{path} is missing; rootful podman needs it, see the README")
+    if not _owned_by(path, owner):
+        raise ValueError(f"{path} and its directory must be owned by root and "
+                         f"writable by no one else")
+    values = {}
+    with open(path, encoding="utf-8") as stream:
+        for line in stream.read().splitlines():
+            if not line or line.startswith("#"):
+                continue
+            key, equals, value = line.partition("=")
+            if not equals or key not in _STEP_CONF_KEYS:
+                raise ValueError(f"{path}: not a known KEY=value line: {line!r}")
+            if key in values:
+                raise ValueError(f"{path}: {key} appears twice")
+            values[key] = value
+    missing = [key for key in _STEP_CONF_KEYS if key not in values]
+    if missing:
+        raise ValueError(f"{path} has no {', '.join(missing)}")
+    for key, shape in (("RUN_ROOT", _ROOT_SHAPE), ("STEP_UID", _ID_SHAPE),
+                       ("STEP_GID", _ID_SHAPE), ("PIDS", _PIDS_SHAPE),
+                       ("MEMORY", _MEMORY_SHAPE)):
+        if not shape.match(values[key]):
+            raise ValueError(f"{path}: {key}={values[key]!r} is not valid")
+    if values["SELINUX"] not in PODMAN_SELINUX:
+        raise ValueError(f"{path}: SELINUX must be disable or keep")
+    return values
+
+
+def _required(name, value, shape, what):
+    value = (os.getenv(name, "") if value is None else value).strip()
+    if not shape.match(value):
+        raise ValueError(f"{name}={value!r}: it must be {what}, and has no default")
+    return value
+
+
+class PodmanRunner(Runner):
+    """Every step in a podman container, with no network.
+
+    Snakemake has no podman deployment method, so the seam is the shell its rules
+    run under: the preamble makes podman-step that shell, and the step's command
+    goes into a container from there. Snakemake itself stays on the host, as it
+    does under apptainer, and the Snakefile does not change otherwise.
+
+    The group kill reaches the podman client and not the container, which belongs
+    to podman's own monitor, so `after_run` removes whatever a killed run left.
+
+    BIOCHEF_PODMAN_MODE has no default, because the two are different hosts.
+    `rootless` runs podman as the agent's user, and each step keeps that user.
+    `rootful` runs podman as root, and the agent still does not: it calls
+    podman-step-root through one sudo rule, and that script takes who a step runs
+    as, the image, the limits and SELinux from its own configuration, which only
+    root can change. Under root, `--userns=keep-id` would not keep the agent's
+    user: podman 3.0.1 turns it into the host's user namespace with uid 0
+    (pkg/specgen/generate/namespaces.go), so a step would run as root on the
+    host. A rootful step runs as STEP_UID:STEP_GID instead, a user that is not
+    the agent's, in a group the agent belongs to, so the agent can still read
+    what the steps write.
+
+    BIOCHEF_PODMAN_SELINUX has no default either. `disable` runs steps without
+    SELinux separation, so the workspace mount works on any host without
+    relabelling it; `keep` leaves podman's labelling on, and on an enforcing host
+    the workspace must already carry a label containers may use.
+
+    Every step has a read-only root filesystem and a limit on processes and on
+    memory, with no swap past it. The limits have no default: what a tool needs
+    depends on the catalogue and on the host.
+    """
+
+    name = "podman"
+
+    def __init__(self, image: str = None, selinux: str = None, mode: str = None,
+                 pids: str = None, memory: str = None, helper: str = None,
+                 step_conf: str = PODMAN_STEP_CONF, run_root: str = None,
+                 trusted_owner: int = 0):
+        self.image = CONTAINER_IMAGE if image is None else image
+        self._literal = _image_literal(self.image)
+        if not self.image.startswith("docker://"):
+            raise ValueError(
+                f"BIOCHEF_CONTAINER_IMAGE={self.image!r} is not one podman can pull "
+                f"under this runner; it needs a docker:// reference"
+            )
+        self.mode = (os.getenv("BIOCHEF_PODMAN_MODE", "") if mode is None
+                     else mode).strip()
+        if self.mode not in PODMAN_MODES:
+            raise ValueError(
+                f"BIOCHEF_PODMAN_MODE={self.mode!r}: it must be rootless or "
+                f"rootful, and has no default. rootless runs podman as the agent's "
+                f"user; rootful runs it as root through podman-step-root and one "
+                f"sudo rule, with each step as a dedicated user"
+            )
+        if os.geteuid() == 0:
+            raise ValueError(
+                "the agent must not run as root under the podman runner: as root, "
+                "every step would run as root on the host. Use rootful mode, which "
+                "reaches root only through podman-step-root"
+            )
+        if self.mode == "rootless":
+            self._rootless(selinux, pids, memory)
+        else:
+            self._rootful(selinux, pids, memory, helper, step_conf, run_root,
+                          trusted_owner)
+
+    def _rootless(self, selinux, pids, memory):
+        self.selinux = (os.getenv("BIOCHEF_PODMAN_SELINUX", "") if selinux is None
+                        else selinux).strip()
+        if self.selinux not in PODMAN_SELINUX:
+            raise ValueError(
+                f"BIOCHEF_PODMAN_SELINUX={self.selinux!r}: it must be one of "
+                f"{', '.join(PODMAN_SELINUX)}, and has no default. disable runs "
+                f"steps without SELinux separation and mounts the workspace as it "
+                f"is; keep leaves podman's labelling on, which on an SELinux host "
+                f"needs the workspace labelled for containers (container_file_t)"
+            )
+        self.pids = _required("BIOCHEF_STEP_PIDS", pids, _PIDS_SHAPE,
+                              "the most processes a step may have, a positive number")
+        self.memory = _required("BIOCHEF_STEP_MEMORY", memory, _MEMORY_SHAPE,
+                                "the most memory a step may use, such as 4g")
+        self.helper = None
+        self.step_uid = self.step_gid = None
+
+    def _rootful(self, selinux, pids, memory, helper, step_conf, run_root,
+                 trusted_owner):
+        self.helper = (os.getenv("BIOCHEF_PODMAN_HELPER", "") if helper is None
+                       else helper).strip()
+        if not os.path.isabs(self.helper):
+            raise ValueError(
+                f"BIOCHEF_PODMAN_HELPER={self.helper!r}: rootful podman needs the "
+                f"absolute path of podman-step-root as installed for sudo, and it "
+                f"has no default"
+            )
+        if (os.path.islink(self.helper) or not os.path.isfile(self.helper)
+                or not _owned_by(self.helper, trusted_owner)):
+            raise ValueError(
+                f"BIOCHEF_PODMAN_HELPER={self.helper!r} must be a file owned by "
+                f"root, in a directory owned by root, neither writable by anyone "
+                f"else, or the agent could change what runs as root"
+            )
+        conf = _read_step_conf(step_conf, trusted_owner)
+        self.step_uid = int(conf["STEP_UID"])
+        self.step_gid = int(conf["STEP_GID"])
+        if self.step_uid == os.getuid():
+            raise ValueError(f"{step_conf}: STEP_UID must not be the agent's user")
+        if self.step_gid not in os.getgroups():
+            raise ValueError(
+                f"{step_conf}: the agent's user must be in group STEP_GID="
+                f"{self.step_gid}, or it cannot read what the steps write"
+            )
+        root = (os.getenv("BIOCHEF_RUN_ROOT", "") if run_root is None
+                else run_root).strip()
+        if not root or os.path.realpath(root) != conf["RUN_ROOT"]:
+            raise ValueError(
+                f"BIOCHEF_RUN_ROOT={root!r} must be set, and be RUN_ROOT="
+                f"{conf['RUN_ROOT']} of {step_conf}: podman-step-root runs only "
+                f"workspaces directly under it"
+            )
+        if conf["IMAGE"] != self.image:
+            raise ValueError(
+                f"BIOCHEF_CONTAINER_IMAGE={self.image!r} is not IMAGE="
+                f"{conf['IMAGE']!r} of {step_conf}, which is what the steps would "
+                f"actually run in"
+            )
+        # One place for each value. A setting the agent also has must agree with
+        # the file, or the Node card would show what the steps do not get.
+        for name, given, key in (("BIOCHEF_PODMAN_SELINUX", selinux, "SELINUX"),
+                                 ("BIOCHEF_STEP_PIDS", pids, "PIDS"),
+                                 ("BIOCHEF_STEP_MEMORY", memory, "MEMORY")):
+            value = (os.getenv(name, "") if given is None else given).strip()
+            if value and value != conf[key]:
+                raise ValueError(
+                    f"{name}={value!r} disagrees with {key}={conf[key]!r} of "
+                    f"{step_conf}; under rootful podman the file decides, so leave "
+                    f"it unset"
+                )
+        self.selinux = conf["SELINUX"]
+        self.pids = conf["PIDS"]
+        self.memory = conf["MEMORY"]
+        try:
+            allowed = subprocess.run(["sudo", "-n", "-l", self.helper],
+                                     capture_output=True, timeout=30, check=False)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise ValueError(f"rootful podman needs sudo: {error}") from None
+        if allowed.returncode != 0:
+            raise ValueError(
+                f"sudo does not let this user run {self.helper} without a "
+                f"password; rootful podman needs exactly that rule, see the README"
+            )
+        # Group-writable for the steps' group, and nobody else, in what snakemake
+        # creates while the run goes on.
+        self.umask = 0o007
+
+    @property
+    def isolates_network(self) -> bool:
+        return True
+
+    def describe(self) -> str:
+        if self.mode == "rootful":
+            return (f"{self.name} rootful ({self.image}, steps as "
+                    f"{self.step_uid}:{self.step_gid})")
+        return f"{self.name} ({self.image})"
+
+    def snakefile_preamble(self) -> str:
+        step = os.path.join(os.path.dirname(os.path.abspath(__file__)), "podman-step")
+        settings = {"BIOCHEF_PODMAN_MODE": self.mode}
+        if self.mode == "rootful":
+            settings["BIOCHEF_PODMAN_HELPER"] = self.helper
+        else:
+            settings.update({"BIOCHEF_PODMAN_IMAGE": self.image,
+                             "BIOCHEF_PODMAN_SELINUX": self.selinux,
+                             "BIOCHEF_STEP_PIDS": self.pids,
+                             "BIOCHEF_STEP_MEMORY": self.memory})
+        lines = "".join(f"_os.environ[{json.dumps(key)}] = {json.dumps(value)}\n"
+                        for key, value in settings.items())
+        # bash's strict prefix is what snakemake would have set, and it sets that
+        # only for an executable named bash.
+        return (f"import os as _os\n"
+                f"{lines}"
+                f"shell.executable({json.dumps(step)})\n"
+                f"shell.prefix(\"set -euo pipefail; \")\n")
+
+    def command(self, ws) -> List[str]:
+        return ["snakemake", "--cores", "4",
+                "-s", os.path.join(ws.path, "Snakefile"),
+                "-d", ws.path]
+
+    def before_run(self, ws) -> None:
+        """Rootful only: give the steps' group what the agent placed in the run.
+
+        The steps run as another user, so the workspace and everything in it go to
+        group STEP_GID, with the group's permissions copied from the owner's, and
+        the directories set-group-ID so that what snakemake and the steps create
+        stays in that group. Nothing outside the workspace changes.
+        """
+        if self.mode != "rootful":
+            return
+        for top, dirs, files in os.walk(ws.path):
+            os.chown(top, -1, self.step_gid, follow_symlinks=False)
+            os.chmod(top, 0o2770)
+            for name in files:
+                path = os.path.join(top, name)
+                if os.path.islink(path):
+                    continue
+                os.chown(path, -1, self.step_gid, follow_symlinks=False)
+                mode = os.stat(path, follow_symlinks=False).st_mode & 0o700
+                os.chmod(path, mode | (mode >> 3))
+
+    def after_run(self, ws) -> None:
+        if self.mode == "rootful":
+            # Removes the run's containers and gives the workspace back to the
+            # agent, whatever modes the steps left on what they wrote.
+            try:
+                subprocess.run(["sudo", "-n", self.helper, "finish", ws.path],
+                               capture_output=True, timeout=120, check=False)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            return
+        label = f"label=biochef.run={os.path.basename(ws.path)}"
+        try:
+            found = subprocess.run(
+                ["podman", "ps", "--all", "--quiet", "--filter", label],
+                capture_output=True, text=True, timeout=30, check=False)
+            names = found.stdout.split()
+            if names:
+                subprocess.run(["podman", "rm", "--force", *names],
+                               capture_output=True, timeout=30, check=False)
+        except (OSError, subprocess.SubprocessError):
+            # A leftover container costs little, and the run has its result.
+            pass
+
+
 PROVIDERS = {
     SubprocessRunner.name: SubprocessRunner,
     ApptainerRunner.name: ApptainerRunner,
+    PodmanRunner.name: PodmanRunner,
 }
 
 

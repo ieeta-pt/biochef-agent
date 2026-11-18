@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Runs one Snakemake step in a container. Snakemake has no podman mode, so
+# PodmanRunner makes this script the shell its rules run under, and each rule's
+# command arrives here as `-c <command>`, in the run's workspace.
+#
+# --network=none is here and not a setting: a step reaches nothing, whatever the
+# deployment says. Nothing of the agent's environment is passed in, and only this
+# workspace is mounted, so a step sees neither credentials nor another run. The
+# root filesystem is read-only, and the number of processes and the memory, with
+# no swap past it, are limited.
+#
+# BIOCHEF_PODMAN_MODE says how podman runs:
+#   rootless  podman as the agent's user, which the step keeps
+#   rootful   podman as root, through podman-step-root and one sudo rule; the
+#             step runs as a dedicated user, and every value comes from that
+#             script's own configuration, which only root can change
+#
+# The label is how PodmanRunner finds a container that outlives a killed run.
+#
+# Every value has no default and PodmanRunner refuses to start without it; this
+# refuses too, so a step never runs on a guess.
+set -euo pipefail
+
+die() {
+    echo "podman-step: $*" >&2
+    exit 2
+}
+
+if [ "$#" -ne 2 ] || [ "$1" != "-c" ]; then
+    die "expects: -c <command>"
+fi
+
+case "${BIOCHEF_PODMAN_MODE:-}" in
+    rootful)
+        exec sudo -n -- "${BIOCHEF_PODMAN_HELPER:?}" run "$PWD" "$2" </dev/null
+        ;;
+    rootless) ;;
+    *) die "BIOCHEF_PODMAN_MODE must be rootless or rootful" ;;
+esac
+
+case "${BIOCHEF_PODMAN_SELINUX:-}" in
+    disable) selinux=(--security-opt=label=disable) ;;
+    keep) selinux=() ;;
+    *) die "BIOCHEF_PODMAN_SELINUX must be disable or keep" ;;
+esac
+[[ "${BIOCHEF_STEP_PIDS:-}" =~ ^[1-9][0-9]{0,6}$ ]] ||
+    die "BIOCHEF_STEP_PIDS must be a positive number"
+[[ "${BIOCHEF_STEP_MEMORY:-}" =~ ^[1-9][0-9]{0,9}[kmg]$ ]] ||
+    die "BIOCHEF_STEP_MEMORY must be a size such as 4g"
+
+exec podman run --rm --init --pull=missing \
+    --network=none \
+    --userns=keep-id \
+    --cap-drop=all \
+    --security-opt=no-new-privileges \
+    ${selinux[@]+"${selinux[@]}"} \
+    --read-only \
+    --pids-limit "$BIOCHEF_STEP_PIDS" \
+    --memory "$BIOCHEF_STEP_MEMORY" \
+    --memory-swap "$BIOCHEF_STEP_MEMORY" \
+    --label "biochef.run=$(basename "$PWD")" \
+    --volume "$PWD:$PWD" \
+    --workdir "$PWD" \
+    "${BIOCHEF_PODMAN_IMAGE:?}" \
+    bash -c "$2" </dev/null
