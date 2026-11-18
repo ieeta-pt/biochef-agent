@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Run</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;500&amp;family=Roboto:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#F5F5F5}
+a{color:#00796B}a:hover{color:#00574B}
+.tab{display:flex;justify-content:space-between;align-items:center;gap:8px;min-height:44px;padding:0 12px;border-radius:6px;color:#FFFFFF;text-decoration:none;font-size:15px;border-left:3px solid transparent}
+.tab:hover{background:rgba(255,255,255,.1);color:#FFFFFF}
+.on{background:rgba(255,255,255,.16);border-left-color:#FFFFFF;font-weight:500}
+.count{background:#FFFFFF;color:#00796B;border-radius:10px;padding:0 8px;font-size:12px;font-weight:700}
+.mono{font-family:'Roboto Mono',ui-monospace,monospace}
+.btn{min-height:44px;padding:0 16px;border-radius:6px;font:inherit;font-size:14px;font-weight:500;cursor:pointer}
+.card{background:#FFFFFF;border:1px solid #E0E0E0;border-radius:8px}
+.lbl{margin:0;font-size:12px;font-weight:500;color:#4A5260;letter-spacing:.06em;text-transform:uppercase}
+.pill{display:inline-block;font-size:12px;font-weight:500;border-radius:4px;padding:2px 8px}
+.p-ok{color:#1E6B3A;background:#E7F3EB}.p-warn{color:#BF360C;background:#FBE9E7}.p-bad{color:#B3261E;background:#FCE8E6}.p-info{color:#00574B;background:#E0F2F1}.p-mute{color:#4A5260;background:#EEEEEE}
+.stage{flex:1 1 200px;box-sizing:border-box;border-radius:8px;padding:14px;display:flex;flex-direction:column;gap:6px;font-size:13px}
+.row{display:grid;grid-template-columns:1.4fr 0.6fr 2fr;gap:12px;padding:10px 12px;border-top:1px solid #EEEEEE;align-items:center}
+.kv{display:grid;grid-template-columns:180px 1fr;gap:12px;padding:8px 0;border-top:1px solid #EEEEEE}
+</style>
+</helmet>
+<div style="min-height: 100vh; display: flex; flex-wrap: wrap; font-family: Roboto, Helvetica, Arial, sans-serif; color: #14181F; background: #F5F5F5">
+<nav aria-label="Agent" style="flex: 1 1 232px; box-sizing: border-box; background: #00796B; color: #FFFFFF; padding: 20px 12px; display: flex; flex-direction: column; gap: 24px">
+<div style="display: flex; flex-direction: column; gap: 10px; padding: 0 12px">
+<img src="/_blob/6a838395830c80e9f97a717df03289ea" alt="BioChef" style="width: 96px; height: auto">
+<span style="align-self: flex-start; font-size: 13px; font-weight: 500; padding: 3px 10px; border: 1px solid rgba(255,255,255,.45); border-radius: 999px; background: rgba(255,255,255,.12)">Agent · IST TRE (test)</span>
+</div>
+<div style="display: flex; flex-direction: column; gap: 2px">
+<a class="tab" href="Main.dc.html">Inbox <span class="count">3</span></a>
+<a class="tab" href="Study.dc.html">Studies</a>
+<a class="tab on" href="Requests.dc.html" aria-current="page">Requests <span class="count">2 refused</span></a>
+<a class="tab" href="Datasets.dc.html">Datasets</a>
+<a class="tab" href="Node.dc.html">Node</a>
+</div>
+<div style="margin-top: auto; display: flex; flex-direction: column; gap: 6px; padding: 0 12px; font-size: 12px; color: #E0F2F1">
+<span style="display: flex; align-items: center; gap: 8px"><span aria-hidden="true" style="width: 8px; height: 8px; border-radius: 4px; background: #B9F6CA"></span>Coordinator polled 12 s ago</span>
+<a href="#" style="color: #FFFFFF">Open Policy Engine ↗</a>
+<span>Signed in through the TRE · j.silva</span>
+</div>
+</nav>
+
+<main style="flex: 999 1 560px; min-width: 0; box-sizing: border-box; padding: 32px; display: flex; flex-direction: column; gap: 20px">
+<nav aria-label="Breadcrumb" style="font-size: 14px; display: flex; gap: 8px; flex-wrap: wrap"><a href="Requests.dc.html">Requests</a><span aria-hidden="true" style="color: #757575">/</span><span class="mono">req_8f21</span></nav>
+<header style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 16px">
+<div style="display: flex; flex-direction: column; gap: 6px">
+<h1 style="margin: 0; font-size: 26px; font-weight: 500">Run of req_8f21</h1>
+<span style="font-size: 13px; color: #5B6472">CARDIO-PT cohort v2 · gwas-qc 1.3.2 · requested by Rui Matos · 5 Nov 09:58 to 11:30</span>
+</div>
+<div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center"><span class="pill p-ok" style="font-size: 13px; padding: 4px 10px">COMPLETE</span><span class="pill" style="{{ egressPill }}">{{ egressLabel }}</span></div>
+</header>
+
+<section aria-label="Steps" class="card" style="padding: 18px 24px; overflow-x: auto">
+<div style="display: flex; align-items: center; min-width: max-content; font-size: 12px">
+<sc-for list="{{ steps }}" as="s" hint-placeholder-count="4">
+<sc-if value="{{ s.arrow }}" hint-placeholder-val="{{ true }}"><svg aria-hidden="true" width="36" height="12" viewBox="0 0 36 12"><line x1="2" y1="6" x2="28" y2="6" stroke="#505050" stroke-width="1.5"></line><polygon points="28,2 34,6 28,10" fill="#505050"></polygon></svg></sc-if>
+<div style="width: 140px; box-sizing: border-box; padding: 10px; border: 2px solid #43A047; border-radius: 8px; background: #FFFFFF; text-align: center; display: flex; flex-direction: column; gap: 2px"><span style="font-weight: 500; font-size: 13px">{{ s.name }}</span><span style="color: #1E6B3A">COMPLETE · {{ s.time }}</span></div>
+</sc-for>
+</div>
+</section>
+
+<div role="tablist" aria-label="Run sections" style="display: flex; gap: 4px; border-bottom: 1px solid #E0E0E0">
+<button class="btn" role="tab" aria-selected="{{ t0 }}" onClick="{{ show0 }}" style="{{ s0 }}">Egress</button>
+<button class="btn" role="tab" aria-selected="{{ t1 }}" onClick="{{ show1 }}" style="{{ s1 }}">Logs</button>
+<button class="btn" role="tab" aria-selected="{{ t2 }}" onClick="{{ show2 }}" style="{{ s2 }}">Manifest</button>
+</div>
+
+<sc-if value="{{ t0 }}" hint-placeholder-val="{{ true }}">
+<div style="display: flex; flex-direction: column; gap: 20px">
+<section aria-label="Egress steps" style="display: flex; flex-wrap: wrap; gap: 12px">
+<div class="stage" style="background: #E7F3EB; color: #1E6B3A"><span class="lbl" style="color: #1E6B3A">1 · Output rules</span><span>2 files pass, 1 held back</span><a href="#" style="font-size: 12px">Details in the Policy Engine ↗</a></div>
+<sc-if value="{{ airlock }}" hint-placeholder-val="{{ true }}">
+<div class="stage" style="background: #FBE9E7; color: #BF360C"><span class="lbl" style="color: #BF360C">2 · TRE airlock</span><span>Handed to the airlock 11:31</span><span>Waiting for the TRE's decision</span></div>
+</sc-if>
+<sc-if value="{{ manual }}" hint-placeholder-val="{{ false }}">
+<div class="stage" style="{{ manualStage }}"><span class="lbl" style="color: inherit">2 · Review in the agent</span><span>{{ manualText }}</span></div>
+</sc-if>
+<div class="stage" style="{{ encStage }}"><span class="lbl" style="color: inherit">3 · Encrypt and sign</span><span>For Rui Matos, x25519:e9a2…0b13</span><span>Signed with the node key</span></div>
+<div class="stage" style="{{ sentStage }}"><span class="lbl" style="color: inherit">4 · Sent to coordinator</span><span>{{ sentText }}</span></div>
+</section>
+
+<section aria-label="Output files" class="card" style="overflow-x: auto">
+<div style="min-width: 560px; font-size: 13px">
+<div class="row" style="background: #FAFAFA; color: #4A5260; font-weight: 500; border-top: 0"><span>File</span><span>Size</span><span>Output rules</span></div>
+<div class="row"><span class="mono">assoc_summary.tsv</span><span>412 KB</span><span style="color: #1E6B3A">✓ aggregate, smallest cell 23</span></div>
+<div class="row"><span class="mono">manhattan.png</span><span>1.8 MB</span><span style="color: #1E6B3A">✓ allowed type</span></div>
+<div class="row" style="background: #FBE9E7"><span class="mono">qc_log.txt</span><span>96 KB</span><span style="color: #BF360C; font-weight: 500">held back · type not allowed by the study</span></div>
+</div>
+</section>
+
+<sc-if value="{{ manualOpen }}" hint-placeholder-val="{{ false }}">
+<section aria-label="Review" class="card" style="padding: 18px 20px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center">
+<button class="btn" onClick="{{ release }}" style="background: #00796B; color: #FFFFFF; border: 0">Release 2 files and sign</button>
+<button class="btn" onClick="{{ withhold }}" style="background: #FFFFFF; color: #B3261E; border: 1px solid #B3261E">Withhold and sign</button>
+<span style="font-size: 13px; color: #5B6472">This node reviews egress in the agent, because the TRE has no airlock</span>
+</section>
+</sc-if>
+<sc-if value="{{ manualDone }}" hint-placeholder-val="{{ false }}">
+<div role="status" style="display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; align-items: center; background: #FAFAFA; border: 1px solid #E0E0E0; border-radius: 8px; padding: 12px 16px; font-size: 14px"><span>{{ manualText }}</span><button class="btn" onClick="{{ reset }}" style="background: transparent; border: 0; color: #00796B; text-decoration: underline">Undo before the next poll</button></div>
+</sc-if>
+<p style="margin: 0; font-size: 13px; color: #5B6472">Outputs stay on this node until egress is decided, then follow the retention setting on the Node page.</p>
+</div>
+</sc-if>
+
+<sc-if value="{{ t1 }}" hint-placeholder-val="{{ false }}">
+<section aria-label="Logs" class="card" style="display: flex; flex-direction: column">
+<div style="padding: 10px 16px; border-bottom: 1px solid #E0E0E0; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between">
+<div style="display: flex; flex-wrap: wrap; gap: 4px">
+<sc-for list="{{ logTabs }}" as="l" hint-placeholder-count="5">
+<button class="btn" onClick="{{ l.pick }}" aria-pressed="{{ l.on }}" style="{{ l.style }}">{{ l.label }}</button>
+</sc-for>
+</div>
+<button class="btn" style="background: #FFFFFF; color: #00796B; border: 1px solid #BDBDBD">Download</button>
+</div>
+<div class="mono" style="background: #1E2329; color: #E6E9EE; font-size: 12.5px; line-height: 1.7; padding: 14px 20px; overflow-x: auto; white-space: pre; min-height: 260px">{{ logText }}</div>
+<div style="padding: 10px 16px; border-top: 1px solid #E0E0E0; font-size: 13px; color: #5B6472">The run log is live while the run goes. Each step's log appears when the run ends. Logs never leave this node.</div>
+</section>
+</sc-if>
+
+<sc-if value="{{ t2 }}" hint-placeholder-val="{{ false }}">
+<section aria-label="Manifest" class="card" style="padding: 18px 24px; display: flex; flex-direction: column; font-size: 13px">
+<div class="kv" style="border-top: 0"><span style="color: #4A5260">Workflow</span><span class="mono">gwas-qc 1.3.2 · sha256:2a77…c5e8</span></div>
+<div class="kv"><span style="color: #4A5260">Tools</span><span class="mono" style="white-space: pre-line">plink2 sha256:a1d9…3e02
+bcftools sha256:77c4…b1aa
+regenie sha256:c3b8…5f61
+biochef-report sha256:19fa…d7c0</span></div>
+<div class="kv"><span style="color: #4A5260">Inputs</span><span class="mono">EGAD00001009912 · 42 files · sha256:8e0b…12aa</span></div>
+<div class="kv"><span style="color: #4A5260">Outputs</span><span class="mono" style="white-space: pre-line">assoc_summary.tsv sha256:f3e1…0c9d
+manhattan.png sha256:7a44…be10
+qc_log.txt sha256:0bd2…5e71</span></div>
+<div class="kv"><span style="color: #4A5260">Runner</span><span class="mono">apptainer · exit code 0</span></div>
+<div class="kv"><span style="color: #4A5260">Build evidence</span><span>biochef.build-evidence.v1 from the hub, by reference</span></div>
+<a href="#" style="margin-top: 10px; font-size: 14px">Download run.json</a>
+</section>
+</sc-if>
+</main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"egressMode":{"editor":"enum","options":["airlock","manual"],"default":"airlock"},"$preview":{"width":1440,"height":1200}}'>
+class Component extends DCLogic {
+  constructor(props) { super(props); this.state = { tab: 0, log: 0, egress: null }; }
+  renderVals() {
+    const mode = this.props.egressMode ?? 'airlock';
+    const t = this.state.tab;
+    const e = this.state.egress;
+    const st = (on) => 'min-height:44px;border:0;border-bottom:2px solid ' + (on ? '#00796B;color:#00574B' : 'transparent;color:#4A5260') + ';background:transparent;border-radius:0';
+    const steps = [['qc_samples', '9 min'], ['qc_variants', '31 min'], ['assoc', '47 min'], ['summarise', '4 min']];
+    const logs = [
+      ['Run log', '09:58:02  pull plink2@sha256:a1d9…3e02  signature ok\n09:58:05  rule qc_samples started\n10:07:11  rule qc_samples finished\n10:07:12  rule qc_variants started\n10:38:40  rule qc_variants finished\n10:38:41  rule assoc started\n11:25:57  rule assoc finished\n11:25:58  rule summarise started\n11:29:44  rule summarise finished\n11:29:45  4 of 4 steps done, exit 0'],
+      ['qc_samples', '--mind 0.05\n4 812 samples loaded, 37 removed for missingness'],
+      ['qc_variants', 'bcftools view -q 0.01:minor\n1 204 337 variants kept'],
+      ['assoc', 'regenie step 2\nphenotype ldl, 10 covariates\n1 204 337 tests done'],
+      ['summarise', 'writing assoc_summary.tsv and manhattan.png\nwriting qc_log.txt']
+    ];
+    const airlock = mode === 'airlock';
+    const released = e === 'released', withheld = e === 'withheld';
+    const done = airlock ? false : (released || withheld);
+    const grey = 'background:#F5F5F5;color:#5B6472';
+    const green = 'background:#E7F3EB;color:#1E6B3A';
+    return {
+      t0: t === 0, t1: t === 1, t2: t === 2,
+      s0: st(t === 0), s1: st(t === 1), s2: st(t === 2),
+      show0: () => this.setState({ tab: 0 }), show1: () => this.setState({ tab: 1 }), show2: () => this.setState({ tab: 2 }),
+      steps: steps.map(([name, time], i) => ({ name, time, arrow: i > 0 })),
+      airlock, manual: !airlock,
+      manualOpen: !airlock && e === null, manualDone: done,
+      manualStage: !airlock && e === null ? 'background:#FBE9E7;color:#BF360C' : (released ? green : 'background:#FCE8E6;color:#B3261E'),
+      manualText: e === null ? 'Waiting for your review' : (released ? 'Released by j.silva 11:42, signed' : 'Withheld by j.silva 11:42, signed. The requester gets no result from this node.'),
+      encStage: released ? green : grey,
+      sentStage: released ? green : grey,
+      sentText: released ? 'Posted 11:42' : 'Not yet',
+      egressLabel: airlock ? 'Egress · waiting for the airlock' : (e === null ? 'Egress · waiting for review' : (released ? 'Egress · sent' : 'Egress · withheld')),
+      egressPill: 'font-size:13px;padding:4px 10px;' + (released ? 'color:#1E6B3A;background:#E7F3EB' : (withheld ? 'color:#B3261E;background:#FCE8E6' : 'color:#BF360C;background:#FBE9E7')),
+      release: () => this.setState({ egress: 'released' }),
+      withhold: () => this.setState({ egress: 'withheld' }),
+      reset: () => this.setState({ egress: null }),
+      logTabs: logs.map(([label], i) => ({ label, on: i === this.state.log, pick: () => this.setState({ log: i }), style: 'min-height:36px;border:0;' + (i === this.state.log ? 'background:#E0F2F1;color:#00574B' : 'background:transparent;color:#4A5260') })),
+      logText: logs[this.state.log][1]
+    };
+  }
+}
+</script>
+</body>
+</html>
