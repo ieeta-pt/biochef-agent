@@ -1,4 +1,39 @@
 {% extends "base.html" %}
+{% from "partials/macros.html" import pill, status_line %}
 {% block title %}Studies{% endblock %}
 {% block heading %}Studies{% endblock %}
 {% block intro %}Each approved study version holds the workflows approved for it, and each workflow the requests it ran here.{% endblock %}
+{% block content %}
+<div class="flex flex-col items-start gap-6 wide:flex-row">
+  <section aria-label="Study list" class="flex w-full flex-col gap-2 wide:w-[320px] wide:shrink-0">
+    {% for card in cards %}
+    <div class="card flex flex-col gap-1.5 px-4 py-3.5 {{ 'card-selected' if card.selected }}">
+      <span class="flex justify-between gap-2"><a href="{{ card.href }}" class="text-[15px] font-medium text-text no-underline hover:underline" {% if card.selected %}aria-current="true"{% endif %}>{{ card.title }}</a><span class="shrink-0">{{ pill(card.pill, card.state) }}</span></span>
+      <span class="text-[13px] text-muted">{{ card.note }}</span>
+      {% if card.waiting %}<a href="{{ card.waiting.href }}" class="pill pill-warn self-start no-underline">v{{ card.waiting.version }} in Inbox</a>{% endif %}
+    </div>
+    {% else %}
+    <p class="m-0 card p-4 text-sm text-muted">No study has been approved on this node yet.</p>
+    {% endfor %}
+  </section>
+  {% if detail %}
+  <section aria-label="{{ detail.title }}" class="card flex w-full min-w-0 flex-1 flex-col">
+    <div class="flex flex-col gap-4 px-6 pt-5">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div class="flex flex-col gap-1">
+          <h2 class="m-0 text-[22px] font-medium">{{ detail.title }}</h2>
+          <span class="text-[13px] text-muted">{{ detail.subtitle }}</span>
+        </div>
+        {% if detail.can_withdraw %}
+        <div id="withdraw-area">
+          <button type="button" class="btn btn-quiet-danger" hx-get="/ui/_/studies/version/{{ detail.version_id }}/withdraw" hx-target="#withdraw-area" hx-swap="innerHTML">Withdraw approval</button>
+        </div>
+        {% endif %}
+      </div>
+      {% if detail.status %}{{ status_line(detail.status) }}{% endif %}
+    </div>
+    {% include "partials/study_tabs.html" %}
+  </section>
+  {% endif %}
+</div>
+{% endblock %}

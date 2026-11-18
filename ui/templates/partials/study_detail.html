@@ -1,0 +1,107 @@
+{% from "partials/macros.html" import pill, status_line, diff %}
+<section aria-label="{{ detail.title }}" class="card flex flex-col">
+  <div class="flex flex-wrap items-center justify-between gap-3 border-b border-line px-6 py-5">
+    <div class="flex flex-col gap-1">
+      <h2 class="m-0 text-xl font-medium">{{ detail.title }}</h2>
+      {% if detail.compared %}
+      <span class="text-[13px] text-muted">Compared with <a href="{{ detail.compared.href }}">v{{ detail.compared.version }}, approved {{ detail.compared.when }}</a></span>
+      {% elif detail.pending %}
+      <span class="text-[13px] text-muted">New study</span>
+      {% endif %}
+    </div>
+    <span class="flex flex-wrap items-center gap-2">
+      {% if not detail.pending %}{{ pill(detail.state_pill, detail.state_label) }}{% endif %}
+      <span class="pill pill-info">Proposed by {{ detail.proposer }}</span>
+    </span>
+  </div>
+  <div class="flex flex-col gap-5 px-6 py-5">
+    {% if detail.status %}{{ status_line(detail.status) }}{% endif %}
+    {% if detail.pending and detail.failed %}
+    <div role="alert" class="flex flex-col gap-1 rounded-control bg-bad-soft p-4 text-sm text-bad">
+      <strong class="font-medium">This version cannot be approved</strong>
+      {% for member in detail.failed %}
+      <span>{{ member.label }}: {{ member.error }}. Ask the proposer to register these keys again.</span>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <div class="flex flex-col gap-2.5">
+      <input id="show-keys-{{ detail.id }}" type="checkbox" class="keys-toggle sr-only">
+      <div class="flex min-h-8 items-center justify-between gap-3">
+        <h3 class="lbl">Members</h3>
+        <label for="show-keys-{{ detail.id }}" class="cursor-pointer text-[13px] text-brand-strong underline"><span class="keys-show">Show keys</span><span class="keys-hide">Hide keys</span></label>
+      </div>
+      <div class="rounded-control border border-line-soft text-sm">
+        {% for member in detail.members %}
+        <div class="border-t border-line-soft px-3 py-2.5 first:border-t-0 {{ 'bg-bad-soft' if not member.verified else ('bg-ok-soft' if member.new) }}">
+          <div class="flex flex-wrap justify-between gap-3">
+            <span>{% if member.new %}<span class="mr-1.5 font-bold text-ok">+</span>{% endif %}{{ member.label }}{% if member.proposer %} · proposer{% endif %}{% if member.new %} · new{% endif %}</span>
+            {% if member.verified %}<span class="text-ok">✓ identity verified</span>{% else %}<span class="font-medium text-bad">✗ identity not verified</span>{% endif %}
+          </div>
+          {% if member.key_text %}<div class="key-line mono mt-1 text-xs text-label">{{ member.key_text }}</div>{% endif %}
+        </div>
+        {% endfor %}
+        {% for label in detail.removed %}
+        <div class="border-t border-line-soft bg-bad-soft px-3 py-2.5"><span class="mr-1.5 font-bold text-bad">−</span>{{ label }} · removed</div>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="grid grid-cols-[repeat(auto-fit,minmax(200px,1fr))] gap-5">
+      <div class="flex flex-col gap-2">
+        <h3 class="lbl">Datasets on this node</h3>
+        {% for dataset in detail.datasets %}
+        <span class="text-sm">{{ dataset.id }}</span>
+        {% if dataset.bound %}
+        <span class="text-[13px] text-ok">✓ bound to local data · <a href="/ui/datasets">Datasets</a></span>
+        {% else %}
+        <span class="text-[13px] text-warn">Not bound to local data yet · <a href="/ui/datasets">Bind it</a></span>
+        {% endif %}
+        {% endfor %}
+        <span class="text-[13px] text-label">{% if settings.required_visa %}Visa required · {{ settings.required_visa }}{% else %}No visa required by this node{% endif %}</span>
+      </div>
+      <div class="flex flex-col gap-2">
+        <h3 class="lbl">Nodes</h3>
+        <span class="text-sm">{{ detail.nodes.names }}</span>
+        <span class="text-[13px] text-{{ detail.nodes.check[0] }}">{% if detail.nodes.check[0] == 'ok' %}✓ {% endif %}{{ detail.nodes.check[1] }}</span>
+      </div>
+      <div class="flex flex-col gap-2">
+        <h3 class="lbl">Result recipients</h3>
+        <span class="text-sm">{{ detail.recipients }}</span>
+        {% if detail.recipients_note %}<span class="text-[13px] text-label">{{ detail.recipients_note }}</span>{% endif %}
+      </div>
+    </div>
+
+    <div class="flex flex-col gap-2.5">
+      <h3 class="lbl">Output rules{% if detail.rules_changed %} · changed{% endif %}</h3>
+      {{ diff(detail.rule_lines) }}
+      {% if detail.pending %}
+      <span class="text-[13px] {{ 'text-ok' if detail.verdict and detail.verdict.acceptable else ('text-warn' if detail.verdict else 'text-muted') }}">
+        {% if detail.verdict %}{{ detail.verdict.name }} · {{ detail.verdict.text }}.{% else %}Policy Engine not connected yet.{% endif %}
+        {% if settings.policy_engine_url %}<a href="{{ settings.policy_engine_url }}" target="_blank" rel="noopener noreferrer">See why in the Policy Engine ↗</a>{% endif %}
+      </span>
+      {% endif %}
+    </div>
+
+    {% if detail.pending %}
+    <div id="decision-fields" class="flex flex-col gap-4">
+      {% if not detail.blockers %}
+      <div class="flex flex-col gap-2 rounded-control bg-head px-4 py-3.5">
+        <h3 class="lbl">Before approving</h3>
+        <label class="flex min-h-11 items-center gap-2.5 text-sm"><input type="checkbox" name="dac_confirmed" class="size-5"> The data access committee has granted access for this study</label>
+      </div>
+      {% endif %}
+      <div class="flex flex-col gap-3 border-t border-line pt-5">
+        <label for="comment" class="text-[13px] font-medium">Comment for the proposer (optional)</label>
+        <textarea id="comment" name="comment" rows="2" maxlength="2000" class="input"></textarea>
+      </div>
+    </div>
+    <div class="flex flex-wrap items-center gap-3">
+      <button type="button" class="btn btn-primary" {% if detail.blockers %}disabled{% else %}hx-post="/ui/_/inbox/study/{{ detail.id }}/approve" hx-include="#decision-fields" hx-target="#decision-error" hx-swap="innerHTML"{% endif %}>Approve and sign</button>
+      <button type="button" class="btn btn-danger" hx-post="/ui/_/inbox/study/{{ detail.id }}/refuse" hx-include="#decision-fields [name=comment]" hx-target="#decision-error" hx-swap="innerHTML">Refuse and sign</button>
+      {% if not detail.blockers %}<span class="text-xs text-muted">{{ detail.approve_note }}</span>{% endif %}
+    </div>
+    {% for blocker in detail.blockers %}{% if 'identity not verified' not in blocker %}<p class="m-0 text-[13px] text-bad">{{ blocker }}</p>{% endif %}{% endfor %}
+    <div id="decision-error"></div>
+    {% endif %}
+  </div>
+</section>

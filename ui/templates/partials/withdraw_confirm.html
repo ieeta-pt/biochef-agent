@@ -1,0 +1,4 @@
+<div class="flex flex-wrap items-center gap-3">
+  <span class="text-[13px] text-bad">Withdraw v{{ version }}? Its requests are refused from now on.</span>
+  <button type="button" class="btn btn-danger" hx-post="/ui/_/studies/version/{{ version_id }}/withdraw" hx-target="#withdraw-area" hx-swap="beforeend">Withdraw and sign</button>
+</div>

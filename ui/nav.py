@@ -1,8 +1,4 @@
-"""What the sidebar shows.
-
-The counts stay empty until the screens that own them exist (part 4), and this
-does not import the store: a shell with no database behind it still has to open.
-"""
+"""The sidebar's items. Their counts come from ui/views.py."""
 
 from dataclasses import dataclass
 
@@ -21,3 +17,7 @@ ITEMS = (
     Item("Datasets", "/ui/datasets"),
     Item("Node", "/ui/node"),
 )
+
+
+def items(counts):
+    return [Item(item.label, item.href, counts.get(item.label)) for item in ITEMS]

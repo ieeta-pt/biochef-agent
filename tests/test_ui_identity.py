@@ -5,9 +5,8 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from store.repo import MAX_NAME_LENGTH
-from tests.ui_support import (LOOPBACK, PAGES, PROXY, USER_HEADER, client_for,
-                              dev_settings, header_settings, proxy_client)
-from ui.app import create_app
+from tests.ui_support import (LOOPBACK, PAGES, PROXY, USER_HEADER, app_for,
+                              client_for, dev_settings, header_settings, proxy_client)
 from ui.identity import MAX_USER_LENGTH, WEBSOCKET_REFUSED, who
 
 
@@ -143,7 +142,7 @@ def test_a_trusted_request_is_served():
 
 def with_a_websocket(settings):
     """An app with a websocket route, which the shell does not have yet."""
-    app = create_app(settings)
+    app = app_for(settings)
 
     @app.websocket("/ui/_/socket")
     async def socket(websocket: WebSocket):  # unannotated, FastAPI reads a query parameter

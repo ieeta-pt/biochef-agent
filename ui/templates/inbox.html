@@ -2,3 +2,11 @@
 {% block title %}Inbox{% endblock %}
 {% block heading %}Inbox{% endblock %}
 {% block intro %}Study and workflow versions waiting for this node. Requests under an approved study and workflow are not listed here: the agent checks and runs them by itself, and shows the refused ones under Requests.{% endblock %}
+{% block content %}
+<div class="flex flex-col items-start gap-6 wide:flex-row">
+  {% include "partials/inbox_list.html" %}
+  <div id="detail" class="w-full min-w-0 flex-1">
+    {% if detail %}{% include "partials/study_detail.html" %}{% endif %}
+  </div>
+</div>
+{% endblock %}
