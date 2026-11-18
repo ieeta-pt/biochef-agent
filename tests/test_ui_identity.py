@@ -1,10 +1,13 @@
 """Who is using the page, and every way the answer cannot be believed (section 4)."""
 
 import pytest
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from tests.ui_support import (LOOPBACK, PAGES, PROXY, USER_HEADER, client_for,
-                              dev_settings, header_settings, proxy_client)
-from ui.identity import who
+from store.repo import MAX_NAME_LENGTH
+from tests.ui_support import (LOOPBACK, PAGES, PROXY, USER_HEADER, app_for,
+                              client_for, dev_settings, header_settings, proxy_client)
+from ui.identity import MAX_USER_LENGTH, WEBSOCKET_REFUSED, who
 
 
 def scope(address=PROXY, headers=()):
@@ -62,10 +65,17 @@ def test_no_usable_address_is_no_trust(address):
     [named(b"j\x7fsilva")],
     [named("j silva".encode())],
     [named(b"\xff\xfe")],
+    [named(b"a" * (MAX_USER_LENGTH + 1))],
 ], ids=["absent", "other", "empty", "blank", "repeated", "nul", "newline", "escape",
-        "delete", "separator", "not-utf8"])
+        "delete", "separator", "not-utf8", "too-long"])
 def test_a_header_that_cannot_be_believed(headers):
     assert who(scope(headers=headers), header_settings()) is None
+
+
+def test_a_name_may_be_as_long_as_the_store_allows():
+    name = "a" * MAX_USER_LENGTH
+    assert who(scope(headers=[named(name.encode())]), header_settings()) == name
+    assert MAX_USER_LENGTH == MAX_NAME_LENGTH
 
 
 # Dev mode
@@ -125,3 +135,39 @@ def test_the_refusal_says_nothing_about_who_is_trusted():
 
 def test_a_trusted_request_is_served():
     assert proxy_client().get(PAGES[0]).status_code == 200
+
+
+# Websockets and lifespan
+
+
+def with_a_websocket(settings):
+    """An app with a websocket route, which the shell does not have yet."""
+    app = app_for(settings)
+
+    @app.websocket("/ui/_/socket")
+    async def socket(websocket: WebSocket):  # unannotated, FastAPI reads a query parameter
+        await websocket.accept()
+        await websocket.send_text("served")
+        await websocket.close()
+
+    return app
+
+
+@pytest.mark.parametrize("path", ["/ui/_/socket", "/ui/static/app.css", PAGES[0]])
+@pytest.mark.parametrize("who_asks", ["dev", "untrusted", "trusted proxy"])
+def test_a_websocket_is_closed_for_everyone(path, who_asks):
+    settings, address, headers = {
+        "dev": (dev_settings(), LOOPBACK, {}),
+        "untrusted": (header_settings(), "10.9.9.9", {USER_HEADER: "j.silva"}),
+        "trusted proxy": (header_settings(), PROXY, {USER_HEADER: "j.silva"}),
+    }[who_asks]
+    client = TestClient(with_a_websocket(settings), client=(address, 50000))
+    with pytest.raises(WebSocketDisconnect) as closed:
+        with client.websocket_connect(path, headers=headers):
+            pass
+    assert closed.value.code == WEBSOCKET_REFUSED
+
+
+def test_lifespan_still_reaches_the_app():
+    with client_for(dev_settings()) as client:  # runs startup and shutdown
+        assert client.get(PAGES[0]).status_code == 200
