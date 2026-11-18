@@ -88,6 +88,28 @@ def test_joined_rows_go_and_the_rest_keep_their_verdict(tmp_path):
             connection.exec_driver_sql("UPDATE request SET verdict = 'joined'")
 
 
+def test_a_list_kept_before_expiry_counts_as_expired(tmp_path):
+    """0005: a list with no expiry is given the moment it was received, so the
+    node waits for a current one rather than trusting it for ever."""
+    url = f"sqlite:///{tmp_path}/old.db"
+    migrate.upgrade(url, "0004")
+    engine = db.make_engine(url)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO federation_list (version, raw, signature, nodes, received_at) "
+            "VALUES (14, x'00', 'sig', '[]', '2026-01-01 00:00:00')")
+    migrate.upgrade(url)
+    with engine.connect() as connection:
+        rows = connection.exec_driver_sql(
+            "SELECT version, expires_at, received_at FROM federation_list").all()
+    assert rows == [(14, "2026-01-01 00:00:00", "2026-01-01 00:00:00")]
+    with pytest.raises(Exception, match="NOT NULL"):
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "INSERT INTO federation_list (version, raw, signature, nodes, "
+                "received_at) VALUES (15, x'00', 'sig', '[]', '2026-01-02 00:00:00')")
+
+
 def test_a_password_with_a_percent_sign_reaches_alembic():
     config = migrate._config("postgresql://u:p%40ss@host/db")
     assert config.get_main_option("sqlalchemy.url") == "postgresql://u:p%40ss@host/db"

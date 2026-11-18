@@ -823,7 +823,7 @@ def test_a_task_the_database_cannot_keep_does_not_run(api, monkeypatch):
 def test_a_database_at_an_older_schema_stops_the_listener(world, capsys, monkeypatch):
     from store import migrate
     from tesapi.__main__ import main
-    migrate.downgrade(world.values["BIOCHEF_DB_URL"], "0005")
+    migrate.downgrade(world.values["BIOCHEF_DB_URL"], "0006")
     for key, value in world.values.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("BIOCHEF_RUNNER", "subprocess")
@@ -922,7 +922,7 @@ def test_the_database_refuses_a_state_that_is_not_a_tes_state(world):
 def test_a_listener_started_on_an_older_schema_does_not_take_requests(world):
     from store import migrate
     from tesapi import records
-    migrate.downgrade(world.values["BIOCHEF_DB_URL"], "0005")
+    migrate.downgrade(world.values["BIOCHEF_DB_URL"], "0006")
     app = create_app(world.config(), RecordingRunner())
     with pytest.raises(records.RecordError, match="schema is not current"):
         with TestClient(app):

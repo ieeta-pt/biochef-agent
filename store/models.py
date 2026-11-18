@@ -323,6 +323,7 @@ class FederationList(SQLModel, table=True):
     raw: bytes = _raw()
     signature: str = Field(sa_column=Column(Text, nullable=False))
     nodes: List[Any] = _json()
+    expires_at: datetime = _moment(nullable=False)
     received_at: datetime = _moment(nullable=False)
 
 
@@ -352,7 +353,7 @@ IMMUTABLE = {
     Decision: ("subject_type", "subject_id", "subject_hash", "action", "user",
                "comment", "dac_confirmed", "reason", "at", "object_raw",
                "signature"),
-    FederationList: ("version", "raw", "signature", "nodes"),
+    FederationList: ("version", "raw", "signature", "nodes", "expires_at"),
 }
 """Fields no update may touch.
 

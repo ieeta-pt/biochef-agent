@@ -1,7 +1,7 @@
 """The TES API's tasks, kept across a restart (SPEC.md, section 14.4).
 
-Revision ID: 0006
-Revises: 0005
+Revision ID: 0007
+Revises: 0006
 """
 
 from alembic import op
@@ -9,8 +9,8 @@ import sqlalchemy as sa
 import store.types
 
 
-revision = '0006'
-down_revision = '0005'
+revision = '0007'
+down_revision = '0006'
 branch_labels = None
 depends_on = None
 

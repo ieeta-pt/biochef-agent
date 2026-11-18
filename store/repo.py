@@ -826,11 +826,18 @@ def latest_federation_list(session):
                         .order_by(FederationList.version.desc())).first()
 
 
-def store_federation_list(session, *, version, raw, signature, nodes, now=None):
+def site_list_expired(session, now):
+    """Whether the newest site list has expired. False when there is none yet."""
+    latest = latest_federation_list(session)
+    return latest is not None and latest.expires_at <= now
+
+
+def store_federation_list(session, *, version, raw, signature, nodes, expires_at,
+                          now=None):
     """Keep a signed site list, refusing one older than the newest stored.
 
     Going backwards is how a removed node would come back. Verifying the
-    signature is the caller's job; this only keeps what passed.
+    signature and the expiry is the caller's job; this only keeps what passed.
     """
     latest = latest_federation_list(session)
     if latest is not None:
@@ -842,7 +849,8 @@ def store_federation_list(session, *, version, raw, signature, nodes, now=None):
                 raise Conflict(f"site list v{version} differs from the one stored")
             return latest
     row = FederationList(version=version, raw=raw, signature=signature,
-                         nodes=nodes, received_at=now or utcnow())
+                         nodes=nodes, expires_at=expires_at,
+                         received_at=now or utcnow())
     session.add(row)
     session.flush()
     return row

@@ -805,12 +805,17 @@ def _network_check(session, settings):
                                    f"{status.network_check_detail}"}
 
 
-def _federation_card(session):
+def _federation_card(session, now):
     latest = repo.latest_federation_list(session)
     if latest is None:
         return {"kind": "mute", "headline": "No signed site list yet", "detail": None}
-    return {"kind": "ok", "headline": "Up to date",
-            "detail": f'{compare.plural(len(latest.nodes), "node")} · list v{latest.version}'}
+    detail = f'{compare.plural(len(latest.nodes), "node")} · list v{latest.version}'
+    if latest.expires_at <= now:
+        # Requests wait unchecked until a current list arrives (7.4).
+        return {"kind": "bad",
+                "headline": f"Expired since {fmt.minute(latest.expires_at)}",
+                "detail": f"{detail} · requests wait unchecked"}
+    return {"kind": "ok", "headline": "Up to date", "detail": detail}
 
 
 def _span(seconds):
@@ -970,7 +975,7 @@ def node_page(session, settings, keys, events, now):
         "signing": keys.signing_fingerprint, "encryption": keys.encryption_fingerprint,
         "signing_short": short_fingerprint(keys.signing_fingerprint),
         "encryption_short": short_fingerprint(keys.encryption_fingerprint),
-        "federation": _federation_card(session),
+        "federation": _federation_card(session, now),
         "coordinator": _coordinator_card(session, settings, now),
         "runner": settings.runner, "busy": repo.count_busy_runs(session),
         "slots": settings.max_concurrent_runs, "isolated": settings.network_isolated,

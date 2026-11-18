@@ -694,7 +694,7 @@ Everything the page loads is served by the agent: htmx, the fonts and the styles
 
 ## The site list
 
-`node/federation.py` keeps the site list, the list of nodes in the federation, only with a valid signature from `BIOCHEF_FEDERATION_KEY`, and refuses a version older than the newest one held, because going backwards is how a removed node comes back. Nothing receives a list yet: the coordinator client does that. The format is an assumption until the coordinator defines it, and the module says which one.
+`node/federation.py` keeps the site list, the list of nodes in the federation, only with a valid signature from `BIOCHEF_FEDERATION_KEY`, and refuses a version older than the newest one held, because going backwards is how a removed node comes back. A list carries an expiry, and one already past it is refused. While the list held has expired, a request delivered to the node is kept unchecked, audited as `node.request.held`, and checked on the first delivery after a current list arrives, and the Node screen shows "Expired since" in place of "Up to date". Otherwise a node that stopped receiving lists would keep trusting the last one, including a node removed or a key replaced since. Nothing receives a list yet: the coordinator client does that. The format is an assumption until the coordinator defines it, and the module says which one.
 
 ## The Node screen
 
