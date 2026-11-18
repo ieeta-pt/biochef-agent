@@ -17,6 +17,7 @@ that wants a container does not get to reinvent the timeout, and cannot quietly
 lose the group-kill.
 """
 
+import copy
 import json
 import os
 import re
@@ -89,6 +90,16 @@ class Runner:
 
     def command(self, ws) -> List[str]:
         raise NotImplementedError
+
+    def with_image(self, image: str) -> "Runner":
+        """A runner like this one for a step that names its own image.
+
+        `image` is `repository@sha256:<digest>`, with no scheme. A runner that
+        runs steps in the one image it was configured with, or in no image at
+        all, refuses a different one, and says so.
+        """
+        raise ValueError(f"the {self.name} runner cannot run an image chosen by "
+                         f"the task")
 
     def snakefile_preamble(self) -> str:
         """Lines this provider needs at the top of the Snakefile, if any.
@@ -475,6 +486,14 @@ class ApptainerRunner(Runner):
         return {**os.environ,
                 "PATH": self._bin_dir + os.pathsep + os.environ.get("PATH", "")}
 
+    def with_image(self, image: str) -> "ApptainerRunner":
+        other = copy.copy(self)
+        self.environment()          # the directory with the link, made once and shared
+        other._bin_dir = self._bin_dir
+        other.image = f"docker://{image}"
+        other._literal = _image_literal(other.image)
+        return other
+
     @property
     def guarantees(self) -> dict:
         """Read from the flags actually passed, so emptying them shows here.
@@ -745,6 +764,17 @@ class PodmanRunner(Runner):
         # creates while the run goes on.
         self.umask = 0o007
 
+    def with_image(self, image: str) -> "PodmanRunner":
+        wanted = f"docker://{image}"
+        if self.mode == "rootful" and wanted != self.image:
+            raise ValueError(
+                f"rootful podman runs the one IMAGE of its configuration "
+                f"({self.image}), which only root can change, and not {wanted}")
+        other = copy.copy(self)
+        other.image = wanted
+        other._literal = _image_literal(wanted)
+        return other
+
     @property
     def guarantees(self) -> dict:
         """All three, fixed in podman-step and podman-step-root with no setting."""
@@ -956,6 +986,13 @@ class TesRunner(Runner):
                              f"did not answer as one: {error}") from None
         self.server = " ".join(str(info[key]) for key in ("name", "version")
                                if isinstance(info.get(key), (str, int, float))) or "?"
+
+    def with_image(self, image: str) -> "TesRunner":
+        other = copy.copy(self)
+        other.settings = tes.Settings(**{**self.settings._asdict(),
+                                         "image": tes.check_image(image)})
+        other.image = other.settings.image
+        return other
 
     @property
     def guarantees(self) -> dict:

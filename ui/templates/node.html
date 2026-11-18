@@ -44,6 +44,36 @@
   <div class="kv"><span class="text-label">Outputs after egress</span><span>{{ data.retention }}</span></div>
   <div class="kv"><span class="text-label">Tool signatures</span><span>{{ data.signatures }}</span></div>
 </section>
+<section aria-label="TES API" class="card flex flex-col gap-3 px-6 py-5">
+  <div class="flex flex-col gap-1">
+    <h2 class="m-0 text-base font-medium">TES API</h2>
+    <span class="text-[13px] text-muted">Read only · the listener and the tasks it was sent, from the database</span>
+  </div>
+  <div class="flex flex-col gap-1">
+    <span class="text-base font-medium {{ {'ok': 'text-ok', 'bad': 'text-bad', 'mute': 'text-muted'}[data.tes.kind] }}">{{ data.tes.headline }}</span>
+    {% for line in data.tes.lines %}<span class="text-[13px] text-muted">{{ line }}</span>
+    {% endfor %}
+  </div>
+  {% if data.tes.counts %}
+  <ul aria-label="Tasks by state" class="m-0 flex list-none flex-wrap gap-2 p-0 text-[13px]">
+    {% for state, count, kind in data.tes.counts %}<li><span class="pill pill-{{ kind }}">{{ state }} {{ count }}</span></li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  <div class="table-box">
+    <table>
+      <thead><tr><th>Time</th><th>Task</th><th>Owner</th><th>Image</th><th>State</th></tr></thead>
+      <tbody>
+        {% for task in data.tes.tasks %}
+        <tr><td class="whitespace-nowrap">{{ task.when }}</td><td class="mono">{{ task.id }}{% if task.name %} <span class="text-muted">{{ task.name }}</span>{% endif %}</td><td>{{ task.owner }}</td><td class="mono">{{ task.image }}</td><td><span class="pill pill-{{ task.pill }}">{{ task.state }}</span></td></tr>
+        {% else %}
+        <tr><td colspan="5">No task has been sent to this node.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if data.tes.total > data.tes.tasks|length %}<span class="text-[13px] text-muted">The newest {{ data.tes.tasks|length }} of {{ data.tes.total }}.</span>{% endif %}
+</section>
 <section aria-label="Audit check" class="card flex flex-col gap-2 px-6 py-5">
   <h2 class="m-0 text-base font-medium">Audit check</h2>
   {% if data.orphans %}
