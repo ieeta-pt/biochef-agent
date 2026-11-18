@@ -1,5 +1,6 @@
 """Every state change proves it could read the page (section 9)."""
 
+import asyncio
 import re
 
 import pytest
@@ -99,9 +100,11 @@ def test_a_wrong_header_is_not_saved_by_a_right_field(client):
     assert response.status_code == 403
 
 
-def test_a_repeated_form_field_is_refused(client):
+@pytest.mark.parametrize("order", ["right first", "right last"])
+def test_a_repeated_form_field_is_refused(client, order):
     token = token_of(client.get(PAGES[0]))
-    body = f"csrf_token={token}&csrf_token=other"
+    fields = [f"csrf_token={token}", "csrf_token=other"]
+    body = "&".join(fields if order == "right first" else fields[::-1])
     response = client.post(ECHO, content=body, headers={
         "content-type": "application/x-www-form-urlencoded"})
     assert response.status_code == 403
@@ -125,6 +128,20 @@ def test_a_malformed_cookie_header_is_a_refusal_not_a_crash(client):
     assert response.status_code == 403
 
 
+@pytest.mark.parametrize("other", ['prefs={"a":1}', "x=hello world", "x=a\\b", "a/b=1"])
+@pytest.mark.parametrize("secure", [False, True], ids=["dev", "header"])
+def test_another_apps_cookie_does_not_hide_ours(other, secure):
+    """Every app on the host shares its cookies; on 127.0.0.1, every port does."""
+    client = with_routes(header_settings(), PROXY) if secure else with_routes(dev_settings())
+    client.headers[USER_HEADER] = "j.silva"
+    token = token_of(client.get(PAGES[0]))
+    client.cookies.clear()
+    cookies = f"{other}; {csrf.cookie_name(secure)}={token}"
+    response = client.post(ECHO, content="body",
+                           headers={"cookie": cookies, "X-CSRF-Token": token})
+    assert response.status_code == 200
+
+
 @pytest.mark.parametrize("kind", ["application/json", "multipart/form-data",
                                   "text/plain"])
 def test_only_a_form_can_carry_the_field(client, kind):
@@ -142,10 +159,57 @@ def test_a_body_over_the_limit_is_not_read_to_the_end(client):
     assert response.status_code == 413
 
 
+def test_the_form_check_stops_reading_at_the_limit():
+    """Driven directly, so the cap in front of the route cannot stand in for it."""
+    token = "t" * 43
+    chunk, chunks = b"x" * 65536, 4 * csrf.MAX_FORM_BYTES // 65536
+    read = 0
+
+    async def receive():
+        nonlocal read
+        read += 1
+        body = f"csrf_token={token}&comment=".encode() if read == 1 else chunk
+        return {"type": "http.request", "body": body, "more_body": read < chunks}
+
+    statuses = []
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            statuses.append(message["status"])
+
+    async def route(scope, receive, send):
+        raise AssertionError("the route was reached")
+
+    scope = {"type": "http", "method": "POST", "path": ECHO, "headers": [
+        (b"cookie", f"{DEV_COOKIE}={token}".encode()),
+        (b"content-type", b"application/x-www-form-urlencoded")]}
+    asyncio.run(csrf.CsrfMiddleware(route, dev_settings())(scope, receive, send))
+    assert statuses == [413]
+    assert read <= csrf.MAX_FORM_BYTES // len(chunk) + 2
+
+
+def test_the_header_path_has_the_same_cap(client):
+    token = token_of(client.get(PAGES[0]))
+    big = client.post(ECHO, content="x" * (2 * csrf.MAX_FORM_BYTES),
+                      headers={"X-CSRF-Token": token})
+    assert big.status_code == 413
+    assert big.headers["x-content-type-options"] == "nosniff"
+    small = client.post(ECHO, content="x" * (csrf.MAX_FORM_BYTES // 2),
+                        headers={"X-CSRF-Token": token})
+    assert small.status_code == 200
+
+
 @pytest.mark.parametrize("method", ["put", "patch", "delete"])
 def test_every_unsafe_method_is_covered(client, method):
     client.get(PAGES[0])
     assert getattr(client, method)(ECHO).status_code == 403
+
+
+def test_only_reading_static_files_skips_the_check(client):
+    token = token_of(client.get(PAGES[0]))
+    assert client.post("/ui/static/app.css").status_code == 403
+    assert client.post("/ui/static/app.css",
+                       headers={"X-CSRF-Token": token}).status_code == 405
 
 
 def test_get_carries_no_requirement(client):
