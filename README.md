@@ -254,6 +254,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_PASSPORT_VISA_ISSUERS` | *(unset)* | comma-separated issuers whose visas count |
 | `BIOCHEF_PASSPORT_REQUIRE_VISA` | *(unset)* | a visa type a caller must hold to be let in |
 | `BIOCHEF_PASSPORT_REQUIRE_VISA_VALUE` | *(unset)* | the exact value that visa must carry |
+| `BIOCHEF_PASSPORT_VISA_MAX_AGE` | *(unset)* | on a node, the oldest visa accepted for a request, in seconds from its `asserted` time; required there, no default |
 | `BIOCHEF_RUNNER` | `subprocess` | how a workflow executes: `subprocess`, `apptainer`, `singularity`, `podman` or `tes` |
 | `BIOCHEF_REQUIRE_NETWORK_ISOLATION` | `true` | refuses to start with a runner the agent does not itself keep off the network; `false` turns that off and is audited at start, see [What each runner guarantees](#what-each-runner-guarantees) |
 | `BIOCHEF_NETWORK_PROBE` | *(unset)* | `host:port` the agent can reach and a step must not, tried by the network check at start |
@@ -681,7 +682,7 @@ The Policy Engine, the airlock and the coordinator's result endpoint are protoco
 
 ## Requests
 
-A request is checked in the ten steps of the specification (section 6.3), and the first failure stops the rest. Every verdict writes an audit event, and a refusal is also a signed decision. A repeat is the same `request_id`, which the member signs: delivered again, it joins the run of an accepted request and gets the same refusal as a refused one, and only a count is kept. A new `request_id` is a new request even with the same payload, and the same `request_id` on a different signed request is refused as `replay`. Check 5 comes first, so a request_id is held to this until its `not_after`. `BIOCHEF_PASSPORT_REQUIRE_VISA` names the visa type required for each dataset, and the visa's value must be exactly the `visa_value` of the dataset's binding, its subject the member, and its issuer one of `BIOCHEF_PASSPORT_VISA_ISSUERS`. A binding with no `visa_value` matches no visa.
+A request is checked in the eleven steps of the specification (section 6.3), and the first failure stops the rest. Every verdict writes an audit event, and a refusal is also a signed decision. A repeat is the same `request_id`, which the member signs: delivered again, it joins the run of an accepted request and gets the same refusal as a refused one, and only a count is kept. A new `request_id` is a new request even with the same payload, and the same `request_id` on a different signed request is refused as `replay`. Check 6 comes first, so a request_id is held to this until its `not_after`. Every dataset a request names has to be in its study version (check 5): a member of two studies holds visas for the datasets of both, and a request under one study must not read the other's. Visas are checked on every request (check 10), so the node needs all three of these: `BIOCHEF_PASSPORT_REQUIRE_VISA` names the visa type required for each dataset, `BIOCHEF_PASSPORT_VISA_ISSUERS` the issuers trusted to sign one, and `BIOCHEF_PASSPORT_VISA_MAX_AGE` the oldest visa accepted, in seconds from its `asserted` time, with no default because the age is the data access committee's to set. The visa's value must be exactly the `visa_value` of the dataset's binding, and the visa must belong to the member: its subject is the member's LS AAI id, or a LinkedIdentities visa of the member, from a trusted issuer and within the age, names its subject and issuer. A binding with no `visa_value` matches no visa. The UI refuses to start without `BIOCHEF_PASSPORT_REQUIRE_VISA`.
 
 The payload is decrypted with `pyrage`, and an accepted payload is kept in memory only.
 
@@ -699,7 +700,7 @@ EGAD00001009912:
   visa_value: https://dac.example.org/datasets/EGAD00001009912
 ```
 
-`visa_value` is the exact value the data access committee issues in a visa for this dataset, usually a URL. On a node with `BIOCHEF_PASSPORT_REQUIRE_VISA`, a request is compared with it and with nothing else, so a dataset with no `visa_value` refuses every request as `visa_missing`, and the Datasets page says so.
+`visa_value` is the exact value the data access committee issues in a visa for this dataset, usually a URL. A request is compared with it and with nothing else, so a dataset with no `visa_value` refuses every request as `visa_missing`, and the Datasets page says so.
 
 The file is read when the page starts. Its bindings are locked on the page, and it wins over anything bound there: a page binding it replaces gets a signed `unbind`, and the page reports it. With `BIOCHEF_DATASET_BINDINGS_FROM_UI=true` a data manager can bind, edit and remove the others, each as a signed decision. Anything that resolves outside the root is refused, with the same check `localpath` applies to a run's inputs.
 
