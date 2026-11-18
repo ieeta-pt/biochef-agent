@@ -15,6 +15,7 @@ AGENT_USER = "agent"
 """Who a refusal is recorded under: the checks made it, not a person."""
 
 EVENT_CHECKED = "node.request.checked"
+EVENT_HELD = "node.request.held"
 
 
 class RequestError(Exception):
@@ -146,6 +147,17 @@ def deliver(session, keys, raw, *, node, visas, now=None):
     now = now or repo.utcnow()
     fields = _fields(raw)
     seen = repo.find_request(session, fields["request_id"])
+    if repo.site_list_expired(session, now):
+        # The node trusts its site list no longer (7.4). A new request is kept,
+        # unchecked, and is checked on the first delivery after a current list.
+        decisions.require_a_trail()
+        if seen is None:
+            receive(session, raw, now=now)
+        audit.record(EVENT_HELD, request_id=fields["request_id"],
+                     study_id=fields["study_id"],
+                     study_version=fields["study_version"],
+                     member=fields["member"], reason="site list expired")
+        return checks.Result(Outcome.HELD)
     if seen is None:
         receive(session, raw, now=now)
         return check(session, keys, fields["request_id"], node=node, visas=visas,
