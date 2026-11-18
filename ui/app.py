@@ -5,19 +5,21 @@ which breaks the rule that nothing leaves the TRE, and this app has no API to
 document.
 
 The middleware added last runs first, so the order of a request is security
-headers, identity, CSRF, then the route.
+headers, identity, CSRF, the body cap, then the route. The cap is the one the
+CSRF check applies to a form, for every request: nothing here takes an upload.
 """
 
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+from bodylimit import BodySizeLimitMiddleware
 from node import keys as node_keys
 from node.policy import FakePolicyEngine
 from store import db, migrate
 from store.errors import NotFound
 from ui import settings as ui_settings
-from ui.csrf import CsrfMiddleware
+from ui.csrf import MAX_FORM_BYTES, CsrfMiddleware
 from ui.identity import IdentityMiddleware
 from ui.render import HERE
 from ui.routes import datasets, decisions, inbox, node, requests, studies, workflows
@@ -44,6 +46,7 @@ def create_app(settings, *, bind, keys, policy=None):
     def not_found(_request, _failure):
         return PlainTextResponse("No such record on this node.\n", status_code=404)
 
+    app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_FORM_BYTES)
     app.add_middleware(CsrfMiddleware, settings=settings)
     app.add_middleware(IdentityMiddleware, settings=settings)
     app.add_middleware(SecurityHeadersMiddleware)

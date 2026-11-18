@@ -148,6 +148,40 @@ until the run ends. This setting is a retention bound, not a peak resource
 limit. Logs may contain sensitive tool output; this prototype has no local
 log-release policy for TRE use.
 
+### A workflow you got wrong is your error, not the agent's
+
+A `biochef_workflow` this service cannot read is a `400` naming what was wrong:
+not valid JSON, no `nodes`, a node without an `id`, a tool node whose
+`data.repo` is not a string, an edge that is a number. On `/runs` the same
+mistakes settle the run as `EXECUTOR_ERROR`, which is WES's word for the
+submission or its tools, rather than `SYSTEM_ERROR`, which is this service
+saying it broke.
+
+Both used to be the other way round. `/convert` answered `500` to nine of ten
+malformed documents and `/runs` recorded five of six as `SYSTEM_ERROR`, in both
+cases carrying the Python exception's own text — so a caller was told `'id'`, or
+`'int' object is not subscriptable`. A hub triaging a federated run would have
+gone looking for a fault here.
+
+The document is checked **before** a run directory exists, so a refused
+submission leaves nothing behind.
+
+The check is on shape only, and it is explicit rather than a `try/except`
+around the parse. Catching `KeyError` and `TypeError` there would cover every
+field for free and would also turn a genuine bug in our own parsing into a tidy
+`400`, telling a caller their workflow was wrong when it was not. The cost is
+that the check knows which fields the parser reads; a test drives a matrix of
+malformed documents through both routes and asserts none of them reaches a
+`500`, and another asserts that an internal fault still does.
+
+Whether a repo exists, whether a tool has the operation named, whether an
+edge's handles match — those need the registry, so they are answered once the
+bundle has been pulled. They are refusals too: naming an input or output
+handle the tool does not declare is a `400` listing what it does declare,
+rather than the `500` it used to be. A parameter the recipe does not declare is
+ignored. An enabled parameter with no value is a `400`, unless the recipe makes
+it required, in which case its default is used.
+
 Both take the same fields:
 
 | field | what it is |
@@ -546,7 +580,14 @@ The agent has no accounts. The TRE decides who may open the page, and `BIOCHEF_U
 - `header`: a reverse proxy passes the user name in `BIOCHEF_UI_IDENTITY_HEADER`. The header counts only from an address in `BIOCHEF_UI_TRUSTED_PROXIES`. Anything else is a 401, static files included.
 - `dev`: `BIOCHEF_UI_DEV_USER`, from a loopback address only. It refuses to start on any other `BIOCHEF_UI_HOST`.
 
-The page refuses to start without `BIOCHEF_AUDIT_LOG`, because every decision made there has to reach the trail, and without the node's signing key or a migrated database. `run-ui.sh` starts `python -m ui`, which keeps uvicorn's proxy headers off. If you run `uvicorn ui.app:app` yourself, pass `--no-proxy-headers`, because otherwise uvicorn rewrites the client address that the identity check depends on.
+In `header` mode:
+
+- The proxy has to set the header itself, replacing any value the browser sent. If it passes one through or appends to it, the browser names the user.
+- Every process that can connect from a trusted address can name any user. If you trust `127.0.0.1`, that includes every local process and every workflow step: `subprocess` runs steps on this host, and `apptainer` with the default `BIOCHEF_APPTAINER_ARGS` shares its network. Prefer a proxy on its own address.
+- The browser has to reach the proxy over https. The CSRF cookie is `__Host-` and `Secure`, so over plain http the browser drops it, and every change on the page is refused with 403. Only `localhost` is exempt.
+- Publish the page at the root of its own host, for example `https://agent.tre.example/`, not under a path such as `/agent/`. The pages link to `/ui/...`, and the cookie needs `Path=/`.
+
+The page refuses to start without `BIOCHEF_AUDIT_LOG`, because every decision made there has to reach the trail, and without the node's signing key or a migrated database. `run-ui.sh` starts `python -m ui`, which keeps uvicorn's proxy headers off. If you run `uvicorn ui.app:app` yourself, pass `--no-proxy-headers`. Otherwise uvicorn takes the client address from `X-Forwarded-For` for any connection from 127.0.0.1, so any local process can pose as a trusted proxy and name any user.
 
 Everything the page loads is served by the agent: htmx, the fonts and the stylesheet are in `ui/static/`, and `ui/static.sha256` records the vendored files. `ui/static/app.css` is built and committed, so nothing else is needed at runtime. After changing a template or `ui/tailwind/input.css`, run `make css`, which downloads the pinned Tailwind CLI, checks it against `ui/tailwind/SHA256SUMS` and rebuilds the file. CI fails if the committed file differs.
 
