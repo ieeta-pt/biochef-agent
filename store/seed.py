@@ -337,11 +337,13 @@ def _seed_bindings(session, keys, now):
 
 def _seed_node(session, keys, now):
     nodes = [{"node": node} for node in mock.FEDERATION_NODES]
-    raw = _bytes({"version": mock.FEDERATION_VERSION, "nodes": nodes})
+    expires_at = now + mock.days(30)
+    raw = _bytes({"version": mock.FEDERATION_VERSION,
+                  "expires_at": expires_at.isoformat(), "nodes": nodes})
     repo.store_federation_list(
         session, version=mock.FEDERATION_VERSION, raw=raw,
         signature=decisions.signature_of(raw, keys), nodes=nodes,
-        now=now - mock.days(1))
+        expires_at=expires_at, now=now - mock.days(1))
     repo.record_poll(session, ok=True, now=now)
 
 

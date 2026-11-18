@@ -5,10 +5,15 @@ list would let a study reach somewhere nobody approved. The list is taken only
 with a valid signature, and never older than the newest one here: going backwards
 is how a removed node comes back.
 
+A list also carries an expiry, and one already past it is refused. Otherwise a
+node that stopped receiving lists would keep trusting the last one, including a
+node removed or a key replaced since. While the list held here is expired,
+node/requests.py leaves new requests unchecked until a current one arrives.
+
 The coordinator's agent API does not exist yet, and #6 does not define the list.
 Until it does this assumes an Ed25519 signature, base64url, over the bytes of the
 document as received, a PEM public key in BIOCHEF_FEDERATION_KEY, and a document
-with `version` and `nodes`.
+with `version`, `expires_at` (ISO 8601 with its zone) and `nodes`.
 """
 
 import base64
@@ -19,6 +24,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from node.verify import parse_time
 from store import repo
 
 
@@ -41,8 +47,9 @@ def load_key(path=None):
     return key
 
 
-def check(raw, signature, key):
-    """The document, if the signature holds and it has the right shape."""
+def check(raw, signature, key, now):
+    """The document, if the signature holds, it has the right shape and it has
+    not expired. Its `expires_at` comes back parsed."""
     try:
         padded = signature + "=" * (-len(signature) % 4)
         key.verify(base64.urlsafe_b64decode(padded), raw)
@@ -56,12 +63,20 @@ def check(raw, signature, key):
     if (not isinstance(version, int) or isinstance(version, bool)
             or not isinstance(nodes, list)):
         raise FederationError("the site list is not a list of nodes")
-    return document
+    try:
+        expires_at = parse_time(document["expires_at"])
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise FederationError("the site list does not say when it expires, with "
+                              "its zone") from None
+    if expires_at <= now:
+        raise FederationError(f"the site list expired at {expires_at.isoformat()}")
+    return {**document, "expires_at": expires_at}
 
 
 def accept(session, raw, signature, key, now=None):
     """Keep a verified list. An older version raises StaleList from the store."""
-    document = check(raw, signature, key)
+    now = now or repo.utcnow()
+    document = check(raw, signature, key, now)
     return repo.store_federation_list(session, version=document["version"], raw=raw,
                                       signature=signature, nodes=document["nodes"],
-                                      now=now)
+                                      expires_at=document["expires_at"], now=now)

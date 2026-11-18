@@ -823,9 +823,18 @@ def test_a_config_binding_cannot_be_removed(engine):
 # Site list and coordinator status
 
 
-def store_list(session, version, raw=b"list"):
+def store_list(session, version, raw=b"list", expires_at=NOW + timedelta(days=30)):
     return repo.store_federation_list(session, version=version, raw=raw,
-                                      signature="sig", nodes=[], now=NOW)
+                                      signature="sig", nodes=[],
+                                      expires_at=expires_at, now=NOW)
+
+
+def test_a_site_list_expires_at_its_moment(engine):
+    with db.writing(engine) as session:
+        assert repo.site_list_expired(session, NOW) is False, "no list yet"
+        store_list(session, 14, expires_at=NOW + timedelta(hours=1))
+        assert repo.site_list_expired(session, NOW) is False
+        assert repo.site_list_expired(session, NOW + timedelta(hours=1)) is True
 
 
 def test_an_older_node_list_is_refused(engine):
