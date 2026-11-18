@@ -29,7 +29,7 @@ The images and sources in `mockups/` were not redrawn after this document was co
 | 02 | v1 as `Withdrawn` | v1 as `superseded`, shown as "Superseded" |
 | 03 | `bcftools:1.21`, an image per step | `repo@digest` per step (6.1). There is no image per step |
 | 03, 04 | `gwas-qc 1.4.0` as a workflow name | Name and version exist only for library workflows (6.7). Otherwise show the short digest |
-| 04 | Nine checks | Ten checks (6.3) |
+| 04 | Nine checks | Eleven checks (6.3) |
 | 01 | "Paulo Neves" named in the failed identity alert | A member whose identity failed has no verified name: show the shortened `ls_aai_id` (7.3) |
 | 04 | `req_7c03` from 28 Oct under "last 24 hours", rows out of order | Everything listed is inside 24 hours, newest first |
 | 06 | Edit only | Edit and Remove (8.6) |
@@ -85,7 +85,7 @@ Requests are never approved one by one. The agent checks each request itself (se
 2. Stop after each part and report back to `jorgeMFS` with what changed, how it was tested, and what is next. Do not start the next part on your own.
 3. Synthetic data only. Fixtures use invented names and the dataset ids in the mocks. Never real data, never real keys.
 4. Every new setting is read with a literal `os.getenv("BIOCHEF_…")` and documented in **both** `README.md` and `example.env`. `tests/test_settings_are_documented.py` must scan every package of the repo, not only `*.py` at the root. A process that does not import `convert.py` has to call `load_dotenv()` itself, because that module is the only one that loads `.env` today.
-5. Keep the existing API (`/convert`, `/runs…`, `/ga4gh/wes/v1/…`) and `openapi.json` unchanged unless a part says otherwise. If an interface changes, `openapi.json` and the README change in the same PR.
+5. Keep the existing API (`/convert`, `/runs…`, `/ga4gh/wes/v1/…`) and `openapi.json` unchanged unless a part says otherwise. If an interface changes, `openapi.json` and the README change in the same PR. On a node these routes go off (section 13).
 6. Match the house style of the repo: module docstrings that explain *why*, explicit failures over silent defaults, refuse to start on a half configured setting (see `auth.py` and `audit.py`).
 7. Python floor is 3.11 (`.python-version`, `run.sh`, CI matrix 3.11 to 3.14). Everything must work on 3.11.
 8. No network at runtime for the UI. No CDN, no Google Fonts, no external script. Everything the page loads is served by the agent.
@@ -238,7 +238,7 @@ Field names follow `ieeta-pt/biochef-coordinator#6` wherever a field comes from 
 | `run_summary` | `run_id`, `request_id`, `state` (existing WES states), `steps` (json: id, state, `started_at`, `ended_at`), `started_at`, `ended_at`, `exit_code`, `workspace_path`, `manifest_path`, `log_stdout`, `log_stderr`, `node_logs` (json), `cancel_requested`, `egress_state` (6.5), `egress_files` (json: file, size, verdict, reason), `airlock_ticket`, `airlock_at`, `retain_until`. `state` is checked against the WES states in the database. The files, ticket and time are fixed once `egress_state` leaves `rules_pending`, and `retain_until` is set only on reaching `sent` or `withheld` |
 | `dataset_binding` | `dataset_id`, `source` (`config` or `page`), `type` (`localpath` today), `location` (relative to `BIOCHEF_LOCAL_ROOT`), `visa_value` (6.6), `bound_by`, `bound_at` |
 | `outgoing_message` | `id`, `run_id`, `kind` (`withheld_result` today), `document` (the signed document, canonical bytes), `created_at`, `sent_at`. One of each kind per run (6.5) |
-| `federation_list` | `version`, `raw`, `signature`, `nodes` (json), `received_at`. An older version than the newest stored is refused (7.4) |
+| `federation_list` | `version`, `expires_at`, `raw`, `signature`, `nodes` (json), `received_at`. An older version than the newest stored is refused, and so is a list past its expiry (7.4) |
 | `node_status` | One row: `last_poll_at`, `last_success_at`, `last_error`. Written by the poll, read by the sidebar and the Node page |
 
 Tool images do not exist per step: the agent runs one image (`BIOCHEF_CONTAINER_IMAGE`) and fetches each tool as a bundle, `repo@digest`.
@@ -263,7 +263,7 @@ Rules:
 1. **Only one approved version of a study at a time.** Approving v3 moves the approved v2 to `superseded` in the **same transaction**, and writes two decisions: `approve v3` and `withdraw v2` (reason `superseded`), both signed and both posted. Both name the user who approved v3. A database constraint enforces the rule. Runs, logs and decisions of v2 stay readable in the study's history. A version moved this way is shown as "Superseded".
 2. While v3 is `pending`, v2 stays `approved` and keeps serving requests. If v3 is refused, v2 is untouched.
 3. A study version can be approved only if **every** member has `identity_verified = true` (section 7.3). Otherwise the Approve button is disabled and the page says which member failed and why (mock: "Rare variants pilot v1").
-4. Before approving a study version the data manager ticks "The data access committee has granted access for this study". Store it in the decision (`dac_confirmed: true`). The tick stays even with the visa check: visas are checked on each request (check 9, 6.3), not at approval.
+4. Before approving a study version the data manager ticks "The data access committee has granted access for this study". Store it in the decision (`dac_confirmed: true`). The tick stays even with the visa check: visas are checked on each request (check 10, 6.3), not at approval.
 5. Workflow versions are approved **per study version**. Different parameter values give a different hash and so a different workflow version (mock: two variants of `gwas-qc 1.3.2`). Several versions of the same workflow can be approved at once in one study version.
 6. Withdrawing a workflow version is a signed decision of its own and does not need a new study version.
 7. When v3 of a study is approved, the workflow approvals of v2 do not carry over: each must be approved again, and the workflows of the superseded version move to `superseded` too.
@@ -273,7 +273,7 @@ Rules:
 
 ### 6.3 Request checks
 
-A request is checked in this exact order. The first failure stops the checks, refuses the request and records its code. The Requests screen lists all ten and marks later ones "not reached".
+A request is checked in this exact order. The first failure stops the checks, refuses the request and records its code. The Requests screen lists all eleven and marks later ones "not reached".
 
 | # | Check | Refusal code |
 |---|---|---|
@@ -281,20 +281,21 @@ A request is checked in this exact order. The first failure stops the checks, re
 | 2 | `node` is this node | `wrong_node` |
 | 3 | The named study version is `approved` on this node and its digest equals `study_digest` | `study_not_approved` |
 | 4 | `workflow_digest` is `approved` for that study version | `workflow_not_approved` |
-| 5 | Not expired (`not_after` later than now) | `expired` |
-| 6 | Not seen before, by `request_id`, which the member signs. The same signed request delivered again **joins** the run if it was accepted, and gets the **same refusal** if it was refused, even when the reason has since gone. Its row keeps the first verdict and counts the repeat. A new `request_id` is a new request, even with the same payload | `replay` when the same `request_id` arrives on a different signed request |
-| 7 | Payload decrypts with this node's encryption key, and its digest equals `payload_digest` | `cannot_decrypt` |
-| 8 | Workflow digest recomputed from the decrypted tools and parameter values equals `workflow_digest` | `hash_mismatch` |
-| 9 | The member's visas allow the named datasets (reuse `passports.py` visa checking): for each dataset, a visa of the required type whose value is exactly the binding's `visa_value` (6.6). A binding with no `visa_value` matches no visa. Where the node gets the member's visas is open (section 13, item 11): inside the job, or fetched by the node with LS Login offline access. This check is the same either way | `visa_missing` |
-| 10 | Every named dataset has a binding on this node | `dataset_not_bound` |
+| 5 | Every dataset the request names is in the named study version's `datasets`. A member of two studies holds visas for the datasets of both, so check 10 alone would let a request under one study read the other study's data under the first one's approval and output rules | `dataset_not_in_study` |
+| 6 | Not expired (`not_after` later than now) | `expired` |
+| 7 | Not seen before, by `request_id`, which the member signs. The same signed request delivered again **joins** the run if it was accepted, and gets the **same refusal** if it was refused, even when the reason has since gone. Its row keeps the first verdict and counts the repeat. A new `request_id` is a new request, even with the same payload | `replay` when the same `request_id` arrives on a different signed request |
+| 8 | Payload decrypts with this node's encryption key, and its digest equals `payload_digest` | `cannot_decrypt` |
+| 9 | Workflow digest recomputed from the decrypted tools and parameter values equals `workflow_digest` | `hash_mismatch` |
+| 10 | The member's visas allow the named datasets, on every request: for each dataset, a visa of the type in `BIOCHEF_PASSPORT_REQUIRE_VISA` whose value is exactly the binding's `visa_value` (6.6), from an issuer in `BIOCHEF_PASSPORT_VISA_ISSUERS` (reuse `passports.py` visa checking), that belongs to the member and is no older than `BIOCHEF_PASSPORT_VISA_MAX_AGE`, counted from its `asserted` time. A visa belongs to the member when its `sub` is the member's `ls_aai_id`, or a LinkedIdentities visa from one of those issuers links it to that id; without this, any valid visa for the dataset would pass. A binding with no `visa_value` matches no visa. Where the node gets the member's visas is open (section 13, item 11): inside the job, or fetched by the node with LS Login offline access. This check is the same either way | `visa_missing` |
+| 11 | Every named dataset has a binding on this node | `dataset_not_bound` |
 
 Write this as a pure function `verify(request, store, keys, now) -> Verdict` with one test per row, plus tests for repeats. Every verdict writes an audit event. A refusal is also a signed decision posted to the coordinator, so the requester sees why.
 
 Repeats, in detail:
 
-- Checks 1 to 5 run on every delivery, so a repeat after `not_after` is refused as `expired`, and `not_after` is how long the node holds a `request_id` to check 6. A refused request is sent again under a new `request_id`.
-- Only the same signed `job_request` is a repeat. The rows are not changed by anything else delivered under the id: a `replay` is refused with a signed decision, since the member signed it, and a delivery that fails checks 1 to 5 is only audited.
-- A repeat writes the audit event of check 6 and no new decision.
+- Checks 1 to 6 run on every delivery, so a repeat after `not_after` is refused as `expired`, and `not_after` is how long the node holds a `request_id` to check 7. A refused request is sent again under a new `request_id`.
+- Only the same signed `job_request` is a repeat. The rows are not changed by anything else delivered under the id: a `replay` is refused with a signed decision, since the member signed it, and a delivery that fails checks 1 to 6 is only audited.
+- A repeat writes the audit event of check 7 and no new decision.
 
 **Blocked on the agent API**: `ieeta-pt/biochef-coordinator#6` fixes the shape of a request, a study version and the encrypted payload, but not the agent side. Until the agent API is in `biochef-coordinator`, build and test against fixtures in `tests/fixtures/federation/` that follow those models. The payload holds a WES request. Whether it also holds the member's visas is open (section 13, item 11).
 
@@ -339,11 +340,12 @@ withheld: at the moment of withholding, a signed notice with no files is kept in
 ### 6.6 Dataset bindings
 
 - `BIOCHEF_DATASET_BINDINGS_FILE`: YAML file with `dataset_id → {type: localpath, location: <relative path>, visa_value: <value>}`. Loaded at start, shown on the page as "config file, locked". PyYAML is already pinned.
-- **`visa_value`** is the exact value the data access committee issues in a visa for the dataset, usually a URL. The dataset id is the node's own name for the data and visas do not carry it. Check 9 compares with `passports.satisfies`, exactly. A binding without one refuses every request for the dataset as `visa_missing` where a visa is required, and the Datasets page and the request's panel say why. It is signed with the location in every `bind` and `unbind` decision (`subject_hash` covers both).
+- **`visa_value`** is the exact value the data access committee issues in a visa for the dataset, usually a URL. The dataset id is the node's own name for the data and visas do not carry it. Check 10 compares with `passports.satisfies`, exactly. A binding without one refuses every request for the dataset as `visa_missing`, and the Datasets page and the request's panel say why. It is signed with the location in every `bind` and `unbind` decision (`subject_hash` covers both).
 - `BIOCHEF_DATASET_BINDINGS_FROM_UI=true|false`. When `true`, the page can add and remove bindings (signed `bind` / `unbind` decisions, audit event). A binding from the page can never override one from the config file; the config wins and the page shows the conflict.
 - Every `location` is resolved under `BIOCHEF_LOCAL_ROOT` with the same rule `datasource.LocalPathSource` applies (refuse anything that resolves outside). Do not write a second resolver: move the check out of `LocalPathSource.fetch` into one function both call. `fetch` takes files only, and a binding names a folder, so part 5 also defines how a bound folder reaches a run.
 - Bindings need `localpath` in `BIOCHEF_DATA_SOURCES` and `BIOCHEF_LOCAL_ROOT` set. Refuse to start with a bindings file or `FROM_UI=true` otherwise.
 - A study version that names an unbound dataset can still be approved; its requests are refused with `dataset_not_bound` until it is bound. The Inbox shows "Not bound to local data yet · Bind it".
+- While the existing API is served on a node, it reaches a bound dataset without any of this: no study approval, no request checks, no egress. Section 13 turns it off on a node.
 
 ### 6.7 What `ieeta-pt/biochef-coordinator#6` decides
 
@@ -415,7 +417,7 @@ The page shows only "✓ identity verified" or "✗ identity not verified" per m
 
 ### 7.4 Site list
 
-`BIOCHEF_FEDERATION_KEY` (public key that signs the site list) and the current list from the coordinator. Refuse older list versions than the one stored. Node page shows "Up to date · N nodes".
+`BIOCHEF_FEDERATION_KEY` (public key that signs the site list) and the current list from the coordinator. The list carries a version and an expiry, as in `docs/architecture.md` of ieeta-pt/biochef-infra#2. Refuse a list older than the one stored, and a list already past its expiry. When the stored list expires and no newer one has arrived, the node stops trusting it: requests wait unchecked until a current list arrives. Otherwise a node that stops receiving lists keeps trusting the last one, including a node removed or a key replaced since. The Node page shows "Up to date · N nodes", or "Expired since …" in bad colours.
 
 ### 7.5 Posting decisions to the coordinator
 
@@ -463,7 +465,7 @@ Each screen below lists its route, what it reads, what it can do, and its states
 - Title "Latest requests". Last 24 hours across all studies; the full list per study is on the study page, and the sentence that says so links to Studies.
 - Filter tabs All / Accepted / Refused with counts.
 - Table: request id (button), study, workflow, member, received, verdict pill ("Refused · workflow not approved", "Accepted · run COMPLETE", "Accepted · result sent").
-- Side panel: the ten checks for the selected request with ✓, ✗ or "not reached", expiry, "Delivered again N times, last <time>" with what the repeats got (6.3), for `visa_missing` each named dataset whose binding has no visa value, link "Open the run" when accepted, and for refusals "The refusal is signed with the node key and sent to the coordinator, so the requester sees why."
+- Side panel: the eleven checks for the selected request with ✓, ✗ or "not reached", expiry, "Delivered again N times, last <time>" with what the repeats got (6.3), for `visa_missing` each named dataset whose binding has no visa value, link "Open the run" when accepted, and for refusals "The refusal is signed with the node key and sent to the coordinator, so the requester sees why."
 
 ### 8.5 Run (`/ui/runs/{run_id}`, mock 05)
 
@@ -477,12 +479,12 @@ Each screen below lists its route, what it reads, what it can do, and its states
 
 ### 8.6 Datasets (`/ui/datasets`, mock 06)
 
-- Table: dataset id, source type, location under the data root, visa value ("Not set" in warn colours with the reason when the node requires a visa), studies using it, bound by ("config file, locked" or "this page · <user>" with Edit and Remove). The bind and edit forms have a visa value field. Edit is offered only where a pending or approved study names the dataset, because the page refuses to bind or rebind any other; Remove is always offered for a page binding and asks first, in the page and never with `confirm()`, as Withdraw does: "Remove the binding of <dataset>? Requests that need it are refused until it is bound again." and **Remove and sign**.
+- Table: dataset id, source type, location under the data root, visa value ("Not set" in warn colours with the reason), studies using it, bound by ("config file, locked" or "this page · <user>" with Edit and Remove). The bind and edit forms have a visa value field. Edit is offered only where a pending or approved study names the dataset, because the page refuses to bind or rebind any other; Remove is always offered for a page binding and asks first, in the page and never with `confirm()`, as Withdraw does: "Remove the binding of <dataset>? Requests that need it are refused until it is bound again." and **Remove and sign**.
 - "Waiting for a binding" card for every dataset named by a pending or approved study version with no binding: prefilled id, type select, folder input, **Bind and sign**, the note "Paths are resolved under the data root on the Node page. The agent refuses anything outside it." Hidden when `BIOCHEF_DATASET_BINDINGS_FROM_UI=false`, replaced by "Bindings on this node come only from the config file."
 
 ### 8.7 Node (`/ui/node`, mock 07)
 
-- Four cards: Node keys ("Ready", "Show fingerprints"), Federation ("Up to date · N nodes"), Coordinator ("Online", last poll; "Offline since …" in bad colours when the last successful poll is older than 3 × the poll interval), Runner (name, busy slots of `BIOCHEF_MAX_CONCURRENT_RUNS` counted from `run_summary`, and "Network isolation: off" in warn colours for `subprocess` and for `apptainer` until part 9b).
+- Four cards: Node keys ("Ready", "Show fingerprints"), Federation ("Up to date · N nodes", or "Expired since …" in bad colours, 7.4), Coordinator ("Online", last poll; "Offline since …" in bad colours when the last successful poll is older than 3 × the poll interval), Runner (name, busy slots of `BIOCHEF_MAX_CONCURRENT_RUNS` counted from `run_summary`, and "Network isolation: off" in warn colours for `subprocess` and for `apptainer` until part 9b).
 - Settings, read only: egress mode (and the other option), dataset bindings mode, data root, retention, tool signature mode (`BIOCHEF_SIGNING_MODE`).
 - TES API, read only, from `tes_listener` and `tes_task` (14.4): "Running" with the pid, the host and since when, and when it last renewed, or "Not running" with who held the database last; the count of tasks in each state, in the order of a task's life; the newest ten tasks with time, short id, owner, image (by its short digest) and state. It reads only what a list needs, never a command or a log, offers nothing to press, and the UI does not import the listener. A place that has not been renewed for the lease (30 seconds, one number shared with the listener) is not running.
 - Audit log: newest 50 events from the JSONL trail (time, event, subject, user, whether signed), every kind of event in words (an event with no line of its own is put into words from its name, so a new kind is readable before its line is written), a study or workflow version by its title and not its number (the number only where the row it names is gone), an undo naming the subject of the decision it took back, a runner event naming the runner and a TES event the task. "Export (JSON lines)" downloads the file. Read the file with `audit.read`; never add an audit endpoint to the API app.
@@ -522,12 +524,15 @@ All read with `os.getenv`, all in `README.md` and `example.env` (test enforced).
 | `BIOCHEF_DATASET_BINDINGS_FROM_UI` | `false` | 5 | Allow bindings from the page |
 | `BIOCHEF_EGRESS_MODE` | none, required by the UI | 7 | `airlock` or `manual` |
 | `BIOCHEF_FEDERATION_KEY` | none, required | 7.4 | Public key that signs the site list |
+| `BIOCHEF_PASSPORT_VISA_MAX_AGE` | none, required | 6 | Oldest visa accepted, in seconds from its `asserted` time. No default, because it is the data access committee's to set |
 | `BIOCHEF_PODMAN_SELINUX` | none, required with `BIOCHEF_RUNNER=podman` | 9 | `disable`: steps run without SELinux separation and the workspace is mounted as it is. `keep`: podman's labels stay on, so on an enforcing host `BIOCHEF_RUN_ROOT` must carry a label containers may use (`container_file_t`). No default, because it depends on the host |
 | `BIOCHEF_COORDINATOR_URL` | none, required | 8 | Coordinator base URL |
 | `BIOCHEF_COORDINATOR_POLL_SECONDS` | `30` | 8 | Poll interval |
 | `BIOCHEF_COORDINATOR_CLIENT_CERT`, `BIOCHEF_COORDINATOR_CLIENT_KEY`, `BIOCHEF_COORDINATOR_CA` | none, required | 8 | mTLS material |
 
 `BIOCHEF_AUDIT_LOG` already exists. It stays optional for the API process and is required by the UI (section 4).
+
+`BIOCHEF_PASSPORT_REQUIRE_VISA` and `BIOCHEF_PASSPORT_VISA_ISSUERS` already exist too. They stay optional for the API process on its own, and a node requires them, because check 10 applies to every request (6.3).
 
 ## 11. Fixtures and development mode
 
@@ -554,8 +559,8 @@ Each part is one PR. Do them in this order unless `jorgeMFS` says otherwise. Par
 | 6 | **Request checks** (`node/verify.py`) and Requests screen | 1, 2, 5, fixtures of the request format | One test per check row of 6.3 and for the join; screen 04 matches section 0.1 |
 | 7 | **Run screen and egress**: `run_summary` written from run state changes, with step times and log tails, `cancel_requested` read by the API process, logs and manifest tabs, egress pipeline both modes with fakes, cancel, retention change | 4, 6 | Retention starts at `sent` or `withheld`, and survives a restart of the API process (tested); a run waiting for egress is never evicted (tested); manual Release and Withhold are signed; airlock mode shows the airlock state; optional Playwright test of the approve and release flow |
 | 7b | **Node screen**: the cards, settings, audit log and audit check of 8.7 | 1, 2, 3 | Screen 07 matches section 0.1; audit export works; the API app gains no audit route; the audit check is tested for a failed commit, an undone decision and an id reused after a rollback |
-| 7.4 | **Site list** (7.4): check the list's signature with `BIOCHEF_FEDERATION_KEY`, refuse older versions | 1, 7b | Bad signature and older version refused; the Node card shows "Up to date · N nodes" |
-| 8 | **Coordinator client**: poll over mTLS in the API process, fetch study versions, workflow versions, requests and the site list; post decisions (in the order of 7.5) and results | The agent API in `biochef-coordinator` | Integration test against the coordinator running locally with `docker compose` |
+| 7.4 | **Site list** (7.4): check the list's signature with `BIOCHEF_FEDERATION_KEY`, refuse older versions and expired lists | 1, 7b | Bad signature, older version and expired list refused; an expired stored list holds requests unchecked; the Node card shows "Up to date · N nodes" or "Expired since …" |
+| 8 | **Coordinator client**: poll over mTLS in the API process, fetch study versions, workflow versions, requests and the site list; post decisions (in the order of 7.5) and results | The agent API in `biochef-coordinator` | Integration test against the coordinator running locally with `docker compose`; the existing run routes are off on a node (section 13) |
 | 9 | **Podman runner** (**parallel**) in `runner.py`, same seam as `apptainer`, steps with `--network=none`. Snakemake has no podman mode, so `podman-step` is the shell its rules run under | nothing | `ci/runner_parity.py` extended to `podman` and passing (same result, step not on the host, neighbours hidden, environment not inherited); documented in README |
 | 9b | **Network isolation for apptainer** (**parallel**) | nothing | `ci/runner_parity.py` proves a step cannot reach the network; the Node card shows it on |
 
@@ -579,6 +584,10 @@ Taken:
 | Apptainer without `--net` support | The run fails rather than going on with the network (part 9b) |
 | SELinux under podman | `BIOCHEF_PODMAN_SELINUX=disable\|keep`, required, no default (10) |
 | Withheld results | The signed notice is kept as an unsent message when the result is withheld; part 8 only sends it (6.5) |
+| The existing API on a node | Off. While `/convert`, `/runs` and WES are served, whoever can call them runs a workflow over a bound dataset and reads the output, without study approval, the request checks or egress (6.6). Part 8 turns them off on a node. Until then a node with dataset bindings must not let anything reach the API port |
+| Visas | Checked on every request: of the required type, from a trusted issuer, the member's own (`sub`, or a LinkedIdentities visa), and no older than `BIOCHEF_PASSPORT_VISA_MAX_AGE` (6.3, check 10) |
+| Datasets of a request | Only those of the named study version (6.3, check 5) |
+| Site list expiry | An expired list is refused, and requests wait unchecked while the stored list is expired (7.4) |
 | Egress without the Policy Engine | The agent checks `types` and `max_bytes` and marks `min_count` and `aggregates_only` not verified; manual release needs a signed, audited confirmation, and the airlock gets the same marking (6.5) |
 
 Still open. Ask `jorgeMFS` before building anything that depends on these.
