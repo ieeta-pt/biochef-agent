@@ -645,7 +645,9 @@ def test_the_changed_step_is_selected_and_tagged(client, pending):
     assert "Step · qc_variants" in text
     assert "Keeps variants above the MAF and HWE thresholds." in text
     assert "maf_min 0.01" in text and "hwe_p 1e-6" in text
-    assert "✓ sign/v1 signature from the hub" in text
+    assert ("sign/v1 signature declared by the hub, not yet verified by this node"
+            in text)
+    assert "✓ sign/v1" not in text
 
 
 def test_a_step_loads_in_place(client, pending):

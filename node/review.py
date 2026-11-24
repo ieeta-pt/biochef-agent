@@ -49,11 +49,14 @@ def approve_study(session, keys, *, node, version_id, user, dac_confirmed,
     The withdrawal carries the same user: it happened because of what they did,
     and every decision names a person.
     """
+    dac_confirmed = dac_confirmed or None
+    decisions.check(subject_type=SubjectType.STUDY_VERSION, action=Action.APPROVE,
+                    user=user, dac_confirmed=dac_confirmed)
     now = now or repo.utcnow()
     replaced = repo.approve_study_version(session, version_id, now=now)
     version = repo.get_study_version(session, version_id)
     approval = _study_decision(session, keys, node, version, Action.APPROVE, user,
-                               now, dac_confirmed=dac_confirmed or None,
+                               now, dac_confirmed=dac_confirmed,
                                comment=comment)
     if replaced is not None:
         _study_decision(session, keys, node, replaced, Action.WITHDRAW, user, now,
@@ -62,6 +65,8 @@ def approve_study(session, keys, *, node, version_id, user, dac_confirmed,
 
 
 def refuse_study(session, keys, *, node, version_id, user, comment=None, now=None):
+    decisions.check(subject_type=SubjectType.STUDY_VERSION, action=Action.REFUSE,
+                    user=user)
     now = now or repo.utcnow()
     version = repo.refuse_study_version(session, version_id, now=now)
     return _study_decision(session, keys, node, version, Action.REFUSE, user, now,
@@ -69,6 +74,8 @@ def refuse_study(session, keys, *, node, version_id, user, comment=None, now=Non
 
 
 def withdraw_study(session, keys, *, node, version_id, user, comment=None, now=None):
+    decisions.check(subject_type=SubjectType.STUDY_VERSION, action=Action.WITHDRAW,
+                    user=user)
     now = now or repo.utcnow()
     version = repo.withdraw_study_version(session, version_id, now=now)
     return _study_decision(session, keys, node, version, Action.WITHDRAW, user, now,
@@ -77,6 +84,8 @@ def withdraw_study(session, keys, *, node, version_id, user, comment=None, now=N
 
 def approve_workflow(session, keys, *, node, workflow_id, user, comment=None,
                      now=None):
+    decisions.check(subject_type=SubjectType.WORKFLOW_VERSION, action=Action.APPROVE,
+                    user=user)
     now = now or repo.utcnow()
     workflow = repo.approve_workflow_version(session, workflow_id, now=now)
     return _workflow_decision(session, keys, node, workflow, Action.APPROVE, user,
@@ -85,6 +94,8 @@ def approve_workflow(session, keys, *, node, workflow_id, user, comment=None,
 
 def refuse_workflow(session, keys, *, node, workflow_id, user, comment=None,
                     now=None):
+    decisions.check(subject_type=SubjectType.WORKFLOW_VERSION, action=Action.REFUSE,
+                    user=user)
     now = now or repo.utcnow()
     workflow = repo.refuse_workflow_version(session, workflow_id, now=now)
     return _workflow_decision(session, keys, node, workflow, Action.REFUSE, user,
@@ -93,6 +104,8 @@ def refuse_workflow(session, keys, *, node, workflow_id, user, comment=None,
 
 def withdraw_workflow(session, keys, *, node, workflow_id, user, comment=None,
                       now=None):
+    decisions.check(subject_type=SubjectType.WORKFLOW_VERSION, action=Action.WITHDRAW,
+                    user=user)
     now = now or repo.utcnow()
     workflow = repo.withdraw_workflow_version(session, workflow_id, now=now)
     return _workflow_decision(session, keys, node, workflow, Action.WITHDRAW, user,
@@ -231,6 +244,7 @@ def _reopen_waiting(session, study_id, now):
 
 def undo(session, decision_id, *, user, now=None):
     """Take a decision back, with everything it moved, and say who did."""
+    decisions.check_undo(user=user)
     now = now or repo.utcnow()
     decision = repo.get_decision(session, decision_id)
     subject = _subject(session, decision)
