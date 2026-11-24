@@ -368,3 +368,61 @@ def test_a_failed_binding_writes_no_row_when_the_trail_is_down(engine, root, mon
     with pytest.raises(audit.AuditError):
         page_bind(engine, root)
     assert binding(engine) is None
+
+
+# Rule 6.2.10: a refusal leaves the store as it was, even for a caller that
+# catches the error and commits.
+
+
+def snapshot(engine):
+    """Every binding and every decision about one."""
+    with db.reading(engine) as session:
+        rows = []
+        for row in repo.dataset_bindings(session):
+            rows.append((row.dataset_id, row.source, row.location, row.visa_value,
+                         row.bound_by))
+        for dataset in ("EGAA1", "EGAD1"):
+            rows += [(row.id, row.action, row.user) for row in
+                     repo.decisions_about(session, SubjectType.DATASET_BINDING,
+                                          dataset)]
+        return rows
+
+
+def caught_and_committed(engine, call):
+    with db.writing(engine) as session:
+        try:
+            call(session)
+        except decisions.DecisionError:
+            pass
+        else:
+            pytest.fail("the call was not refused")
+
+
+def test_a_refused_bind_caught_and_committed_changes_nothing(engine, root):
+    page_bind(engine, root, "other")
+    before = snapshot(engine)
+    caught_and_committed(engine, lambda session: datasets.bind(
+        session, KEYS, node=NODE, root=root, dataset_id="EGAD1",
+        location="cohort", user=""))
+    assert snapshot(engine) == before
+
+
+def test_a_refused_unbind_caught_and_committed_changes_nothing(engine, root):
+    page_bind(engine, root)
+    before = snapshot(engine)
+    caught_and_committed(engine, lambda session: datasets.unbind(
+        session, KEYS, node=NODE, dataset_id="EGAD1", user=""))
+    assert snapshot(engine) == before
+
+
+def test_a_refused_sync_caught_and_committed_changes_nothing(engine, root,
+                                                             monkeypatch):
+    """The config binding of EGAA1 comes first and would go before the unbind
+    of EGAD1 found no trail."""
+    sync(engine, {"EGAA1": "cohort"})
+    page_bind(engine, root, "other")
+    before = snapshot(engine)
+    monkeypatch.delenv("BIOCHEF_AUDIT_LOG")
+    caught_and_committed(engine, lambda session: datasets.sync(
+        session, KEYS, NODE, {"EGAD1": datasets.Entry("cohort")}))
+    assert snapshot(engine) == before

@@ -144,8 +144,16 @@ def sync(session, keys, node, entries, now=None):
     left the file goes too, since nothing vouches for it any more.
     """
     now = now or repo.utcnow()
+    rows = repo.dataset_bindings(session)
+    if any(row.source == BindingSource.PAGE.value and row.dataset_id in entries
+           and (row.location, row.visa_value) != tuple(entries[row.dataset_id])
+           for row in rows):
+        # Refused here rather than at the unbind, after config bindings have
+        # already gone (rule 6.2.10).
+        decisions.check(subject_type=SubjectType.DATASET_BINDING,
+                        action=Action.UNBIND, user=CONFIG_USER)
     replaced = []
-    for row in repo.dataset_bindings(session):
+    for row in rows:
         entry = entries.get(row.dataset_id)
         if (row.source == BindingSource.PAGE.value and entry is not None
                 and (row.location, row.visa_value) != tuple(entry)):
@@ -173,6 +181,8 @@ def _named_by_a_study(session, dataset_id):
 def bind(session, keys, *, node, root, dataset_id, location, user, visa_value=None,
          now=None):
     """Bind or rebind from the page. Signed, audited, and never over the config."""
+    decisions.check(subject_type=SubjectType.DATASET_BINDING, action=Action.BIND,
+                    user=user)
     now = now or repo.utcnow()
     if not DATASET_ID.fullmatch(dataset_id or ""):
         raise BindingError("That is not a dataset id.")
@@ -190,6 +200,8 @@ def bind(session, keys, *, node, root, dataset_id, location, user, visa_value=No
 
 
 def unbind(session, keys, *, node, dataset_id, user, now=None):
+    decisions.check(subject_type=SubjectType.DATASET_BINDING, action=Action.UNBIND,
+                    user=user)
     now = now or repo.utcnow()
     row = repo.dataset_binding(session, dataset_id)
     if row is None:
