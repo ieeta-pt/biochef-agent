@@ -7,9 +7,8 @@ from typing import Optional
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import PlainTextResponse, Response
 
-from node import decisions, egress
+from node import egress, review
 from store import db, repo
-from store.states import Action, SubjectType
 from ui.actions import act, bind_of
 from ui.render import fragment, page
 from ui.views import run_page
@@ -107,9 +106,6 @@ def cancel(request: Request, run_id: str):
     state = request.app.state
 
     def work(session):
-        repo.request_cancel(session, run_id)
-        decisions.decide(session, state.keys, node=state.settings.node_name,
-                         subject_type=SubjectType.RUN, subject_id=run_id,
-                         action=Action.CANCEL, user=request.state.user,
-                         at=repo.utcnow())
+        review.cancel_run(session, state.keys, node=state.settings.node_name,
+                          run_id=run_id, user=request.state.user)
     return act(request, work, then=f"/ui/runs/{run_id}")
