@@ -11,7 +11,7 @@ import pyrage
 import pytest
 
 import audit
-from node import age, decisions, egress
+from node import age, decisions, egress, review as node_review
 from node.keys import generate
 from node.policy import FakePolicyEngine, LocalRules
 from store import db, repo
@@ -491,3 +491,68 @@ def test_the_studys_rules_verdict_says_what_stays_open():
     assert verdict.acceptable is False
     assert "min_count and aggregates_only cannot be" in verdict.text
     assert LocalRules().check_rules({"types": ["tsv"]}).acceptable is True
+
+
+# Rule 6.2.10: a refusal leaves the store as it was, even for a caller that
+# catches the error and commits. Here it would be a result released with no
+# signed decision behind it.
+
+
+def snapshot(engine):
+    """The run's egress, its messages and every decision about it."""
+    with db.reading(engine) as session:
+        run = repo.get_run(session, "run_1")
+        rows = [(run.egress_state, run.retain_until, run.cancel_requested)]
+        rows += [(kind, getattr(repo.message_of(session, "run_1", kind), "id", None))
+                 for kind in MessageKind]
+        for subject in (SubjectType.EGRESS, SubjectType.RUN):
+            rows += [(row.id, row.action, row.user)
+                     for row in repo.decisions_about(session, subject, "run_1")]
+        return rows
+
+
+def caught_and_committed(engine, call):
+    before = snapshot(engine)
+    with db.writing(engine) as session:
+        try:
+            call(session)
+        except decisions.DecisionError:
+            pass
+        else:
+            pytest.fail("the call was not refused")
+    assert snapshot(engine) == before
+
+
+def test_a_refused_release_caught_and_committed_changes_nothing(engine):
+    start(engine, egress.MANUAL)
+    caught_and_committed(engine, lambda session: egress.release(
+        session, KEYS, node=NODE, run_id="run_1", user=""))
+
+
+def test_a_release_with_no_trail_caught_and_committed_changes_nothing(engine,
+                                                                       monkeypatch):
+    start(engine, egress.MANUAL)
+    monkeypatch.delenv("BIOCHEF_AUDIT_LOG")
+    caught_and_committed(engine, lambda session: egress.release(
+        session, KEYS, node=NODE, run_id="run_1", user="j.silva"))
+
+
+def test_a_refused_withholding_caught_and_committed_changes_nothing(engine):
+    start(engine, egress.MANUAL)
+    caught_and_committed(engine, lambda session: egress.withhold(
+        session, KEYS, node=NODE, run_id="run_1", user="", keep_seconds=KEEP))
+
+
+@pytest.mark.parametrize("act", [egress.release, egress.withhold])
+def test_a_refused_undo_caught_and_committed_changes_nothing(engine, act):
+    options = {"keep_seconds": KEEP} if act is egress.withhold else {}
+    decision = review(engine, act, **options)
+    caught_and_committed(engine, lambda session: egress.undo_review(
+        session, repo.get_decision(session, decision), user=""))
+
+
+def test_a_refused_cancel_caught_and_committed_changes_nothing(engine):
+    with db.writing(engine) as session:
+        repo.save_run(session, "run_1", state="RUNNING")
+    caught_and_committed(engine, lambda session: node_review.cancel_run(
+        session, KEYS, node=NODE, run_id="run_1", user=""))
