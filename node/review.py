@@ -112,6 +112,16 @@ def withdraw_workflow(session, keys, *, node, workflow_id, user, comment=None,
                               now, comment=comment)
 
 
+def cancel_run(session, keys, *, node, run_id, user, now=None):
+    """Ask for a run to stop, signed by whoever asked."""
+    decisions.check(subject_type=SubjectType.RUN, action=Action.CANCEL, user=user)
+    now = now or repo.utcnow()
+    repo.request_cancel(session, run_id)
+    return decisions.decide(session, keys, node=node, subject_type=SubjectType.RUN,
+                            subject_id=run_id, action=Action.CANCEL, user=user,
+                            at=now)
+
+
 def _subject(session, decision):
     if decision.subject_type == SubjectType.STUDY_VERSION.value:
         return repo.get_study_version(session, int(decision.subject_id))

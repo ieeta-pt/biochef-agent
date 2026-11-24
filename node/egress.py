@@ -173,6 +173,8 @@ def release(session, keys, *, node, run_id, user, now=None, confirm_unverified=F
     Rules nobody checked need the person to say so, and the signed decision
     names them, so the release is on the record as one made without them.
     """
+    decisions.check(subject_type=SubjectType.EGRESS, action=Action.RELEASE,
+                    user=user)
     now = now or repo.utcnow()
     open_rules = unverified(repo.get_run(session, run_id))
     if open_rules and not confirm_unverified:
@@ -185,6 +187,8 @@ def release(session, keys, *, node, run_id, user, now=None, confirm_unverified=F
 
 
 def withhold(session, keys, *, node, run_id, user, keep_seconds, now=None):
+    decisions.check(subject_type=SubjectType.EGRESS, action=Action.WITHHOLD,
+                    user=user)
     now = now or repo.utcnow()
     repo.set_egress_state(session, run_id, EgressState.WITHHELD, now,
                           retain_seconds=keep_seconds)
@@ -195,6 +199,7 @@ def withhold(session, keys, *, node, run_id, user, keep_seconds, now=None):
 
 def undo_review(session, decision, *, user):
     """Take back a release or a withholding that has not gone anywhere yet."""
+    decisions.check_undo(user=user)
     run = repo.get_run(session, decision.subject_id)
     if repo.has_left(decision):
         raise Conflict("This decision has already been sent, so it cannot be undone.")
