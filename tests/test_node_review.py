@@ -151,6 +151,76 @@ def test_the_dac_tick_is_required(engine, confirmed):
     assert states(engine, version) == ["pending"]
 
 
+# Rule 6.2.10: a refusal leaves the store as it was, even for a caller that
+# catches the error and commits.
+
+
+def snapshot(engine):
+    """Every state, when it changed, and every decision, of the whole study."""
+    with db.reading(engine) as session:
+        rows = []
+        for version in repo.study_versions(session, "st-01"):
+            rows.append(("study", version.id, version.state,
+                         version.state_changed_at))
+            rows += [(SubjectType.STUDY_VERSION, row.id, row.action)
+                     for row in repo.decisions_about(
+                         session, SubjectType.STUDY_VERSION, version.id)]
+            for workflow in repo.workflow_versions(session, version.id):
+                rows.append(("workflow", workflow.id, workflow.state,
+                             workflow.state_changed_at))
+                rows += [(SubjectType.WORKFLOW_VERSION, row.id, row.action)
+                         for row in repo.decisions_about(
+                             session, SubjectType.WORKFLOW_VERSION, workflow.id)]
+        return rows
+
+
+def _latest_about_workflow(session, workflow):
+    return repo.decisions_about(session, SubjectType.WORKFLOW_VERSION, workflow)[0].id
+
+
+REFUSED_CALLS = {
+    "approve study without the DAC tick":
+        lambda s, v1, v2, ok, wait: review.approve_study(
+            s, KEYS, node=NODE, version_id=v2, user="j.silva",
+            dac_confirmed=False, now=LATER),
+    "approve study without a user":
+        lambda s, v1, v2, ok, wait: review.approve_study(
+            s, KEYS, node=NODE, version_id=v2, user="", dac_confirmed=True,
+            now=LATER),
+    "refuse study without a user":
+        lambda s, v1, v2, ok, wait: review.refuse_study(
+            s, KEYS, node=NODE, version_id=v2, user="", now=LATER),
+    "withdraw study without a user":
+        lambda s, v1, v2, ok, wait: review.withdraw_study(
+            s, KEYS, node=NODE, version_id=v1, user="", now=LATER),
+    "approve workflow without a user":
+        lambda s, v1, v2, ok, wait: review.approve_workflow(
+            s, KEYS, node=NODE, workflow_id=wait, user="", now=LATER),
+    "refuse workflow without a user":
+        lambda s, v1, v2, ok, wait: review.refuse_workflow(
+            s, KEYS, node=NODE, workflow_id=wait, user="", now=LATER),
+    "withdraw workflow without a user":
+        lambda s, v1, v2, ok, wait: review.withdraw_workflow(
+            s, KEYS, node=NODE, workflow_id=ok, user="", now=LATER),
+    "undo without a user":
+        lambda s, v1, v2, ok, wait: review.undo(
+            s, _latest_about_workflow(s, ok), user="", now=LATER),
+}
+
+
+@pytest.mark.parametrize("call", REFUSED_CALLS.values(), ids=REFUSED_CALLS.keys())
+def test_a_refusal_caught_and_committed_changes_nothing(engine, two_versions, call):
+    before = snapshot(engine)
+    with db.writing(engine) as session:
+        try:
+            call(session, *two_versions)
+        except DecisionError:
+            pass
+        else:
+            pytest.fail("the call was not refused")
+    assert snapshot(engine) == before
+
+
 def test_every_decision_reaches_the_trail_with_the_user(engine, two_versions, trail):
     v1, v2, *_ = two_versions
     with db.writing(engine) as session:
