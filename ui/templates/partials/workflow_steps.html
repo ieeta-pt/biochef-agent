@@ -21,7 +21,7 @@
     <div class="flex flex-col gap-1.5">
       <h3 class="lbl">Tool</h3>
       <span class="mono text-xs">{{ step.reference }}</span>
-      {% if step.signature %}<span class="text-[13px] text-ok">✓ {{ step.signature }} signature from the hub</span>{% else %}<span class="text-[13px] text-warn">No signature recorded</span>{% endif %}
+      {% if step.signature %}<span class="text-[13px] text-muted">{{ step.signature }} signature declared by the hub, not yet verified by this node</span>{% else %}<span class="text-[13px] text-warn">No signature recorded</span>{% endif %}
     </div>
     <div class="flex flex-col gap-1.5">
       <h3 class="lbl">Parameter values</h3>
