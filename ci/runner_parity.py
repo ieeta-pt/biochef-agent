@@ -222,7 +222,8 @@ def main():
 
     runners = [
         ("subprocess", SubprocessRunner()),
-        ("apptainer", ApptainerRunner(image=IMAGE, cache_dir=cache)),
+        ("apptainer", ApptainerRunner(image=IMAGE, cache_dir=cache,
+                                      binary=shutil.which("apptainer"))),
         # Both settings, so that neither stops a step from working. The runner
         # has no SELinux, so this proves the flags and the isolation, not what
         # an enforcing host does with the labels.
