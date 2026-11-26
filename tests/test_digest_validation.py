@@ -135,6 +135,7 @@ class _Registry:
         self.vouched = written if vouched is None else vouched
         self.manifest = _manifest_for(self.vouched)
         self.pulled = False
+        self.requested = []
 
     def get_container(self, target):
         return target
@@ -142,12 +143,18 @@ class _Registry:
     def get_manifest(self, container, *a, **k):
         return self.manifest
 
-    def pull(self, target, outdir):
+    def download_blob(self, container, digest, outfile):
+        """Writes what this registry serves under the title the agent asked for."""
         self.pulled = True
-        os.makedirs(outdir, exist_ok=True)
+        self.requested.append(digest)
         for name, content in self.written.items():
-            with open(os.path.join(outdir, name), "wb") as f:
-                f.write(content)
+            if outfile.endswith(os.sep + name):
+                with open(outfile, "wb") as f:
+                    f.write(content)
+                return outfile
+        # What oras does when the blob is the empty one and the request fails:
+        # it writes nothing and returns os.devnull.
+        return os.devnull
 
 
 GENUINE = {"bundle.json": json.dumps(
@@ -356,15 +363,7 @@ def test_a_nested_layer_title_is_accepted(tmp_path, monkeypatch):
 
     monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
 
-    class _Nested(_Registry):
-        def pull(self, target, outdir):
-            for name, content in self.written.items():
-                path = os.path.join(outdir, name)
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "wb") as f:
-                    f.write(content)
-
-    monkeypatch.setattr(convert, "client", _Nested(nested))
+    monkeypatch.setattr(convert, "client", _Registry(nested))
     convert.tools.clear()
     try:
         assert convert.fetch_tool("tool-1", "tool:latest")["bin"] == "tool"
@@ -508,3 +507,149 @@ def test_a_client_is_told_the_failure_was_upstream(tmp_path, monkeypatch):
         assert "Traceback" not in response.text
     finally:
         convert.tools.clear()
+
+
+# --------------------------------------------------------------------------
+# the blobs come from the manifest that was checked, and nothing else stays
+
+
+def test_the_blobs_are_the_ones_the_checked_manifest_names(tmp_path, monkeypatch):
+    """A registry that answers differently the second time gets no second ask.
+
+    client.pull fetched the manifest again and downloaded what that copy named,
+    so every check before it covered only the first copy. This registry serves
+    an extra file in every manifest after the first, and offers it for download.
+    """
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(cache))
+
+    class _Changing(_Registry):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.manifest_fetches = 0
+            self.later = _manifest_for({**GENUINE, "extra": b"added later"})
+
+        def get_manifest(self, container, *a, **k):
+            self.manifest_fetches += 1
+            return self.manifest if self.manifest_fetches == 1 else self.later
+
+        def pull(self, target, outdir):
+            raise AssertionError("client.pull fetches the manifest again")
+
+    registry = _Changing({**GENUINE, "extra": b"added later"}, vouched=GENUINE)
+    monkeypatch.setattr(convert, "client", registry)
+    convert.tools.clear()
+    try:
+        convert.fetch_tool("tool-1", "tool:latest")
+    finally:
+        convert.tools.clear()
+
+    assert registry.manifest_fetches == 1
+    assert sorted(registry.requested) == sorted(
+        layer["digest"] for layer in registry.manifest["layers"])
+    assert sorted(os.listdir(cache / "tool")) == sorted(GENUINE)
+
+
+def test_a_title_used_twice_is_refused(tmp_path, monkeypatch):
+    """The second file would replace the first, and only one digest could match."""
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+    registry = _Registry(GENUINE)
+    registry.manifest["layers"].append({
+        "digest": "sha256:" + hashlib.sha256(b"other").hexdigest(),
+        "mediaType": "application/octet-stream",
+        "annotations": {"org.opencontainers.image.title": "tool"},
+    })
+    monkeypatch.setattr(convert, "client", registry)
+    convert.tools.clear()
+    try:
+        with pytest.raises(convert.ToolIntegrityError, match="twice"):
+            convert.fetch_tool("tool-1", "tool:latest")
+    finally:
+        convert.tools.clear()
+    assert not os.path.exists(tmp_path / "cache" / "tool")
+    assert not list((tmp_path / "cache").glob("tool.part.*"))
+
+
+def test_a_file_named_as_the_directory_of_another_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(convert, "client", _Registry(
+        {**GENUINE, "bin": b"a file", "bin/tool": b"under it"}))
+    convert.tools.clear()
+    try:
+        with pytest.raises(convert.ToolIntegrityError, match="bin"):
+            convert.fetch_tool("tool-1", "tool:latest")
+    finally:
+        convert.tools.clear()
+    assert not os.path.exists(tmp_path / "cache" / "tool")
+
+
+def test_a_cached_bundle_with_a_file_the_manifest_does_not_name_is_pulled_again(
+        tmp_path, monkeypatch):
+    """Every named file matching is not enough: the extra one would stay beside the tool."""
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(cache))
+    registry = _Registry(GENUINE)
+    monkeypatch.setattr(convert, "client", registry)
+    convert.tools.clear()
+    try:
+        convert.fetch_tool("tool-1", "tool:latest")
+        (cache / "tool" / "extra").write_bytes(b"left in the cache")
+        convert.tools.clear()
+        registry.requested.clear()
+
+        convert.fetch_tool("tool-1", "tool:latest")
+    finally:
+        convert.tools.clear()
+
+    assert registry.requested, "the cache was used as it was"
+    assert sorted(os.listdir(cache / "tool")) == sorted(GENUINE)
+
+
+def test_a_named_file_that_is_a_symlink_in_the_cache_is_pulled_again(
+        tmp_path, monkeypatch):
+    """A link to another named file with the same bytes passes every hash.
+
+    It stays inside the bundle's directory and names nothing unnamed, so only
+    refusing links catches it.
+    """
+    files = {**GENUINE, "tool-copy": GENUINE["tool"]}
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(cache))
+    registry = _Registry(files)
+    monkeypatch.setattr(convert, "client", registry)
+    convert.tools.clear()
+    try:
+        convert.fetch_tool("tool-1", "tool:latest")
+        os.remove(cache / "tool" / "tool-copy")
+        os.symlink("tool", cache / "tool" / "tool-copy")
+        convert.tools.clear()
+        registry.requested.clear()
+
+        convert.fetch_tool("tool-1", "tool:latest")
+    finally:
+        convert.tools.clear()
+
+    assert registry.requested, "the symlink was trusted"
+    assert not os.path.islink(cache / "tool" / "tool-copy")
+
+
+def test_a_cached_bundle_with_a_directory_the_manifest_does_not_name_is_pulled_again(
+        tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(convert, "TOOL_CACHE", str(cache))
+    registry = _Registry({"bundle.json": GENUINE["bundle.json"],
+                          "bin/tool": GENUINE["tool"]})
+    monkeypatch.setattr(convert, "client", registry)
+    convert.tools.clear()
+    try:
+        convert.fetch_tool("tool-1", "tool:latest")
+        (cache / "tool" / "lib").mkdir()
+        convert.tools.clear()
+        registry.requested.clear()
+
+        convert.fetch_tool("tool-1", "tool:latest")
+    finally:
+        convert.tools.clear()
+
+    assert registry.requested, "the cache was used as it was"
+    assert sorted(os.listdir(cache / "tool")) == ["bin", "bundle.json"]
