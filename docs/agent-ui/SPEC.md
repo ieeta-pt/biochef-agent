@@ -121,7 +121,7 @@ fastapi run main.py                       # existing API, unchanged
 python -m ui                              # new, started by run-ui.sh
 ```
 
-Both processes share the same database and the same audit file. Add a `run-ui.sh` next to `run.sh`. The UI never mounts the API routes and the API never serves the UI or the audit trail. `python -m ui` takes the host and port from the same settings the app checks, `.env` included, and keeps uvicorn's proxy headers off, because uvicorn otherwise rewrites the client address from `X-Forwarded-For` for a local proxy, and section 4 decides trust on that address. `uvicorn ui.app:app` still works, with `--no-proxy-headers`.
+Both processes share the same database and the same audit file. Add a `run-ui.sh` next to `run.sh`. The UI never mounts the API routes and the API never serves the UI or the audit trail. `python -m ui` takes the host and port, or the unix socket, from the same settings the app checks, `.env` included, and keeps uvicorn's proxy headers off, because uvicorn otherwise rewrites the client address from `X-Forwarded-For` for a local proxy, and section 4 decides trust on that address. It is the only way to start the page: `ui.app` has no module-level `app` for `uvicorn ui.app:app`.
 
 **The database is the only channel between the two processes.** Runs, logs, slots and retained workspaces live in the memory of the API process (`runs.py`, `main.py`), where a second process cannot reach them. So:
 
@@ -183,6 +183,7 @@ Names can change if the repo's flat layout argues against packages; say so in th
 - The agent has **no user accounts and no passwords**. The TRE decides who may open the page. How depends on the deployment; a reverse proxy with Keycloak in front of the UI port is one way.
 - `BIOCHEF_UI_IDENTITY=header|dev`. No default: refuse to start without it. Also refuse to start without `BIOCHEF_AUDIT_LOG`: unset, `audit.record` writes nothing and reports nothing, and every decision must be in the trail.
   - `header`: the proxy passes the user name in the header named by `BIOCHEF_UI_IDENTITY_HEADER` (for example `X-Forwarded-User`). The UI accepts that header **only** from the addresses in `BIOCHEF_UI_TRUSTED_PROXIES` (comma separated CIDRs). From any other address, or without the header, or with the header repeated, empty or holding control characters, answer 401 and do not render any page.
+    - With `BIOCHEF_UI_SOCKET`, the UI listens on that unix socket instead of `BIOCHEF_UI_HOST` and `BIOCHEF_UI_PORT`, and whoever can open it is the proxy: only a request that came in on that socket counts, and `BIOCHEF_UI_TRUSTED_PROXIES` stays unset. Refuse to start when the path is not absolute, is longer than the 107 bytes a socket address holds, or is not in an existing directory; when that directory belongs to another user, can be entered by every user, or can be written by its group; with `dev` identity; or with `BIOCHEF_UI_TRUSTED_PROXIES`, `BIOCHEF_UI_HOST` or `BIOCHEF_UI_PORT` next to it.
   - `dev`: a fixed user from `BIOCHEF_UI_DEV_USER`. Refuse to start in `dev` unless `BIOCHEF_UI_HOST` is `127.0.0.1` or `::1`. Also check the client address of each request, because a `--host` given on the command line bypasses the variable. Show a red "development identity" bar on every page.
 - There are no roles in the agent. Whoever the TRE lets in is a data manager. **Every** decision records that user name in the audit trail and in the decision object.
 - The sidebar footer shows "Signed in through the TRE · <user>".
@@ -514,7 +515,8 @@ All read with `os.getenv`, all in `README.md` and `example.env` (test enforced).
 | `BIOCHEF_UI_PORT` | `8081` | 3 | UI port |
 | `BIOCHEF_UI_IDENTITY` | none, required | 3 | `header` or `dev` |
 | `BIOCHEF_UI_IDENTITY_HEADER` | none, required with `header` | 3 | Header carrying the user name |
-| `BIOCHEF_UI_TRUSTED_PROXIES` | none, required with `header` | 3 | CIDRs allowed to set that header |
+| `BIOCHEF_UI_TRUSTED_PROXIES` | none, required with `header` unless `BIOCHEF_UI_SOCKET` is set | 3 | CIDRs allowed to set that header |
+| `BIOCHEF_UI_SOCKET` | none, `header` only | 3 | Unix socket the UI listens on instead of `BIOCHEF_UI_HOST` and `BIOCHEF_UI_PORT`; whoever can open it is the proxy |
 | `BIOCHEF_UI_DEV_USER` | none, required with `dev` | 3 | Fixed user for development |
 | `BIOCHEF_NODE_NAME` | none, required | 3 | Shown in the sidebar and in decisions |
 | `BIOCHEF_POLICY_ENGINE_URL` | none | 3 | Where "Open Policy Engine" points |
