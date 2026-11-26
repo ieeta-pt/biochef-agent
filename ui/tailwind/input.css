@@ -228,6 +228,7 @@
   .graph-step { border-color: var(--color-line); cursor: pointer; }
   .graph-selected { border: 2px solid var(--color-brand); }
   .key-line, .keys-hide { display: none; }
+  .kv { display: grid; grid-template-columns: 200px 1fr; gap: 12px; }
   .keys-toggle:checked ~ div .key-line { display: block; }
   .keys-toggle:checked ~ div .keys-show { display: none; }
   .keys-toggle:checked ~ div .keys-hide { display: inline; }

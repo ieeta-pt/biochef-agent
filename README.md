@@ -325,6 +325,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_NODE_SIGNING_KEY` | | path of the node's Ed25519 private key, see [The node's keys](#the-nodes-keys) |
 | `BIOCHEF_NODE_ENCRYPTION_KEY` | | path of the node's X25519 private key |
 | `BIOCHEF_NODE_NAME` | | this node's name, required by the UI |
+| `BIOCHEF_COORDINATOR_POLL_SECONDS` | `30` | how often the coordinator is polled; three intervals with no success shows it as offline |
 | `BIOCHEF_EGRESS_MODE` | | `airlock` or `manual`, required by the UI, and what makes an agent a node, see [Egress](#egress) |
 | `BIOCHEF_DATASET_BINDINGS_FILE` | | YAML file of dataset bindings, locked on the page |
 | `BIOCHEF_DATASET_BINDINGS_FROM_UI` | `false` | allow bindings to be made on the page |
@@ -666,6 +667,12 @@ In `header` mode:
 The page refuses to start without `BIOCHEF_AUDIT_LOG`, because every decision made there has to reach the trail, and without the node's signing key or a migrated database. `run-ui.sh` starts `python -m ui`, which keeps uvicorn's proxy headers off, and it is the only way to start the page. There is no `ui.app:app` for `uvicorn` to import, because uvicorn started that way takes the client address from `X-Forwarded-For` for any connection from 127.0.0.1, and then any local process could pose as a trusted proxy and name any user.
 
 Everything the page loads is served by the agent: htmx, the fonts and the stylesheet are in `ui/static/`, and `ui/static.sha256` records the vendored files. `ui/static/app.css` is built and committed, so nothing else is needed at runtime. After changing a template or `ui/tailwind/input.css`, run `make css`, which downloads the pinned Tailwind CLI, checks it against `ui/tailwind/SHA256SUMS` and rebuilds the file. CI fails if the committed file differs.
+
+## The Node screen
+
+The Node screen shows the keys' fingerprints, the site list, the coordinator, the runner and the settings, all read only, and the newest 50 events of the audit trail. "Export" downloads the whole trail. The page process reads the file itself, and the API still has no route to it.
+
+A decision's audit event is written before its transaction commits, so a commit that fails leaves an event for a decision that does not exist. The screen crosses the trail with the `decision` table and lists any such event. Nothing repairs the trail. An event is matched on its decision id, subject, action and user, and one followed by an undo is accounted for.
 
 ## Egress
 

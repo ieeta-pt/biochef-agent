@@ -2,3 +2,77 @@
 {% block title %}Node{% endblock %}
 {% block heading %}Node{% endblock %}
 {% block intro %}How this node is set up. The settings come from the agent's config file and are shown here to read; the TRE operator changes them there.{% endblock %}
+{% block content %}
+<div class="grid grid-cols-[repeat(auto-fit,minmax(200px,1fr))] gap-4">
+  <section aria-label="Node keys" class="card flex flex-col gap-1.5 p-4">
+    <input id="show-prints" type="checkbox" class="keys-toggle sr-only">
+    <h2 class="lbl">Node keys</h2>
+    <span class="text-base font-medium text-ok">Ready</span>
+    <div class="flex flex-col gap-1 text-[13px]">
+      <span class="mono keys-show text-xs">{{ data.signing_short }}<br>{{ data.encryption_short }}</span>
+      <span class="key-line mono break-all text-xs">{{ data.signing }}<br>{{ data.encryption }}</span>
+      <label for="show-prints" class="cursor-pointer text-brand-strong underline"><span class="keys-show">Show fingerprints</span><span class="keys-hide">Hide fingerprints</span></label>
+    </div>
+  </section>
+  <section aria-label="Federation" class="card flex flex-col gap-1.5 p-4">
+    <h2 class="lbl">Federation</h2>
+    <span class="text-base font-medium {{ 'text-ok' if data.federation.kind == 'ok' else 'text-muted' }}">{{ data.federation.headline }}</span>
+    {% if data.federation.detail %}<span class="text-[13px] text-muted">{{ data.federation.detail }}</span>{% endif %}
+  </section>
+  <section aria-label="Coordinator" class="card flex flex-col gap-1.5 p-4">
+    <h2 class="lbl">Coordinator</h2>
+    <span class="text-base font-medium {{ {'ok': 'text-ok', 'bad': 'text-bad', 'mute': 'text-muted'}[data.coordinator.kind] }}">{{ data.coordinator.headline }}</span>
+    {% if data.coordinator.detail %}<span class="text-[13px] text-muted">{{ data.coordinator.detail }}</span>{% endif %}
+  </section>
+  <section aria-label="Runner" class="card flex flex-col gap-1.5 p-4">
+    <h2 class="lbl">Runner</h2>
+    <span class="text-base font-medium">{{ data.runner }}</span>
+    <span class="text-[13px] text-muted">{{ data.busy }} of {{ data.slots }} slots busy</span>
+    {% if data.isolated %}<span class="text-[13px] text-ok">Network isolation: on</span>{% else %}<span class="text-[13px] font-medium text-warn">Network isolation: off</span>{% endif %}
+  </section>
+</div>
+<section aria-label="Settings" class="card flex flex-col gap-2 px-6 py-5 text-sm">
+  <div class="kv"><span class="text-label">Egress</span><span>{{ data.egress[0] }} <span class="text-muted">(other option: {{ data.egress[1] }})</span></span></div>
+  <div class="kv"><span class="text-label">Dataset bindings</span><span>{{ data.bindings[0] }} <span class="text-muted">(other option: {{ data.bindings[1] }})</span></span></div>
+  <div class="kv"><span class="text-label">Data root</span><span class="mono">{{ data.root }}</span></div>
+  <div class="kv"><span class="text-label">Outputs after egress</span><span>{{ data.retention }}</span></div>
+  <div class="kv"><span class="text-label">Tool signatures</span><span>{{ data.signatures }}</span></div>
+</section>
+<section aria-label="Audit check" class="card flex flex-col gap-2 px-6 py-5">
+  <h2 class="m-0 text-base font-medium">Audit check</h2>
+  {% if data.orphans %}
+  <p class="m-0 text-sm text-warn">{{ data.orphans|length }} audit event{{ '' if data.orphans|length == 1 else 's' }} with no decision behind {{ 'it' if data.orphans|length == 1 else 'them' }}. The decision's transaction failed after the event was written. Nothing here changes the trail.</p>
+  <div class="table-box">
+    <table>
+      <thead><tr><th>Time</th><th>Event</th><th>Subject</th><th>By</th><th>Decision id</th></tr></thead>
+      <tbody>
+        {% for row in data.orphans %}
+        <tr class="bg-warn-soft"><td>{{ row.when }}</td><td>{{ row.event }}</td><td class="mono">{{ row.subject }}</td><td>{{ row.by }}</td><td class="mono">{{ data.orphan_ids[loop.index0] }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="m-0 text-sm text-ok">✓ Every decision event in the audit trail has its decision.</p>
+  {% endif %}
+</section>
+<section aria-label="Audit log" class="card flex flex-col gap-3 px-6 py-5">
+  <div class="flex flex-col gap-1">
+    <h2 class="m-0 text-base font-medium">Audit log</h2>
+    <span class="text-[13px] text-muted">Append only · every signed decision and every run state</span>
+  </div>
+  <div class="table-box">
+    <table>
+      <thead><tr><th>Time</th><th>Event</th><th>Subject</th><th>By</th><th>Signature</th></tr></thead>
+      <tbody>
+        {% for row in data.events %}
+        <tr {% if row.bad %}class="bg-bad-soft"{% endif %}><td class="whitespace-nowrap">{{ row.when }}</td><td>{{ row.event }}</td><td class="mono">{{ row.subject }}</td><td>{{ row.by }}</td><td {% if row.signed != 'n/a' %}class="mono"{% endif %}>{{ row.signed }}</td></tr>
+        {% else %}
+        <tr><td colspan="5">Nothing in the audit trail yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <a href="/ui/node/audit.jsonl" class="text-sm">Export (JSON lines)</a>
+</section>
+{% endblock %}
