@@ -335,7 +335,8 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_UI_PORT` | `8081` | UI port |
 | `BIOCHEF_UI_IDENTITY` | | `header` or `dev`, no default, see [The page for a node's data manager](#the-page-for-a-nodes-data-manager) |
 | `BIOCHEF_UI_IDENTITY_HEADER` | | header carrying the user name, required with `header` |
-| `BIOCHEF_UI_TRUSTED_PROXIES` | | comma separated CIDRs allowed to set that header, required with `header` |
+| `BIOCHEF_UI_TRUSTED_PROXIES` | | comma separated CIDRs allowed to set that header, required with `header` unless `BIOCHEF_UI_SOCKET` is set |
+| `BIOCHEF_UI_SOCKET` | | unix socket the UI listens on instead of `BIOCHEF_UI_HOST` and `BIOCHEF_UI_PORT`, `header` only; whoever can open it is the proxy |
 | `BIOCHEF_UI_DEV_USER` | | fixed user, required with `dev` |
 | `BIOCHEF_POLICY_ENGINE_URL` | | where "Open Policy Engine" points; unset hides the link |
 | `BIOCHEF_KEEP_WORKSPACE` | `false` | leave a run's directory behind, for debugging |
@@ -658,11 +659,12 @@ The agent has no accounts. The TRE decides who may open the page, and `BIOCHEF_U
 In `header` mode:
 
 - The proxy has to set the header itself, replacing any value the browser sent. If it passes one through or appends to it, the browser names the user.
-- Every process that can connect from a trusted address can name any user. If you trust `127.0.0.1`, that includes every local process and every workflow step: `subprocess` runs steps on this host, and `apptainer` with the default `BIOCHEF_APPTAINER_ARGS` shares its network. Prefer a proxy on its own address.
+- Every process that can connect from a trusted address can name any user. If you trust `127.0.0.1`, that includes every local process and every workflow step: `subprocess` runs steps on this host, and `apptainer` with the default `BIOCHEF_APPTAINER_ARGS` shares its network. Prefer a proxy on its own address, or a unix socket.
+- With `BIOCHEF_UI_SOCKET=/run/biochef-ui/ui.sock`, the page listens on that socket instead of a port, and whoever can open it is the proxy. Leave `BIOCHEF_UI_TRUSTED_PROXIES`, `BIOCHEF_UI_HOST` and `BIOCHEF_UI_PORT` unset; the page refuses to start with any of them. uvicorn makes the socket writable by every user, so its directory is what keeps them out: make it `0750`, owned by the user the page runs as, with the proxy's group. The page refuses to start if every user can enter it, if its group can write to it, or if another user owns it. In nginx, `proxy_pass http://unix:/run/biochef-ui/ui.sock;`. This keeps out other users, and steps that cannot see the directory. `subprocess` steps run as the agent's user, so to keep them out as well, run the page as a user of its own.
 - The browser has to reach the proxy over https. The CSRF cookie is `__Host-` and `Secure`, so over plain http the browser drops it, and every change on the page is refused with 403. Only `localhost` is exempt.
 - Publish the page at the root of its own host, for example `https://agent.tre.example/`, not under a path such as `/agent/`. The pages link to `/ui/...`, and the cookie needs `Path=/`.
 
-The page refuses to start without `BIOCHEF_AUDIT_LOG`, because every decision made there has to reach the trail, and without the node's signing key or a migrated database. `run-ui.sh` starts `python -m ui`, which keeps uvicorn's proxy headers off. If you run `uvicorn ui.app:app` yourself, pass `--no-proxy-headers`. Otherwise uvicorn takes the client address from `X-Forwarded-For` for any connection from 127.0.0.1, so any local process can pose as a trusted proxy and name any user.
+The page refuses to start without `BIOCHEF_AUDIT_LOG`, because every decision made there has to reach the trail, and without the node's signing key or a migrated database. `run-ui.sh` starts `python -m ui`, which keeps uvicorn's proxy headers off, and it is the only way to start the page. There is no `ui.app:app` for `uvicorn` to import, because uvicorn started that way takes the client address from `X-Forwarded-For` for any connection from 127.0.0.1, and then any local process could pose as a trusted proxy and name any user.
 
 Everything the page loads is served by the agent: htmx, the fonts and the stylesheet are in `ui/static/`, and `ui/static.sha256` records the vendored files. `ui/static/app.css` is built and committed, so nothing else is needed at runtime. After changing a template or `ui/tailwind/input.css`, run `make css`, which downloads the pinned Tailwind CLI, checks it against `ui/tailwind/SHA256SUMS` and rebuilds the file. CI fails if the committed file differs.
 
