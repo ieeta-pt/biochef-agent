@@ -185,12 +185,11 @@ def _seed_workflows(session, keys, versions, now):
 
 
 def _add_request(session, versions, workflows, now, *, request_id, study, number,
-                 key, member, age, joined=None):
+                 key, member, age):
     at = now - age
     member = mock.MEMBERS[member][0]
     version = versions[(study, number)]
-    # A repeated request carries the same payload as the one it joined.
-    payload = _digest((joined or request_id).encode())
+    payload = _digest(request_id.encode())
     document = {"request_id": request_id, "study_id": study,
                 "study_version": number, "study_digest": version.digest,
                 "workflow_digest": workflows[key].digest, "member": member,
@@ -208,20 +207,20 @@ def _add_request(session, versions, workflows, now, *, request_id, study, number
 
 def _seed_requests(session, keys, versions, workflows, now):
     pending_verdicts = []
-    for (request_id, study, number, key, member, age, verdict, failed, joined,
+    for (request_id, study, number, key, member, age, verdict, failed, repeats,
          run) in mock.REQUESTS:
         at = _add_request(
             session, versions, workflows, now, request_id=request_id, study=study,
-            number=number, key=key, member=member, age=age, joined=joined)
-        pending_verdicts.append((request_id, at, verdict, failed, joined, run))
+            number=number, key=key, member=member, age=age)
+        pending_verdicts.append((request_id, at, verdict, failed, repeats, run))
 
     pending_verdicts.extend(_older_requests(session, versions, workflows, now))
 
-    # Joined requests point at a request that must exist first, and every row
-    # above does by now.
-    for request_id, at, verdict, failed, joined, run in pending_verdicts:
+    for request_id, at, verdict, failed, repeats, run in pending_verdicts:
         repo.set_verdict(session, request_id, Verdict(verdict), failed_check=failed,
-                         joined_request_id=joined, run_id=run)
+                         run_id=run)
+        for _ in range(repeats):
+            repo.note_repeat(session, request_id, at + mock.hours(1))
         if verdict == "refused":
             _decide(session, keys, SubjectType.REQUEST, request_id, Action.REFUSE,
                     SYSTEM_USER, at, reason=failed)
@@ -241,7 +240,7 @@ def _older_requests(session, versions, workflows, now):
             at = _add_request(
                 session, versions, workflows, now, request_id=request_id,
                 study=study, number=number, key=key, member=member, age=age)
-            rows.append((request_id, at, "accepted", None, None,
+            rows.append((request_id, at, "accepted", None, 0,
                          f"run_{request_id[4:]}"))
     return rows
 

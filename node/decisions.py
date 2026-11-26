@@ -152,7 +152,7 @@ def store(session, document, object_raw, signature):
         signature=signature)
 
 
-def _require_a_trail():
+def require_a_trail():
     # audit.record does nothing at all when no trail is configured, which is a
     # fair default for the API and not for a decision. A signed approval with no
     # audit event looks fine until someone needs the event.
@@ -167,14 +167,14 @@ def check(*, subject_type, action, user, dac_confirmed=None):
     refusal came from decide, a caller that catches the error and commits would
     keep the states with no signed decision behind them (rule 6.2.10).
     """
-    _require_a_trail()
+    require_a_trail()
     _check(subject_type=subject_type, action=action, user=user,
            dac_confirmed=dac_confirmed)
 
 
 def check_undo(*, user):
     """Refuse an undo that undo would refuse, before anything has moved."""
-    _require_a_trail()
+    require_a_trail()
     if not user:
         raise DecisionError("an undo records who made it")
 
@@ -183,7 +183,7 @@ def decide(session, keys, *, node, subject_type, subject_id, action, user,
            at=None, subject_hash=None, comment=None, dac_confirmed=None,
            reason=None):
     """Build, sign, store and audit one decision."""
-    _require_a_trail()
+    require_a_trail()
     document = build(
         node=node, subject_type=subject_type, subject_id=subject_id,
         action=action, user=user, at=at or repo.utcnow(),
