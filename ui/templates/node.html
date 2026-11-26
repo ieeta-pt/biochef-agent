@@ -29,11 +29,17 @@
     <span class="text-base font-medium">{{ data.runner }}</span>
     <span class="text-[13px] text-muted">{{ data.busy }} of {{ data.slots }} slots busy</span>
     {% if data.isolated %}<span class="text-[13px] text-ok">Network isolation: on</span>{% else %}<span class="text-[13px] font-medium text-warn">Network isolation: off</span>{% endif %}
+    <ul aria-label="What the runner guarantees" class="flex flex-col gap-0.5 text-[13px]">
+      {% for aspect, words, value in data.guarantees %}<li><span class="text-label">{{ aspect }}:</span> <span class="{{ 'text-ok' if value == 'enforced' else 'font-medium text-warn' }}">{{ words }}</span></li>
+      {% endfor %}
+    </ul>
+    {% if data.network_check %}<span class="text-[13px] {{ {'ok': 'text-ok', 'bad': 'font-medium text-bad', 'mute': 'text-muted'}[data.network_check.kind] }}">{{ data.network_check.text }}</span>{% endif %}
   </section>
 </div>
 <section aria-label="Settings" class="card flex flex-col gap-2 px-6 py-5 text-sm">
   <div class="kv"><span class="text-label">Egress</span><span>{{ data.egress[0] }} <span class="text-muted">(other option: {{ data.egress[1] }})</span></span></div>
   <div class="kv"><span class="text-label">Dataset bindings</span><span>{{ data.bindings[0] }} <span class="text-muted">(other option: {{ data.bindings[1] }})</span></span></div>
+  <div class="kv"><span class="text-label">Network isolation</span><span>{{ "Required: a runner the agent does not isolate is refused" if data.require_isolation else "Not required" }}</span></div>
   <div class="kv"><span class="text-label">Data root</span><span class="mono">{{ data.root }}</span></div>
   <div class="kv"><span class="text-label">Outputs after egress</span><span>{{ data.retention }}</span></div>
   <div class="kv"><span class="text-label">Tool signatures</span><span>{{ data.signatures }}</span></div>

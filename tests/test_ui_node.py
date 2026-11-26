@@ -246,6 +246,68 @@ def test_the_check_only_reads(bare, trail):
     assert trail.read_text() == before
 
 
+# What the runner guarantees, and its network check at start (section 14.1)
+
+ALL_ENFORCED = (("network", "enforced"), ("filesystem", "enforced"),
+                ("environment", "enforced"))
+
+
+def test_the_card_lists_the_three_guarantees(engine):
+    text = web(engine).get("/ui/node").text
+    for aspect in ("Network:", "Filesystem:", "Environment:"):
+        assert aspect in text
+    assert text.count('<span class="font-medium text-warn">none</span>') == 3
+
+
+def test_enforced_guarantees_are_in_ok_colours(engine):
+    text = web(engine, runner="podman", network_isolated=True,
+               guarantees=ALL_ENFORCED).get("/ui/node").text
+    assert text.count('<span class="text-ok">enforced by the agent</span>') == 3
+
+
+def test_an_attested_guarantee_says_it_is_not_verified(engine):
+    text = web(engine, guarantees=(("network", "attested"), ("filesystem", "none"),
+                                   ("environment", "none"))).get("/ui/node").text
+    assert ('<span class="font-medium text-warn">left to the backend, not verified'
+            '</span>') in text
+
+
+def test_no_check_is_shown_for_a_runner_that_claims_no_isolation(engine):
+    assert "at start" not in web(engine).get("/ui/node").text
+
+
+def test_an_isolating_runner_not_checked_yet_says_so(engine):
+    text = web(engine, network_isolated=True, guarantees=ALL_ENFORCED).get(
+        "/ui/node").text
+    assert '<span class="text-[13px] text-muted">Not checked at start yet</span>' in text
+
+
+def test_a_passed_check_is_shown(engine):
+    with db.writing(engine) as session:
+        repo.record_network_check(session, ok=True, detail="no route or address but loopback",
+                                  now=NOW)
+    text = web(engine, network_isolated=True, guarantees=ALL_ENFORCED).get(
+        "/ui/node").text
+    assert "text-ok\">Checked at start" in text and "no route or address but loopback" in text
+
+
+def test_a_failed_check_is_shown_in_bad_colours(engine):
+    with db.writing(engine) as session:
+        repo.record_network_check(session, ok=False, detail="a step saw 1 routes or addresses besides loopback",
+                                  now=NOW)
+    text = web(engine, network_isolated=True, guarantees=ALL_ENFORCED).get(
+        "/ui/node").text
+    assert 'font-medium text-bad">Check at start failed' in text
+    assert "a step saw 1 routes or addresses besides loopback" in text
+
+
+@pytest.mark.parametrize("required,words", [
+    (True, "Required: a runner the agent does not isolate is refused"),
+    (False, "Not required")])
+def test_the_rule_is_among_the_settings(engine, required, words):
+    text = web(engine, require_network_isolation=required).get("/ui/node").text
+    assert f"<span>{words}</span>" in text
+
 # --------------------------------------------------------------------------
 # the words of the trail: names a person knows, for every kind of event
 
@@ -352,3 +414,25 @@ def test_a_demo_event_carries_the_time_of_what_it_records(engine, trail):
         for event in approvals:
             row = session.get(Decision, event["decision_id"])
             assert event["at"] == row.at.isoformat()
+
+
+def test_the_runners_events_are_in_words_and_name_the_runner(engine, trail):
+    audit.record("node.runner.isolation_not_required", runner="subprocess", network="none",
+                 setting="BIOCHEF_REQUIRE_NETWORK_ISOLATION=false")
+    audit.record("node.runner.network_check", runner="podman", ok=True,
+                 detail="no route or address but loopback")
+    audit.record("node.runner.network_check", runner="podman", ok=False, detail="a route")
+    text = audit_text(engine)
+    assert "Network isolation turned off for the subprocess runner" in text
+    assert "podman network check passed" in text and "podman network check failed" in text
+    assert '<td class="mono">subprocess</td>' in text
+    assert text.count('<td class="mono">podman</td>') == 2
+    assert "node.runner" not in text
+
+
+def test_a_runner_event_without_its_fields_still_reads(engine, trail):
+    audit.record("node.runner.network_check")
+    audit.record("node.runner.isolation_not_required")
+    text = audit_text(engine)
+    assert "Runner network check failed" in text
+    assert "Network isolation turned off for the runner runner" in text

@@ -396,6 +396,7 @@ def test_a_proxy_on_the_socket_names_the_user(tmp_path, socket_dir):
                    BIOCHEF_AUDIT_LOG=str(tmp_path / "audit.jsonl"), BIOCHEF_DB_URL=url,
                    BIOCHEF_PASSPORT_REQUIRE_VISA="ControlledAccessGrants",
                    BIOCHEF_EGRESS_MODE="manual",
+                   BIOCHEF_REQUIRE_NETWORK_ISOLATION="false",
                    BIOCHEF_NODE_SIGNING_KEY=str(tmp_path / "keys" / node_keys.SIGNING_FILE),
                    BIOCHEF_NODE_ENCRYPTION_KEY=str(tmp_path / "keys" / node_keys.ENCRYPTION_FILE))
     server = subprocess.Popen([sys.executable, "-m", "ui"], cwd=REPO_ROOT, env=env,
@@ -498,6 +499,27 @@ def test_isolation_follows_the_runner(dev):
     assert settings.load().network_isolated is False
     dev.setenv("BIOCHEF_RUNNER", "apptainer")
     assert settings.load().network_isolated is True
+
+
+def test_the_guarantees_follow_the_runner(dev):
+    assert dict(settings.load().guarantees) == {
+        "network": "none", "filesystem": "none", "environment": "none"}
+    dev.setenv("BIOCHEF_RUNNER", "apptainer")
+    assert set(dict(settings.load().guarantees).values()) == {"enforced"}
+
+
+def test_the_rule_stops_the_page_as_it_stops_the_agent(dev):
+    dev.setenv("BIOCHEF_REQUIRE_NETWORK_ISOLATION", "true")
+    with pytest.raises(SettingsError, match="refuses BIOCHEF_RUNNER=subprocess"):
+        settings.load()
+    dev.setenv("BIOCHEF_RUNNER", "apptainer")
+    assert settings.load().require_network_isolation is True
+
+
+def test_a_bad_rule_value_stops_the_page(dev):
+    dev.setenv("BIOCHEF_REQUIRE_NETWORK_ISOLATION", "yes")
+    with pytest.raises(SettingsError, match="must be true or false"):
+        settings.load()
 
 
 def test_a_runner_that_does_not_exist_stops_the_page(dev):
