@@ -3,13 +3,15 @@
 import os
 import subprocess
 import sys
+import time
 
+import httpx
 import pytest
 
 import ui.__main__ as entry
 from node import keys as node_keys
 from store import migrate
-from tests.ui_support import REPO_ROOT, USER_HEADER
+from tests.ui_support import PAGES, REPO_ROOT, USER_HEADER
 from ui import app as ui_app
 from ui import settings
 from ui.app import create_app
@@ -17,7 +19,7 @@ from ui.settings import SettingsError
 
 NAMES = ("BIOCHEF_UI_IDENTITY", "BIOCHEF_UI_IDENTITY_HEADER",
          "BIOCHEF_UI_TRUSTED_PROXIES", "BIOCHEF_UI_DEV_USER", "BIOCHEF_UI_HOST",
-         "BIOCHEF_UI_PORT", "BIOCHEF_POLICY_ENGINE_URL")
+         "BIOCHEF_UI_PORT", "BIOCHEF_UI_SOCKET", "BIOCHEF_POLICY_ENGINE_URL")
 
 
 @pytest.fixture
@@ -208,24 +210,126 @@ def test_the_fake_policy_engine_is_for_development_only(ready, dev):
     assert ui_app.configured_app().state.policy is None
 
 
+# A unix socket instead of an address
+
+
+@pytest.fixture
+def socket_dir(tmp_path):
+    directory = tmp_path / "ui"
+    directory.mkdir()
+    directory.chmod(0o750)
+    return directory
+
+
+@pytest.fixture
+def on_a_socket(header, socket_dir):
+    header.delenv("BIOCHEF_UI_TRUSTED_PROXIES")
+    header.setenv("BIOCHEF_UI_SOCKET", str(socket_dir / "ui.sock"))
+    return header
+
+
+def test_header_mode_can_listen_on_a_socket(on_a_socket, socket_dir):
+    loaded = settings.load()
+    assert loaded.socket == str(socket_dir / "ui.sock")
+    assert loaded.trusted_proxies == ()
+    assert loaded.secure_cookies is True
+
+
+@pytest.mark.parametrize("mode", [0o755, 0o751, 0o754, 0o1777])
+def test_the_socket_directory_keeps_other_users_out(on_a_socket, socket_dir, mode):
+    # uvicorn makes the socket itself writable by everyone.
+    socket_dir.chmod(mode)
+    with pytest.raises(SettingsError, match="every user can enter"):
+        settings.load()
+
+
+@pytest.mark.parametrize("mode", [0o700, 0o710, 0o740])
+def test_a_socket_directory_can_be_closed_further(on_a_socket, socket_dir, mode):
+    socket_dir.chmod(mode)
+    assert settings.load().socket == str(socket_dir / "ui.sock")
+
+
+@pytest.mark.parametrize("mode", [0o770, 0o730, 0o720])
+def test_the_group_cannot_replace_the_socket(on_a_socket, socket_dir, mode):
+    socket_dir.chmod(mode)
+    with pytest.raises(SettingsError, match="the group can write"):
+        settings.load()
+
+
+def test_the_socket_directory_belongs_to_the_page(on_a_socket, monkeypatch):
+    owner = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: owner + 1)
+    with pytest.raises(SettingsError, match="belongs to another user"):
+        settings.load()
+
+
+@pytest.mark.parametrize("value, message", [
+    ("ui.sock", "absolute path"),
+    ("run/ui.sock", "absolute path"),
+    ("/nonexistent-biochef/ui.sock", "not a directory"),
+])
+def test_a_socket_is_an_absolute_path_in_a_directory(on_a_socket, value, message):
+    on_a_socket.setenv("BIOCHEF_UI_SOCKET", value)
+    with pytest.raises(SettingsError, match=message):
+        settings.load()
+
+
+def test_a_socket_path_fits_in_a_socket_address(on_a_socket, socket_dir):
+    longest = str(socket_dir) + "/"
+    longest += "s" * (settings.MAX_SOCKET_PATH - len(longest))
+    on_a_socket.setenv("BIOCHEF_UI_SOCKET", longest)
+    assert settings.load().socket == longest
+    on_a_socket.setenv("BIOCHEF_UI_SOCKET", longest + "s")
+    with pytest.raises(SettingsError, match="longer than the 107 bytes"):
+        settings.load()
+
+
+def test_a_socket_under_a_file_is_refused(on_a_socket, socket_dir):
+    (socket_dir / "file").write_text("")
+    on_a_socket.setenv("BIOCHEF_UI_SOCKET", str(socket_dir / "file" / "ui.sock"))
+    with pytest.raises(SettingsError, match="not a directory"):
+        settings.load()
+
+
+@pytest.mark.parametrize("name, value", [("BIOCHEF_UI_TRUSTED_PROXIES", "10.0.0.0/24"),
+                                         ("BIOCHEF_UI_HOST", "127.0.0.1"),
+                                         ("BIOCHEF_UI_PORT", "8081")])
+def test_with_a_socket_no_address_applies(on_a_socket, name, value):
+    on_a_socket.setenv(name, value)
+    with pytest.raises(SettingsError, match=f"{name} does not apply"):
+        settings.load()
+
+
+def test_dev_mode_has_no_socket(dev, socket_dir):
+    dev.setenv("BIOCHEF_UI_SOCKET", str(socket_dir / "ui.sock"))
+    with pytest.raises(SettingsError, match="dev identity is for a browser"):
+        settings.load()
+
+
 # The processes, as started
 
 
-def run_python(*args):
+def bare_env(**settings):
     # Set to empty rather than left out: ui/settings.py loads .env, and dotenv
     # does not override a variable that is set, so a developer's .env stays out.
-    env = {"PATH": os.environ["PATH"], "HOME": os.environ.get("HOME", "/"),
-           "PYTHONDONTWRITEBYTECODE": "1",
-           **{name: "" for name in (*NAMES, "BIOCHEF_AUDIT_LOG", "BIOCHEF_NODE_NAME")}}
-    return subprocess.run([sys.executable, *args], cwd=REPO_ROOT, env=env,
+    return {"PATH": os.environ["PATH"], "HOME": os.environ.get("HOME", "/"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            **{name: "" for name in (*NAMES, "BIOCHEF_AUDIT_LOG", "BIOCHEF_NODE_NAME")},
+            **settings}
+
+
+def run_python(*args):
+    return subprocess.run([sys.executable, *args], cwd=REPO_ROOT, env=bare_env(),
                           capture_output=True, text=True, timeout=60)
 
 
-def test_the_asgi_entry_refuses_to_start_unconfigured():
-    result = run_python("-c", "import ui.app; ui.app.app")
+def test_there_is_no_app_for_uvicorn():
+    # Started that way, uvicorn believes X-Forwarded-For from 127.0.0.1, so any
+    # local process could pose as a trusted proxy. A refusal to start without
+    # settings is not enough: it starts once they are there.
+    result = run_python("-m", "uvicorn", "ui.app:app")
     assert result.returncode != 0
-    assert "SettingsError" in result.stderr
-    assert "BIOCHEF_UI_IDENTITY" in result.stderr
+    assert 'Attribute "app" not found in module "ui.app"' in result.stderr
 
 
 def test_the_command_refuses_with_one_line():
@@ -252,6 +356,54 @@ def test_the_command_keeps_proxy_headers_off(dev, monkeypatch, tmp_path):
     assert seen == {"host": "127.0.0.1", "port": 8081, "proxy_headers": False,
                     "server_header": False}
 
+
+def test_the_command_listens_on_the_socket(on_a_socket, socket_dir, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(entry.uvicorn, "run",
+                        lambda app, **options: seen.update(options))
+    monkeypatch.setattr(entry.app, "configured_app", lambda: create_app(
+        settings.load(), bind=None, keys=None))
+    assert entry.main() == 0
+    assert seen == {"uds": str(socket_dir / "ui.sock"), "proxy_headers": False,
+                    "server_header": False}
+
+
+def test_a_proxy_on_the_socket_names_the_user(tmp_path, socket_dir):
+    path = socket_dir / "ui.sock"
+    node_keys.init(tmp_path / "keys")
+    url = f"sqlite:///{tmp_path}/agent.db"
+    migrate.upgrade(url)
+    env = bare_env(BIOCHEF_UI_IDENTITY="header", BIOCHEF_UI_IDENTITY_HEADER=USER_HEADER,
+                   BIOCHEF_UI_SOCKET=str(path), BIOCHEF_NODE_NAME="Example TRE (test)",
+                   BIOCHEF_AUDIT_LOG=str(tmp_path / "audit.jsonl"), BIOCHEF_DB_URL=url,
+                   BIOCHEF_NODE_SIGNING_KEY=str(tmp_path / "keys" / node_keys.SIGNING_FILE),
+                   BIOCHEF_NODE_ENCRYPTION_KEY=str(tmp_path / "keys" / node_keys.ENCRYPTION_FILE))
+    server = subprocess.Popen([sys.executable, "-m", "ui"], cwd=REPO_ROOT, env=env,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              text=True)
+    try:
+        transport = httpx.HTTPTransport(uds=str(path))
+        with httpx.Client(transport=transport, base_url="http://ui.tre.test") as client:
+            deadline = time.monotonic() + 30
+            while True:
+                assert server.poll() is None, server.communicate()[1]
+                try:
+                    named = client.get(PAGES[0], headers={USER_HEADER: "j.silva"})
+                    break
+                except (httpx.ConnectError, FileNotFoundError):
+                    assert time.monotonic() < deadline, "the page never listened"
+                    time.sleep(0.05)
+            nobody = client.get(PAGES[0])
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait()
+    assert named.status_code == 200
+    assert "j.silva" in named.text
+    assert nobody.status_code == 401
 
 
 def test_run_ui_uses_that_command():
