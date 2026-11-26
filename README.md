@@ -269,6 +269,73 @@ Everything else about the tool — its binary, its inputs and outputs, its
 parameter flags — comes from the bundle fetched from the registry, not from the
 request.
 
+### Is it up, and is it free
+
+Two questions, two endpoints, because they have different audiences.
+
+`GET /health` (and `HEAD /health`) answers `{"status": "ok"}` and **is the one
+route exempt from authentication**, whatever `BIOCHEF_AUTH` is set to. What probes it is an orchestrator,
+not a person, and it has no credentials to offer; a liveness check that demanded
+a token would turn a mistyped token into a healthy service that looks dead and
+gets restarted forever. That is also why it says nothing else — it answers to
+whatever can reach the port, so anything beyond "up" would be published to it.
+The exemption is matched on the exact method and path, so nothing beneath
+`/health` is reachable without credentials, and `POST /health` is still a `401`.
+Behind a proxy that sets `root_path` the path will not match and liveness will
+ask for a token, which is the direction to fail in.
+
+`GET /capacity` answers the other question and **is authenticated like every
+other route**, because every field in it describes this deployment rather than
+merely whether it is up. (Under the default `BIOCHEF_AUTH=none` that means
+anybody, the same as everything else here — the point is that `/capacity` is
+not separately exempt the way liveness is.)
+
+```json
+{
+  "version": null,
+  "authentication": "bearer",
+  "runner": "subprocess",
+  "slots": {"total": 4, "busy": 2, "free": 2},
+  "runs": {"in_flight": 1, "queued": 2, "accepting": true,
+           "by_state": {"RUNNING": 1, "QUEUED": 2, "COMPLETE": 7}},
+  "retained": {"runs": 10, "cap": 256},
+  "datasets": null
+}
+```
+
+**`slots` is what a hub routes on.** `busy` is read from the slot semaphore
+itself, not derived from run states, because `/convert` holds a slot for a whole
+synchronous conversion without ever creating a run record — an agent with every
+slot busy converting would otherwise report itself entirely free.
+
+`runs.in_flight` is the asynchronous subset of that: the runs whose worker holds
+a slot right now, as the worker records it, so the gap between it and
+`slots.busy` is exactly the `/convert` calls in progress. It is not read from
+the states. A run cancelled while `QUEUED` is `CANCELING` until its turn comes,
+and holds no slot meanwhile. A `QUEUED` run is admitted and waiting rather than
+executing, so it is reported separately and is not counted as busy. `by_state`
+is walked from the run store rather than kept as a tally, so it cannot drift
+from what the store holds.
+
+**`runs.accepting` is a separate question from free slots, and free slots do not
+answer it.** `BIOCHEF_MAX_RUNS` bounds how many run records are retained, and a
+full set of non-terminal ones refuses new work with `503` *even with every
+execution slot idle* — reachable with `MAX_RUNS` runs admitted and queued and
+nothing executing. An agent can therefore report `free: 4` and refuse
+everything, and a hub told only about slots would route work there and get the
+refusal. The field answers the admission question directly rather than leaving
+a hub to re-derive it from the retention counts.
+
+`version` is whatever `BIOCHEF_AGENT_VERSION` was set to, and `null` when it was
+not — a deployment that does not say which commit it is built from reports
+nothing rather than something invented. `datasets` is `null` for the same
+reason: which datasets a site holds comes from the DataSource interface, which
+this service does not implement yet, and `[]` would read as "this site holds
+none".
+
+Before this, the only way to discover a saturated agent was to submit work and
+be refused with `503`, which is finding out after sending it to the wrong site.
+
 ## Running it
 
 ```
@@ -296,10 +363,18 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_LOCAL_ROOT` | | the only directory `localpath` may read from |
 | `BIOCHEF_RUN_ROOT` | the system temp directory | where a run's private directory is created |
 | `BIOCHEF_RUN_TIMEOUT` | `900` | seconds before a run's whole process group is killed |
-| `BIOCHEF_AUDIT_LOG` | *(unset)* | path to an append-only JSONL audit trail; unset writes none |
+| `BIOCHEF_AUDIT_LOG` | *(unset)* | path to an append-only JSONL audit trail; unset writes none. Required by the [UI](#the-page-for-a-nodes-data-manager) |
 | `BIOCHEF_DB_URL` | `sqlite:////var/lib/biochef/agent.db` | the node's database, see [The node's store](#the-nodes-store) |
 | `BIOCHEF_NODE_SIGNING_KEY` | | path of the node's Ed25519 private key, see [The node's keys](#the-nodes-keys) |
 | `BIOCHEF_NODE_ENCRYPTION_KEY` | | path of the node's X25519 private key |
+| `BIOCHEF_NODE_NAME` | | this node's name, required by the UI |
+| `BIOCHEF_UI_HOST` | `127.0.0.1` | interface the UI binds to |
+| `BIOCHEF_UI_PORT` | `8081` | UI port |
+| `BIOCHEF_UI_IDENTITY` | | `header` or `dev`, no default, see [The page for a node's data manager](#the-page-for-a-nodes-data-manager) |
+| `BIOCHEF_UI_IDENTITY_HEADER` | | header carrying the user name, required with `header` |
+| `BIOCHEF_UI_TRUSTED_PROXIES` | | comma separated CIDRs allowed to set that header, required with `header` |
+| `BIOCHEF_UI_DEV_USER` | | fixed user, required with `dev` |
+| `BIOCHEF_POLICY_ENGINE_URL` | | where "Open Policy Engine" points; unset hides the link |
 | `BIOCHEF_KEEP_WORKSPACE` | `false` | leave a run's directory behind, for debugging |
 | `BIOCHEF_MAX_UPLOAD_BYTES` | `536870912` | largest request body accepted, in bytes |
 | `BIOCHEF_MAX_RUNS` | `256` | maximum run records retained for polling |
@@ -307,6 +382,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_KEEP_OUTPUTS` | `3600` | seconds a finished run's outputs stay fetchable; `0` deletes them at once |
 | `BIOCHEF_MAX_RETAINED_RUNS` | `32` | how many finished runs may keep outputs on disk |
 | `BIOCHEF_MAX_CONCURRENT_RUNS` | `4` | execution slots shared by `/runs` and `/convert`; admitted `/runs` jobs wait in `QUEUED` |
+| `BIOCHEF_AGENT_VERSION` | *(unset)* | what this deployment reports as its version at `/capacity`; `null` when unset |
 | `BIOCHEF_AUTH` | `none` | who may call it: `none` or `bearer` |
 | `BIOCHEF_AUTH_TOKEN` | | the shared token, required when `BIOCHEF_AUTH=bearer` |
 | `BIOCHEF_PASSPORT_ISSUER` | *(unset)* | the issuer whose passports are accepted, when `BIOCHEF_AUTH=passport` |
@@ -596,6 +672,33 @@ python -m node.keys init --out /etc/biochef/keys
 ```
 
 It prints both public fingerprints, for registering the node, and refuses to replace a key that exists. The files must stay readable by their owner only. Point `BIOCHEF_NODE_SIGNING_KEY` and `BIOCHEF_NODE_ENCRYPTION_KEY` at them; a key that is missing, exposed, inside the repository or of the wrong type is refused.
+
+## The page for a node's data manager
+
+A second process, on its own port, for the people who run a node inside a TRE. It shares the database and the audit trail with the API and nothing else: it never mounts the API's routes, and the API never serves it. So far this is the shell: the sidebar, identity, CSRF protection and five empty screens.
+
+```sh
+./run-ui.sh          # uses the settings in the environment or .env
+./run-ui.sh --dev    # a fixed user on 127.0.0.1, marked in red on every page
+```
+
+It needs Python 3.11 to 3.14, like `run.sh`, and refuses to start on any other.
+
+The agent has no accounts. The TRE decides who may open the page, and `BIOCHEF_UI_IDENTITY` says how the agent hears about it:
+
+- `header`: a reverse proxy passes the user name in `BIOCHEF_UI_IDENTITY_HEADER`. The header counts only from an address in `BIOCHEF_UI_TRUSTED_PROXIES`. Anything else is a 401, static files included.
+- `dev`: `BIOCHEF_UI_DEV_USER`, from a loopback address only. It refuses to start on any other `BIOCHEF_UI_HOST`.
+
+In `header` mode:
+
+- The proxy has to set the header itself, replacing any value the browser sent. If it passes one through or appends to it, the browser names the user.
+- Every process that can connect from a trusted address can name any user. If you trust `127.0.0.1`, that includes every local process and every workflow step: `subprocess` runs steps on this host, and `apptainer` with the default `BIOCHEF_APPTAINER_ARGS` shares its network. Prefer a proxy on its own address.
+- The browser has to reach the proxy over https. The CSRF cookie is `__Host-` and `Secure`, so over plain http the browser drops it, and every change on the page is refused with 403. Only `localhost` is exempt.
+- Publish the page at the root of its own host, for example `https://agent.tre.example/`, not under a path such as `/agent/`. The pages link to `/ui/...`, and the cookie needs `Path=/`.
+
+The page refuses to start without `BIOCHEF_AUDIT_LOG`, because every decision made there has to reach the trail. `run-ui.sh` starts `python -m ui`, which keeps uvicorn's proxy headers off. If you run `uvicorn ui.app:app` yourself, pass `--no-proxy-headers`. Otherwise uvicorn takes the client address from `X-Forwarded-For` for any connection from 127.0.0.1, so any local process can pose as a trusted proxy and name any user.
+
+Everything the page loads is served by the agent: htmx, the fonts and the stylesheet are in `ui/static/`, and `ui/static.sha256` records the vendored files. `ui/static/app.css` is built and committed, so nothing else is needed at runtime. After changing a template or `ui/tailwind/input.css`, run `make css`, which downloads the pinned Tailwind CLI, checks it against `ui/tailwind/SHA256SUMS` and rebuilds the file. CI fails if the committed file differs.
 
 ## Before deploying this
 
