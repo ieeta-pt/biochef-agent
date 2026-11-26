@@ -5,7 +5,7 @@ import re
 
 import pytest
 
-from tests.ui_support import PAGES, PROXY, dev_settings, header_settings, proxy_client, with_routes, USER_HEADER
+from tests.ui_support import LOOPBACK, PAGES, PROXY, dev_settings, header_settings, proxy_client, with_routes, USER_HEADER
 from ui import csrf
 
 DEV_COOKIE = csrf.cookie_name(False)
@@ -26,16 +26,21 @@ def test_a_page_sets_the_cookie_and_repeats_it(client):
     assert client.cookies[DEV_COOKIE] == token_of(page)
 
 
+def attributes(cookie):
+    # Compared whole rather than searched for: "Path=/ui" contains "Path=/", and
+    # a __Host- cookie needs exactly Path=/ or the browser drops it.
+    return set(cookie.split("; ")[1:])
+
+
 def test_the_cookie_has_the_attributes_of_the_spec_in_dev(client):
     cookie = client.get(PAGES[0]).headers["set-cookie"]
-    assert "HttpOnly" in cookie and "SameSite=Strict" in cookie
-    assert "Path=/" in cookie and "Secure" not in cookie
+    assert attributes(cookie) == {"Path=/", "HttpOnly", "SameSite=Strict"}
 
 
 def test_behind_the_proxy_it_is_also_secure_and_host_only():
     cookie = proxy_client().get(PAGES[0]).headers["set-cookie"]
     assert cookie.startswith("__Host-biochef-csrf=")
-    assert "; Secure" in cookie and "Domain" not in cookie
+    assert attributes(cookie) == {"Path=/", "HttpOnly", "SameSite=Strict", "Secure"}
 
 
 def test_the_token_stays_for_the_session(client):
@@ -189,14 +194,15 @@ def test_the_form_check_stops_reading_at_the_limit():
 
 
 def test_the_header_path_has_the_same_cap(client):
+    # At the byte, so a cap that drifted either way is caught.
     token = token_of(client.get(PAGES[0]))
-    big = client.post(ECHO, content="x" * (2 * csrf.MAX_FORM_BYTES),
-                      headers={"X-CSRF-Token": token})
-    assert big.status_code == 413
-    assert big.headers["x-content-type-options"] == "nosniff"
-    small = client.post(ECHO, content="x" * (csrf.MAX_FORM_BYTES // 2),
-                        headers={"X-CSRF-Token": token})
-    assert small.status_code == 200
+    over = client.post(ECHO, content="x" * (csrf.MAX_FORM_BYTES + 1),
+                       headers={"X-CSRF-Token": token})
+    assert over.status_code == 413
+    assert over.headers["x-content-type-options"] == "nosniff"
+    at = client.post(ECHO, content="x" * csrf.MAX_FORM_BYTES,
+                     headers={"X-CSRF-Token": token})
+    assert at.status_code == 200
 
 
 @pytest.mark.parametrize("method", ["put", "patch", "delete"])
@@ -205,26 +211,43 @@ def test_every_unsafe_method_is_covered(client, method):
     assert getattr(client, method)(ECHO).status_code == 403
 
 
-def test_only_reading_static_files_skips_the_check(client):
+@pytest.mark.parametrize("method", ["post", "put", "patch", "delete"])
+def test_only_reading_static_files_skips_the_check(client, method):
     token = token_of(client.get(PAGES[0]))
-    assert client.post("/ui/static/app.css").status_code == 403
-    assert client.post("/ui/static/app.css",
-                       headers={"X-CSRF-Token": token}).status_code == 405
+    write = getattr(client, method)
+    assert write("/ui/static/app.css").status_code == 403
+    assert write("/ui/static/app.css", headers={"X-CSRF-Token": token}).status_code == 405
 
 
-@pytest.mark.parametrize("method", ["put", "patch", "delete"])
-def test_writing_to_static_files_is_checked_whatever_the_method(client, method):
-    client.get(PAGES[0])
-    assert getattr(client, method)("/ui/static/app.css").status_code == 403
-
-
-def test_the_check_comes_before_the_body_cap(client):
+def test_the_check_comes_before_the_body_cap():
     # A request that cannot prove it read the page is refused as that, whatever
-    # its size, and the cap never reads its body.
-    client.get(PAGES[0])
-    big = client.post(ECHO, content="x" * (2 * csrf.MAX_FORM_BYTES),
-                      headers={"Content-Type": "application/octet-stream"})
-    assert big.status_code == 403
+    # its size, and nothing reads its body. Driven through the whole app, since
+    # the order of the middleware is the point, with a receive that counts.
+    chunk = b"x" * 65536
+    chunks = 2 * csrf.MAX_FORM_BYTES // len(chunk)
+    read = 0
+
+    async def receive():
+        nonlocal read
+        read += 1
+        return {"type": "http.request", "body": chunk, "more_body": read < chunks}
+
+    statuses = []
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            statuses.append(message["status"])
+
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+             "method": "POST", "scheme": "https", "path": ECHO, "raw_path": ECHO.encode(),
+             "root_path": "", "query_string": b"", "client": (LOOPBACK, 50000),
+             "server": ("ui.tre.test", 443), "headers": [
+                 (b"cookie", f"{DEV_COOKIE}={'t' * 43}".encode()),
+                 (b"content-type", b"application/octet-stream"),
+                 (b"content-length", str(chunks * len(chunk)).encode())]}
+    asyncio.run(with_routes(dev_settings()).app(scope, receive, send))
+    assert statuses == [403]
+    assert read == 0
 
 
 def test_get_carries_no_requirement(client):
