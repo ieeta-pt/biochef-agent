@@ -214,6 +214,40 @@ def cache_matches(directory, manifest, target):
         verify_against_manifest(target, directory, manifest=manifest)
     except ToolIntegrityError:
         return False
+    return _only_named_files(directory, manifest)
+
+
+def _only_named_files(directory, manifest):
+    """Whether the directory holds the manifest's files and nothing else.
+
+    Every named file matching its digest is not enough: a file the manifest does
+    not name would still sit in the cache beside the tool, and a symlink to
+    another named file with the same bytes would pass every hash. So every
+    entry must be a regular file the manifest names, or a directory on the way
+    to one.
+    """
+    names = {
+        os.path.normpath((layer.get("annotations") or {}).get(_ANNOTATION_TITLE) or "")
+        for layer in manifest.get("layers") or []
+    }
+    parents = set()
+    for name in names:
+        parent = os.path.dirname(name)
+        while parent:
+            parents.add(parent)
+            parent = os.path.dirname(parent)
+
+    for root, dirs, files in os.walk(directory):
+        for entry in dirs + files:
+            path = os.path.join(root, entry)
+            relative = os.path.relpath(path, directory)
+            if os.path.islink(path):
+                return False
+            if entry in dirs:
+                if relative not in parents:
+                    return False
+            elif relative not in names or not os.path.isfile(path):
+                return False
     return True
 
 
@@ -257,6 +291,37 @@ def refuse_unusable_layers(target, manifest):
                 f"the files of a bundle. Refusing rather than storing it "
                 f"beside the tool."
             )
+
+
+def download_layers(target, staging, manifest):
+    """Download each layer of the checked manifest by its digest, into staging.
+
+    Not client.pull: that fetches the manifest again and downloads what the
+    second copy names, so everything checked so far would only cover the first
+    copy, and a registry that answered differently the second time could put
+    other files in the cache. It also extracts a directory layer as it goes.
+    Here the manifest is the one already checked, each blob is asked for by the
+    digest that manifest gives, and each lands as one plain file under its
+    title. verify_against_manifest then hashes what arrived. fetch_tool has
+    already run refuse_unusable_layers, so every layer has a digest and a title.
+    """
+    container = client.get_container(target)
+    for layer in manifest["layers"]:
+        name = layer["annotations"][_ANNOTATION_TITLE]
+        path = _contained_path(staging, name, target)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except OSError as error:
+            raise ToolIntegrityError(
+                f"{target}: the manifest names {name!r}, whose directory "
+                f"cannot be made beside the bundle's other files: {error}"
+            ) from error
+        if os.path.lexists(path):
+            raise ToolIntegrityError(
+                f"{target}: the manifest names {name!r} twice, or as a "
+                f"directory of another file"
+            )
+        client.download_blob(container, layer["digest"], path)
 
 
 def verify_against_manifest(target, staging, manifest=None):
@@ -433,7 +498,7 @@ def fetch_tool(tool_id, repo):
             staging = f"{outdir}.part.{uuid.uuid4().hex}"
             os.makedirs(staging)
             try:
-                client.pull(target=pull_target, outdir=staging)
+                download_layers(pull_target, staging, manifest)
                 verify_against_manifest(pull_target, staging, manifest=manifest)
                 evidence_verification.verify_pulled(
                     staging, subject, tool_id, evidence, log=print
