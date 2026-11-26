@@ -332,7 +332,7 @@ def test_registry_strings_reach_the_tool_without_running_as_shell_code(monkeypat
     assert result.returncode == 0, result.stderr[-2000:]
     assert json.loads((tmp_path / "argv.json").read_text()) == [
         "-p $(touch PWNED_PARAM)", "v", "-i; touch PWNED_INPUT #",
-        "input-1-out", "h-1-out",
+        "input-1-out",
     ]
     assert (tmp_path / "h-1-out").read_text() == "ok"
     assert not any(p.name.startswith("PWNED") for p in tmp_path.iterdir())

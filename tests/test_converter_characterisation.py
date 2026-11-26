@@ -112,3 +112,29 @@ def test_a_terminal_tool_with_no_output_edge_produces_nothing_to_build():
     sm = convert.convert_to_snakemake(convert.parse_biochef_workflow(wf))
     assert "rule all:\n    input:\nrule" in sm.replace("\r\n", "\n")
     assert "    output:\n    shell:" in sm
+
+
+@pytest.mark.parametrize("output, command", [
+    ({"flag": "-o"}, "./t -o {output.o_0:q} {input.i_0:q}"),
+    ({"flag": ""}, "./t {input.i_0:q} {output.o_0:q}"),
+    ({"flag": "", "filename": "fixed.txt"},
+     "./t {input.i_0:q} fixed.txt\ncp fixed.txt {output.o_0:q}"),
+    ({}, "./t {input.i_0:q}"),
+    ({"filename": "fixed.txt"},
+     "./t {input.i_0:q}\ncp fixed.txt {output.o_0:q}"),
+], ids=["flag", "empty-flag", "empty-flag-fixed-name", "no-flag",
+        "no-flag-fixed-name"])
+def test_a_file_output_reaches_the_command_as_the_frontend_passes_it(
+        monkeypatch, output, command):
+    # toolUtils.js: only an output with a flag, or with flag "", is an argument.
+    bundle = {"id": "t", "name": "t", "bin": "t", "parameters": [],
+              "io": {"inputs": [{"name": "in", "types": ["T"], "mode": "file"}],
+                     "outputs": [{"name": "out", "types": ["T"], "mode": "file",
+                                  **output}]}}
+    monkeypatch.setattr(convert, "fetch_tool", lambda tool_id, repo: bundle)
+    convert.tools.clear()
+
+    sm = convert.convert_to_snakemake(
+        convert.parse_biochef_workflow(workflow("t", "in", "out")))
+
+    assert shell_line(sm) == command
