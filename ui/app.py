@@ -1,4 +1,8 @@
-"""The UI's ASGI app: `uvicorn ui.app:app`, or `python -m ui`.
+"""The UI's ASGI app, started by `python -m ui` and by nothing else.
+
+There is no module-level `app` for `uvicorn ui.app:app`. uvicorn started that way
+believes X-Forwarded-For from 127.0.0.1 unless told not to, and then any local
+process can pose as a trusted proxy and name any user (ui/identity.py).
 
 docs, redoc and openapi are off. FastAPI's documentation pages load from a CDN,
 which breaks the rule that nothing leaves the TRE, and this app has no API to
@@ -85,11 +89,3 @@ def configured_app():
             raise ui_settings.SettingsError(str(refused)) from None
     return app
 
-
-def __getattr__(name):
-    # Built on demand rather than at import, so that importing this module for
-    # create_app does not need the whole configuration, while `ui.app:app` still
-    # refuses to start without it.
-    if name == "app":
-        return configured_app()
-    raise AttributeError(name)

@@ -9,6 +9,10 @@ closed for everyone, since the page uses none and CSRF does not cover them.
 The header is believed only from an address in BIOCHEF_UI_TRUSTED_PROXIES, and
 that address has to be the one the socket reports. run-ui.sh turns off uvicorn's
 proxy headers because otherwise uvicorn rewrites it from X-Forwarded-For.
+
+With BIOCHEF_UI_SOCKET there is no address to check: the page listens on a unix
+socket, the directory around it decides who may connect, and whoever did is the
+proxy. Only a request that came in on that socket counts.
 """
 
 import ipaddress
@@ -62,8 +66,17 @@ def _named_user(scope, name):
     return user
 
 
+def _on_the_socket(scope, settings):
+    # uvicorn reports no peer on a unix socket, and the socket's path as the server.
+    return scope.get("client") is None and scope.get("server") == (settings.socket, None)
+
+
 def who(scope, settings):
     """The user behind this request, or None when there is no believing it."""
+    if settings.socket is not None:
+        if settings.identity == DEV or not _on_the_socket(scope, settings):
+            return None
+        return _named_user(scope, settings.identity_header)
     address = _address(scope)
     if address is None:
         return None
