@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# The only thing the agent may run as root for the TES runner. A TES server that
+# runs as root writes the files of a task as root, so the agent could read them
+# but not delete them, and retention would fail. The agent does not run as root:
+# it calls this through one sudo rule, and what it passes is checked, never trusted:
+#
+#   tes-step-root finish <step directory>
+#       gives everything in the step's directory back to the user sudo was
+#       called by, and to that user's group
+#
+# A step directory is <STAGING_ROOT>/<run>/<step>, two levels under STAGING_ROOT,
+# named by no symlink at any level, owned by the user sudo was called by. Nothing
+# else is ever changed: -P walks the tree without following a symlink a task left
+# in it, and the script does nothing but chown and chmod.
+#
+# STAGING_ROOT is read from /etc/biochef-agent/tes-step.conf, owned by root and
+# writable only by root, in a directory that is too, so the agent cannot point the
+# script at another directory. Install this owned by root and writable only by
+# root, for example as /usr/local/libexec/biochef-agent/tes-step-root, and allow
+# the agent's user exactly that path in sudoers:
+#
+#   biochef ALL=(root) NOPASSWD: /usr/local/libexec/biochef-agent/tes-step-root
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 0022
+
+CONF=/etc/biochef-agent/tes-step.conf
+
+die() {
+    echo "tes-step-root: $*" >&2
+    exit 2
+}
+
+[ "$(id -u)" = 0 ] || die "must run as root, through sudo"
+case "${SUDO_UID:-}" in
+    '' | 0 | *[!0-9]*) die "must be called through sudo, by the agent's user" ;;
+esac
+case "${SUDO_GID:-}" in
+    '' | *[!0-9]*) die "must be called through sudo, by the agent's user" ;;
+esac
+
+# Owned by root and writable by nobody else, the file and the directory it is in.
+owned_by_root() {
+    local owner mode
+    read -r owner mode < <(stat -c '%u %a' -- "$1")
+    [ "$owner" = 0 ] && [ $((8#$mode & 8#022)) = 0 ]
+}
+[ -f "$CONF" ] && [ ! -L "$CONF" ] || die "$CONF is missing"
+owned_by_root "$CONF" && owned_by_root "$(dirname "$CONF")" ||
+    die "$CONF and its directory must be owned by root and writable by no one else"
+
+root=
+while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in '' | '#'*) continue ;; esac
+    [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]] || die "not KEY=value in $CONF: $line"
+    [ "${BASH_REMATCH[1]}" = STAGING_ROOT ] || die "unknown key in $CONF: ${BASH_REMATCH[1]}"
+    [ -z "$root" ] || die "STAGING_ROOT appears twice in $CONF"
+    root=${BASH_REMATCH[2]}
+done < "$CONF"
+[[ "$root" =~ ^/[A-Za-z0-9._/-]*[A-Za-z0-9._-]$ ]] || die "STAGING_ROOT in $CONF is missing or not valid"
+[ "$(realpath -e -- "$root" 2>/dev/null)" = "$root" ] ||
+    die "STAGING_ROOT=$root must exist and be named by no symlink"
+
+# The step directory the agent named, checked against the configuration.
+step_directory() {
+    local path=$1 owner
+    [[ "$path" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "not a step directory: $path"
+    [ "$(realpath -e -- "$path" 2>/dev/null)" = "$path" ] ||
+        die "the directory must exist and be named by no symlink: $path"
+    [ "$(dirname -- "$(dirname -- "$path")")" = "$root" ] ||
+        die "the directory must be two levels under STAGING_ROOT=$root: $path"
+    [ -d "$path" ] && [ ! -L "$path" ] || die "not a directory: $path"
+    for each in "$path" "$(dirname -- "$path")"; do
+        read -r owner < <(stat -c '%u' -- "$each")
+        [ "$owner" = "$SUDO_UID" ] || die "not the agent's: $each"
+    done
+}
+
+case "${1:-}" in
+    finish)
+        [ "$#" -eq 2 ] || die "expects: finish <step directory>"
+        step_directory "$2"
+        chown -R -P "$SUDO_UID:$SUDO_GID" -- "$2"
+        chmod -R u+rwX -- "$2"
+        ;;
+    *)
+        die "expects: finish <step directory>"
+        ;;
+esac
