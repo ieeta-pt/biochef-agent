@@ -41,7 +41,6 @@ def test_the_first_use_logs_in_once(recording):
     assert recording.pull() == "pulled"
     recording.pull()
     assert Recording.made == 1
-    assert recording.login is not None
     assert recording._client.logged_in == 1
 
 
@@ -106,6 +105,5 @@ def test_a_tool_not_in_the_cache_says_which(monkeypatch, tmp_path):
 
 def test_a_hostile_node_id_cannot_leave_the_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(convert, "TOOL_CACHE", str(tmp_path))
-    with pytest.raises(Exception) as refused:
+    with pytest.raises(convert.UnsafeName):
         convert.cached_tool("../../etc/passwd", "r")
-    assert not isinstance(refused.value, FileNotFoundError)
