@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 from dotenv import load_dotenv
 
 import audit
+import runner
 
 load_dotenv()
 
@@ -63,6 +64,7 @@ class Settings:
     max_retained_runs: int = 32
     keep_outputs_seconds: int = 3600
     poll_seconds: int = 30
+    network_isolated: bool = False
 
     @property
     def secure_cookies(self):
@@ -203,6 +205,13 @@ def _node_facts():
     }
 
 
+def _isolation(name):
+    try:
+        return runner.get_runner(name).isolates_network
+    except ValueError as refused:
+        raise SettingsError(str(refused)) from None
+
+
 def _egress_mode():
     value = _setting(os.getenv("BIOCHEF_EGRESS_MODE"))
     if value not in ("airlock", "manual"):
@@ -250,6 +259,8 @@ def load():
             "every request is checked for a visa of that type"),
         "egress_mode": _egress_mode(),
         **_node_facts(),
+        "network_isolated": _isolation(
+            _setting(os.getenv("BIOCHEF_RUNNER")) or "subprocess"),
         **_bindings(),
     }
 

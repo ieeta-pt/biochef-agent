@@ -101,9 +101,10 @@ def test_the_container_is_contained_by_default():
     """
     import runner as runner_module
 
-    assert runner_module.APPTAINER_ARGS == "--contain --cleanenv"
+    assert runner_module.APPTAINER_ARGS == ("--contain --cleanenv --net "
+                                            "--network none")
     argv = ApptainerRunner(cache_dir="/cache").command(_Workspace("/ws"))
-    assert "--apptainer-args=--contain --cleanenv" in argv
+    assert "--apptainer-args=--contain --cleanenv --net --network none" in argv
 
 
 def test_the_apptainer_args_are_one_argv_element():
@@ -316,3 +317,26 @@ def test_the_service_writes_the_preamble_into_the_snakefile():
     source = Path(REPO_ROOT / "main.py").read_text()
     assert "RUNNER.snakefile_preamble()" in source
     assert "snakefile_preamble() + convert_to_snakemake" in source
+
+
+@pytest.mark.parametrize("args,isolated", [
+    ("--contain --cleanenv --net --network none", True),
+    ("--net --network none", True),
+    ("--contain --cleanenv", False),
+    ("--net", False),
+    ("--net --network bridge", False),
+    ("--network none", False),
+    ("", False),
+])
+def test_isolation_is_read_from_the_flags_actually_passed(args, isolated):
+    runner = ApptainerRunner(image="docker://debian:stable-slim",
+                             apptainer_args=args)
+    assert runner.isolates_network is isolated
+
+
+def test_the_subprocess_runner_isolates_nothing():
+    assert SubprocessRunner().isolates_network is False
+
+
+def test_the_default_isolates_the_network():
+    assert ApptainerRunner().isolates_network is True
