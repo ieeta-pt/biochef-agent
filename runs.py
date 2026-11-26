@@ -162,6 +162,13 @@ class Run:
         state alone. A run that has started needs the group ended, which is the
         same lever the timeout pulls.
         """
+        self.holds_slot = False
+        """Whether this run's worker holds an execution slot right now.
+
+        Recorded by the worker, not read from the state. A run cancelled while
+        QUEUED is CANCELING without ever having held a slot, and a run that has
+        just been given one is still QUEUED until it starts.
+        """
 
     def logs_as_dict(self) -> dict:
         """Run-level output, diagnostic error blocks, and per-node output.
@@ -344,6 +351,41 @@ class RunStore:
             for run in self._runs.values():
                 counts[run.state.value] = counts.get(run.state.value, 0) + 1
         return counts
+
+    def accepting(self) -> bool:
+        """Whether create() would admit a run right now.
+
+        Separate from free slots, and not derivable from them. A full set of
+        non-terminal runs refuses new work with 503 even with every execution
+        slot idle -- reachable with MAX_RUNS queued runs and nothing running --
+        so an agent can be simultaneously `free: 4` and refusing everything. A
+        hub told only about slots routes work there and gets the 503.
+
+        This restates _evict_if_needed's rule, which is a drift risk, so a test
+        compares this against what create() actually does at each boundary
+        rather than against a second copy of the condition.
+        """
+        with self._lock:
+            return (len(self._runs) < self._max
+                    or any(run.state in TERMINAL
+                           for run in self._runs.values()))
+
+    def retained(self) -> int:
+        """How many run records are held, against the cap that evicts them."""
+        with self._lock:
+            return len(self._runs)
+
+    def hold_slot(self, run_id: str, held: bool) -> None:
+        """Record that a run's worker took its slot, or gave it back."""
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is not None:
+                run.holds_slot = held
+
+    def in_flight(self) -> int:
+        """How many runs hold an execution slot right now."""
+        with self._lock:
+            return sum(1 for run in self._runs.values() if run.holds_slot)
 
     def all(self):
         """Every run still held, newest first.

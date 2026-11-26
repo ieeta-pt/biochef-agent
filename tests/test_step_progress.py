@@ -223,13 +223,10 @@ def test_a_polled_run_carries_per_step_status_before_it_finishes(tmp_path,
                 {"digest": digest(binary), "mediaType": "application/octet-stream",
                  "annotations": {"org.opencontainers.image.title": "tool"}}]}
 
-        def pull(self, target, outdir):
-            self.get_manifest(None)
-            os.makedirs(outdir, exist_ok=True)
-            with open(os.path.join(outdir, "bundle.json"), "wb") as f:
-                f.write(self._bundle)
-            with open(os.path.join(outdir, "tool"), "wb") as f:
-                f.write(self._binary)
+        def download_blob(self, container, digest, outfile):
+            contents = {"bundle.json": self._bundle, "tool": self._binary}
+            with open(outfile, "wb") as f:
+                f.write(contents[os.path.basename(outfile)])
 
     monkeypatch.setattr(convert, "client", _Registry())
     convert.tools.clear()

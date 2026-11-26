@@ -91,11 +91,8 @@ class RequestIdMiddleware:
     handler would not help -- starlette gives Exception to that same outermost
     layer, so the response would still be built beyond this one.
 
-    That matters more than it sounds, because /convert reaches a 500 on an
-    ordinary malformed workflow rather than only on a genuine crash (#86), and
-    an uncorrelatable response to a routine client mistake is the case a hub
-    most wants to report back. The fix is to stop answering 500 to bad input,
-    not to tag the 500.
+    A malformed workflow does not reach it: since #86 that is a 400, which
+    passes back through here, so only a genuine crash comes back untagged.
     """
 
     def __init__(self, app):
