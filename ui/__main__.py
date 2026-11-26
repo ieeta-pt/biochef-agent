@@ -1,4 +1,4 @@
-"""`python -m ui`: start the page on the configured address.
+"""`python -m ui`: start the page on the configured address or unix socket.
 
 The address comes from the same settings the app checks, .env included, so the
 two cannot disagree. proxy_headers stays off because the identity check depends
@@ -21,7 +21,9 @@ def main():
         print(refused, file=sys.stderr)
         return 1
     current = configured.state.settings
-    uvicorn.run(configured, host=current.host, port=current.port, proxy_headers=False,
+    where = ({"uds": current.socket} if current.socket is not None
+             else {"host": current.host, "port": current.port})
+    uvicorn.run(configured, **where, proxy_headers=False,
                 server_header=False)
     return 0
 
