@@ -12,6 +12,7 @@ so it loads it itself.
 import ipaddress
 import os
 import re
+import stat
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -27,6 +28,10 @@ DEV = "dev"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = "8081"
 LOOPBACK_HOSTS = {"127.0.0.1", "::1"}
+
+# sun_path is 108 bytes on Linux, the closing NUL included. Longer, and uvicorn
+# fails at bind with a traceback instead of this module's one line.
+MAX_SOCKET_PATH = 107
 
 # RFC 9110 field-name. Anything else is not a header a proxy could set.
 HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
@@ -44,6 +49,7 @@ class Settings:
     port: int = int(DEFAULT_PORT)
     identity_header: str | None = None
     trusted_proxies: tuple = ()
+    socket: str | None = None
     dev_user: str | None = None
     policy_engine_url: str | None = None
 
@@ -90,6 +96,28 @@ def _proxies(value):
     return tuple(networks)
 
 
+def _socket(value):
+    if not os.path.isabs(value):
+        raise SettingsError(f"BIOCHEF_UI_SOCKET must be an absolute path, not {value!r}")
+    if len(os.fsencode(value)) > MAX_SOCKET_PATH:
+        raise SettingsError(f"BIOCHEF_UI_SOCKET: {value} is longer than the "
+                            f"{MAX_SOCKET_PATH} bytes a unix socket path can have")
+    directory = os.path.dirname(value)
+    try:
+        mode = os.stat(directory).st_mode
+    except OSError:
+        mode = None
+    if mode is None or not stat.S_ISDIR(mode):
+        raise SettingsError(f"BIOCHEF_UI_SOCKET: {directory} is not a directory")
+    # uvicorn makes the socket itself writable by everyone, so the directory is
+    # the only thing that decides who may connect, and whoever does is the proxy.
+    if stat.S_IMODE(mode) & 0o007:
+        raise SettingsError(f"BIOCHEF_UI_SOCKET: every user can enter {directory}, "
+                            f"and whoever opens the socket can name any user. "
+                            f"Make it 0750, with the proxy's group")
+    return value
+
+
 def _policy_engine(value):
     if value is None:
         return None
@@ -111,6 +139,18 @@ def load():
         raise SettingsError("BIOCHEF_AUDIT_LOG is required: every decision made "
                             "on this page has to reach the audit trail")
 
+    socket = _setting(os.getenv("BIOCHEF_UI_SOCKET"))
+    if socket is not None:
+        if mode == DEV:
+            raise SettingsError("dev identity is for a browser on this machine, so "
+                                "it has no BIOCHEF_UI_SOCKET")
+        # The socket replaces the address, so a setting that names one would say
+        # that someone else is trusted, or that the page listens where it does not.
+        for name in ("BIOCHEF_UI_TRUSTED_PROXIES", "BIOCHEF_UI_HOST", "BIOCHEF_UI_PORT"):
+            if _setting(os.getenv(name)) is not None:
+                raise SettingsError(f"{name} does not apply with BIOCHEF_UI_SOCKET: "
+                                    f"whoever can open the socket is the proxy")
+
     host = _setting(os.getenv("BIOCHEF_UI_HOST")) or DEFAULT_HOST
     fields = {
         "identity": mode,
@@ -129,10 +169,15 @@ def load():
         if not HEADER_NAME.fullmatch(name):
             raise SettingsError(f"BIOCHEF_UI_IDENTITY_HEADER: {name!r} is not a "
                                 f"header name")
-        proxies = _required(_setting(os.getenv("BIOCHEF_UI_TRUSTED_PROXIES")),
-                            "BIOCHEF_UI_TRUSTED_PROXIES",
-                            "it says who may set that header")
-        fields |= {"identity_header": name, "trusted_proxies": _proxies(proxies)}
+        fields["identity_header"] = name
+        if socket is not None:
+            fields["socket"] = _socket(socket)
+        else:
+            proxies = _required(_setting(os.getenv("BIOCHEF_UI_TRUSTED_PROXIES")),
+                                "BIOCHEF_UI_TRUSTED_PROXIES",
+                                "it says who may set that header, unless "
+                                "BIOCHEF_UI_SOCKET is set")
+            fields["trusted_proxies"] = _proxies(proxies)
     else:
         if host not in LOOPBACK_HOSTS:
             raise SettingsError(f"dev identity gives every visitor the same name, "
