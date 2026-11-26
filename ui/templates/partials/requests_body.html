@@ -43,7 +43,7 @@
       </ol>
       {% for reason in panel.reasons %}<p class="m-0 text-[13px] text-bad">{{ reason }}</p>{% endfor %}
       {% if panel.repeats %}<p class="m-0 text-[13px] text-brand-deep"><span aria-hidden="true">↻ </span>{{ panel.repeats }}</p>{% endif %}
-      {% if panel.run_id %}<span class="mono text-[13px]">Run {{ panel.run_id }}</span>{% endif %}
+      {% if panel.run_id %}<a href="/ui/runs/{{ panel.run_id }}" class="text-sm">Open the run</a>{% endif %}
       {% if panel.refused %}<p class="m-0 text-[13px] text-muted">The refusal is signed with the node key and sent to the coordinator, so the requester sees why.</p>{% endif %}
     </aside>
     {% endif %}

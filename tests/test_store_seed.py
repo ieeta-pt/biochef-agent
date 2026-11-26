@@ -117,6 +117,19 @@ def test_the_last_day_is_mock_04(engine):
     assert {row.request_id for row in refused} == {"req_8f40", "req_8f33"}
 
 
+def test_the_run_waiting_for_review_is_there_and_outside_the_last_day(engine):
+    with db.reading(engine) as session:
+        run = repo.get_run(session, "run_7c04")
+        request = repo.get_request(session, "req_7c04")
+        recent = {row.request_id for row in
+                  repo.requests_since(session, NOW - timedelta(hours=24))}
+    assert run.egress_state == "awaiting_review" and run.state == "COMPLETE"
+    assert [row["file"] for row in run.egress_files] == [
+        "assoc_summary.tsv", "manhattan.png", "qc_log.txt"]
+    assert request.study_id == mock.CARDIO and request.run_id == "run_7c04"
+    assert "req_7c04" not in recent, "mock 04 keeps its five rows"
+
+
 def test_the_study_counts_are_mock_02(engine):
     with db.reading(engine) as session:
         assert repo.count_requests_of_study(session, mock.CARDIO) == 14

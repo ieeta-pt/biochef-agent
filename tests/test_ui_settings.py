@@ -28,6 +28,7 @@ def env(monkeypatch, tmp_path):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("BIOCHEF_AUDIT_LOG", str(tmp_path / "audit.jsonl"))
     monkeypatch.setenv("BIOCHEF_NODE_NAME", "Example TRE (test)")
+    monkeypatch.setenv("BIOCHEF_EGRESS_MODE", "manual")
     monkeypatch.setenv("BIOCHEF_PASSPORT_REQUIRE_VISA", "ControlledAccessGrants")
     return monkeypatch
 
@@ -165,6 +166,16 @@ def test_cookies_are_secure_behind_the_proxy_only(dev):
     assert settings.load().secure_cookies is True
 
 
+@pytest.mark.parametrize("value", [None, "", "both"])
+def test_there_is_no_default_egress_mode(dev, value):
+    if value is None:
+        dev.delenv("BIOCHEF_EGRESS_MODE")
+    else:
+        dev.setenv("BIOCHEF_EGRESS_MODE", value)
+    with pytest.raises(SettingsError, match="BIOCHEF_EGRESS_MODE"):
+        settings.load()
+
+
 def test_the_visa_comes_from_the_passport_setting(dev):
     assert settings.load().required_visa == "ControlledAccessGrants"
 
@@ -214,7 +225,7 @@ def test_the_fake_policy_engine_is_for_development_only(ready, dev):
     dev.setenv("BIOCHEF_UI_IDENTITY", "header")
     dev.setenv("BIOCHEF_UI_IDENTITY_HEADER", USER_HEADER)
     dev.setenv("BIOCHEF_UI_TRUSTED_PROXIES", "10.0.0.0/24")
-    assert ui_app.configured_app().state.policy is None
+    assert ui_app.configured_app().state.policy.name == "The agent's own check"
 
 
 # A unix socket instead of an address
@@ -384,6 +395,7 @@ def test_a_proxy_on_the_socket_names_the_user(tmp_path, socket_dir):
                    BIOCHEF_UI_SOCKET=str(path), BIOCHEF_NODE_NAME="Example TRE (test)",
                    BIOCHEF_AUDIT_LOG=str(tmp_path / "audit.jsonl"), BIOCHEF_DB_URL=url,
                    BIOCHEF_PASSPORT_REQUIRE_VISA="ControlledAccessGrants",
+                   BIOCHEF_EGRESS_MODE="manual",
                    BIOCHEF_NODE_SIGNING_KEY=str(tmp_path / "keys" / node_keys.SIGNING_FILE),
                    BIOCHEF_NODE_ENCRYPTION_KEY=str(tmp_path / "keys" / node_keys.ENCRYPTION_FILE))
     server = subprocess.Popen([sys.executable, "-m", "ui"], cwd=REPO_ROOT, env=env,

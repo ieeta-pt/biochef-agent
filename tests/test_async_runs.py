@@ -840,3 +840,39 @@ def test_a_run_cancelled_in_the_queue_is_not_counted_in_flight(service,
         release.set()
         main._slots_by_loop.clear()
         main._occupied_by_loop.clear()
+
+
+# --------------------------------------------------------------------------
+# on a node
+
+
+def test_on_a_node_a_real_submission_reaches_the_store(service, tmp_path, monkeypatch):
+    """Through the API, the mirror and the retained workspace, end to end."""
+    import json as json_
+    import os
+
+    from fastapi.testclient import TestClient
+
+    from node.runtime import RunMirror
+    from store import db, migrate, repo
+
+    url = f"sqlite:///{tmp_path}/agent.db"
+    migrate.upgrade(url)
+    bind = db.make_engine(url)
+    mirror = RunMirror(bind)
+    monkeypatch.setattr(main, "MIRROR", mirror)
+    main.RUNS.observer = mirror
+
+    with TestClient(main.app) as client:
+        run_id = _submit(client).json()["run_id"]
+        body = _poll(client, run_id)
+
+    assert body["state"] == RunState.COMPLETE.value, body
+    with db.reading(bind) as session:
+        row = repo.get_run(session, run_id)
+    assert row.state == "COMPLETE"
+    assert row.started_at is not None and row.ended_at is not None
+    assert os.path.isdir(row.workspace_path)
+    assert json_.load(open(row.manifest_path))
+    assert [entry["file"] for entry in row.egress_files] == ["tool-1-out"]
+    assert row.egress_files[0]["size"] == len(b"the output")
