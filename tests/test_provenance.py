@@ -132,15 +132,11 @@ class _Registry:
                                  "build-evidence.json"}})
         return {"layers": layers}
 
-    def pull(self, target, outdir):
-        os.makedirs(outdir, exist_ok=True)
-        with open(os.path.join(outdir, "bundle.json"), "wb") as f:
-            f.write(self.bundle_bytes)
-        with open(os.path.join(outdir, "tool"), "wb") as f:
-            f.write(self.binary_bytes)
-        if self.with_evidence:
-            with open(os.path.join(outdir, "build-evidence.json"), "wb") as f:
-                f.write(self.evidence_bytes)
+    def download_blob(self, container, digest, outfile):
+        contents = {"bundle.json": self.bundle_bytes, "tool": self.binary_bytes,
+                    "build-evidence.json": self.evidence_bytes}
+        with open(outfile, "wb") as f:
+            f.write(contents[os.path.basename(outfile)])
 
 
 def _run(tmp_path, monkeypatch, *, with_evidence=True, exit_code=0,
