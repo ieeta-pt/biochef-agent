@@ -491,15 +491,13 @@ def test_evidence_failure_does_not_promote_the_staged_bundle(tmp_path, monkeypat
     body = json.dumps(manifest, separators=(",", ":")).encode()
     digest = "sha256:" + hashlib.sha256(body).hexdigest()
     registry = _RawRegistry(body)
-    pulled_targets = []
+    pulled_from = []
 
-    def pull(target, outdir):
-        pulled_targets.append(target)
-        Path(outdir).mkdir(parents=True, exist_ok=True)
-        for name, content in files.items():
-            (Path(outdir) / name).write_bytes(content)
+    def download_blob(container, blob, outfile):
+        pulled_from.append(container.digest)
+        Path(outfile).write_bytes(files[Path(outfile).name])
 
-    registry.pull = pull
+    registry.download_blob = download_blob
     cache = tmp_path / "cache"
     checked = []
     evidence = object()
@@ -528,7 +526,7 @@ def test_evidence_failure_does_not_promote_the_staged_bundle(tmp_path, monkeypat
         convert.fetch_tool("tool-1", f"x@{digest}")
 
     assert len(checked) == 1
-    assert pulled_targets == [f"registry.example.test/x@{digest}"]
+    assert pulled_from == [digest] * len(files), "blobs came from another reference"
     assert checked[0].parent == cache
     assert checked[0].name.startswith("tool.part."), (
         "pulled evidence was checked only after the bundle became the shared cache"
@@ -546,7 +544,7 @@ class _RefusingRegistry(_RawRegistry):
         super().__init__(body)
         self.pulled = False
 
-    def pull(self, **kwargs):
+    def download_blob(self, *args, **kwargs):
         self.pulled = True
         raise AssertionError("the bundle was pulled despite a refused signature")
 
