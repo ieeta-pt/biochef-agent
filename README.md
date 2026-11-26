@@ -148,6 +148,40 @@ until the run ends. This setting is a retention bound, not a peak resource
 limit. Logs may contain sensitive tool output; this prototype has no local
 log-release policy for TRE use.
 
+### A workflow you got wrong is your error, not the agent's
+
+A `biochef_workflow` this service cannot read is a `400` naming what was wrong:
+not valid JSON, no `nodes`, a node without an `id`, a tool node whose
+`data.repo` is not a string, an edge that is a number. On `/runs` the same
+mistakes settle the run as `EXECUTOR_ERROR`, which is WES's word for the
+submission or its tools, rather than `SYSTEM_ERROR`, which is this service
+saying it broke.
+
+Both used to be the other way round. `/convert` answered `500` to nine of ten
+malformed documents and `/runs` recorded five of six as `SYSTEM_ERROR`, in both
+cases carrying the Python exception's own text — so a caller was told `'id'`, or
+`'int' object is not subscriptable`. A hub triaging a federated run would have
+gone looking for a fault here.
+
+The document is checked **before** a run directory exists, so a refused
+submission leaves nothing behind.
+
+The check is on shape only, and it is explicit rather than a `try/except`
+around the parse. Catching `KeyError` and `TypeError` there would cover every
+field for free and would also turn a genuine bug in our own parsing into a tidy
+`400`, telling a caller their workflow was wrong when it was not. The cost is
+that the check knows which fields the parser reads; a test drives a matrix of
+malformed documents through both routes and asserts none of them reaches a
+`500`, and another asserts that an internal fault still does.
+
+Whether a repo exists, whether a tool has the operation named, whether an
+edge's handles match — those need the registry, so they are answered once the
+bundle has been pulled. They are refusals too: naming an input or output
+handle the tool does not declare is a `400` listing what it does declare,
+rather than the `500` it used to be. A parameter the recipe does not declare is
+ignored. An enabled parameter with no value is a `400`, unless the recipe makes
+it required, in which case its default is used.
+
 Both take the same fields:
 
 | field | what it is |
@@ -191,6 +225,73 @@ Only three things are read from each node:
 Everything else about the tool — its binary, its inputs and outputs, its
 parameter flags — comes from the bundle fetched from the registry, not from the
 request.
+
+### Is it up, and is it free
+
+Two questions, two endpoints, because they have different audiences.
+
+`GET /health` (and `HEAD /health`) answers `{"status": "ok"}` and **is the one
+route exempt from authentication**, whatever `BIOCHEF_AUTH` is set to. What probes it is an orchestrator,
+not a person, and it has no credentials to offer; a liveness check that demanded
+a token would turn a mistyped token into a healthy service that looks dead and
+gets restarted forever. That is also why it says nothing else — it answers to
+whatever can reach the port, so anything beyond "up" would be published to it.
+The exemption is matched on the exact method and path, so nothing beneath
+`/health` is reachable without credentials, and `POST /health` is still a `401`.
+Behind a proxy that sets `root_path` the path will not match and liveness will
+ask for a token, which is the direction to fail in.
+
+`GET /capacity` answers the other question and **is authenticated like every
+other route**, because every field in it describes this deployment rather than
+merely whether it is up. (Under the default `BIOCHEF_AUTH=none` that means
+anybody, the same as everything else here — the point is that `/capacity` is
+not separately exempt the way liveness is.)
+
+```json
+{
+  "version": null,
+  "authentication": "bearer",
+  "runner": "subprocess",
+  "slots": {"total": 4, "busy": 2, "free": 2},
+  "runs": {"in_flight": 1, "queued": 2, "accepting": true,
+           "by_state": {"RUNNING": 1, "QUEUED": 2, "COMPLETE": 7}},
+  "retained": {"runs": 10, "cap": 256},
+  "datasets": null
+}
+```
+
+**`slots` is what a hub routes on.** `busy` is read from the slot semaphore
+itself, not derived from run states, because `/convert` holds a slot for a whole
+synchronous conversion without ever creating a run record — an agent with every
+slot busy converting would otherwise report itself entirely free.
+
+`runs.in_flight` is the asynchronous subset of that: the runs whose worker holds
+a slot right now, as the worker records it, so the gap between it and
+`slots.busy` is exactly the `/convert` calls in progress. It is not read from
+the states. A run cancelled while `QUEUED` is `CANCELING` until its turn comes,
+and holds no slot meanwhile. A `QUEUED` run is admitted and waiting rather than
+executing, so it is reported separately and is not counted as busy. `by_state`
+is walked from the run store rather than kept as a tally, so it cannot drift
+from what the store holds.
+
+**`runs.accepting` is a separate question from free slots, and free slots do not
+answer it.** `BIOCHEF_MAX_RUNS` bounds how many run records are retained, and a
+full set of non-terminal ones refuses new work with `503` *even with every
+execution slot idle* — reachable with `MAX_RUNS` runs admitted and queued and
+nothing executing. An agent can therefore report `free: 4` and refuse
+everything, and a hub told only about slots would route work there and get the
+refusal. The field answers the admission question directly rather than leaving
+a hub to re-derive it from the retention counts.
+
+`version` is whatever `BIOCHEF_AGENT_VERSION` was set to, and `null` when it was
+not — a deployment that does not say which commit it is built from reports
+nothing rather than something invented. `datasets` is `null` for the same
+reason: which datasets a site holds comes from the DataSource interface, which
+this service does not implement yet, and `[]` would read as "this site holds
+none".
+
+Before this, the only way to discover a saturated agent was to submit work and
+be refused with `503`, which is finding out after sending it to the wrong site.
 
 ## Running it
 
@@ -238,6 +339,7 @@ Configuration is by environment variable, and `example.env` lists them:
 | `BIOCHEF_KEEP_OUTPUTS` | `3600` | seconds a finished run's outputs stay fetchable; `0` deletes them at once |
 | `BIOCHEF_MAX_RETAINED_RUNS` | `32` | how many finished runs may keep outputs on disk |
 | `BIOCHEF_MAX_CONCURRENT_RUNS` | `4` | execution slots shared by `/runs` and `/convert`; admitted `/runs` jobs wait in `QUEUED` |
+| `BIOCHEF_AGENT_VERSION` | *(unset)* | what this deployment reports as its version at `/capacity`; `null` when unset |
 | `BIOCHEF_AUTH` | `none` | who may call it: `none` or `bearer` |
 | `BIOCHEF_AUTH_TOKEN` | | the shared token, required when `BIOCHEF_AUTH=bearer` |
 | `BIOCHEF_PASSPORT_ISSUER` | *(unset)* | the issuer whose passports are accepted, when `BIOCHEF_AUTH=passport` |
