@@ -52,6 +52,7 @@ class Settings:
     socket: str | None = None
     dev_user: str | None = None
     policy_engine_url: str | None = None
+    required_visa: str | None = None
 
     @property
     def secure_cookies(self):
@@ -172,6 +173,7 @@ def load():
                                "BIOCHEF_NODE_NAME", "it names this node"),
         "policy_engine_url": _policy_engine(
             _setting(os.getenv("BIOCHEF_POLICY_ENGINE_URL"))),
+        "required_visa": _setting(os.getenv("BIOCHEF_PASSPORT_REQUIRE_VISA")),
     }
 
     if mode == HEADER:

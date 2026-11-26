@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block header %}
+<nav aria-label="Breadcrumb" class="flex flex-wrap gap-2 text-sm"><a href="/ui/workflows/{{ workflow_id }}">{{ title }}</a><span aria-hidden="true" class="text-muted">/</span><span>recipe.json and Snakefile</span></nav>
+<h1 class="m-0 text-[26px] font-medium">{{ title }} under {{ study_title }}</h1>
+{% endblock %}
+{% block content %}
+<section class="card flex flex-col gap-3 px-6 py-5">
+  <h2 class="m-0 text-base font-medium">recipe.json, as received</h2>
+  <pre class="mono m-0 max-h-96 overflow-auto rounded-control bg-head p-3 text-xs">{{ recipe }}</pre>
+</section>
+<section class="card flex flex-col gap-3 px-6 py-5">
+  <h2 class="m-0 text-base font-medium">Generated Snakefile</h2>
+  {% if snakefile %}
+  <p class="m-0 text-[13px] text-warn">Built from the tool bundles in this node's cache, which may not be the versions this workflow pins. Nothing has been run.</p>
+  <pre class="mono m-0 max-h-96 overflow-auto rounded-control bg-head p-3 text-xs">{{ snakefile }}</pre>
+  {% else %}
+  <p class="m-0 text-sm text-muted">{{ problem }}</p>
+  {% endif %}
+</section>
+{% endblock %}

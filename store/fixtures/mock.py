@@ -72,7 +72,31 @@ UNVERIFIED = {
         "The keys listed are not the ones this LS Login sign in vouches for",
 }
 
-GWAS_STEPS = ("qc_samples", "qc_variants", "assoc", "summarise")
+# (id, tool, description, parameter values). A step's values come from here,
+# except that None takes the workflow's own, which is what tells its variants
+# apart.
+GWAS_STEPS = (
+    ("qc_samples", "plink2", "Removes samples with high missingness.",
+     {"mind": "0.05"}),
+    ("qc_variants", "bcftools", "Keeps variants above the MAF and HWE thresholds.",
+     None),
+    ("assoc", "regenie", "Association test against the phenotype.",
+     {"phenotype": "ldl"}),
+    ("summarise", "biochef-report", "Aggregate table and Manhattan plot.",
+     {"top": "100"}),
+)
+COHORT_STEPS = (
+    ("summarise", "biochef-report", "Aggregate table by group.", None),
+)
+
+TOOL_DIGESTS = {
+    "plink2": ("a1d9", "3e02"),
+    "bcftools": ("77c4", "b1aa"),
+    "regenie": ("c3b8", "5f61"),
+    "biochef-report": ("19fa", "d7c0"),
+}
+TOOL_CHANGES = {"gwas-140": {"bcftools": ("0e5f", "92dd")}}
+"""What differs from TOOL_DIGESTS: the one tool 1.4.0 changed."""
 
 # (key, study, version, name, workflow version, digest ends, parameter values,
 #  state, received). `key` is how the requests below refer to a workflow.

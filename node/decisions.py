@@ -61,14 +61,7 @@ def _timestamp(moment):
     return moment.astimezone(timezone.utc)
 
 
-def build(*, node, subject_type, subject_id, action, user, at, subject_hash=None,
-          comment=None, dac_confirmed=None, reason=None):
-    """The decision object of section 7.2.
-
-    Approving a study version needs the data access committee's confirmation,
-    and that field means nothing on any other decision, so it is refused there
-    rather than signed and left for someone to misread.
-    """
+def _check(*, subject_type, action, user, dac_confirmed):
     if not user:
         raise DecisionError("a decision records who made it")
     is_study_approval = (subject_type is SubjectType.STUDY_VERSION
@@ -78,7 +71,19 @@ def build(*, node, subject_type, subject_id, action, user, at, subject_hash=None
                             "committee's confirmation")
     if not is_study_approval and dac_confirmed is not None:
         raise DecisionError("dac_confirmed belongs to study approvals only")
+    return is_study_approval
 
+
+def build(*, node, subject_type, subject_id, action, user, at, subject_hash=None,
+          comment=None, dac_confirmed=None, reason=None):
+    """The decision object of section 7.2.
+
+    Approving a study version needs the data access committee's confirmation,
+    and that field means nothing on any other decision, so it is refused there
+    rather than signed and left for someone to misread.
+    """
+    is_study_approval = _check(subject_type=subject_type, action=action,
+                               user=user, dac_confirmed=dac_confirmed)
     document = {
         "schema": SCHEMA,
         "node": node,
@@ -155,6 +160,25 @@ def _require_a_trail():
         raise DecisionError("decisions need an audit trail: set BIOCHEF_AUDIT_LOG")
 
 
+def check(*, subject_type, action, user, dac_confirmed=None):
+    """Refuse a decision that decide would refuse, before anything has moved.
+
+    A caller that changes states and then decides has to ask this first: if the
+    refusal came from decide, a caller that catches the error and commits would
+    keep the states with no signed decision behind them (rule 6.2.10).
+    """
+    _require_a_trail()
+    _check(subject_type=subject_type, action=action, user=user,
+           dac_confirmed=dac_confirmed)
+
+
+def check_undo(*, user):
+    """Refuse an undo that undo would refuse, before anything has moved."""
+    _require_a_trail()
+    if not user:
+        raise DecisionError("an undo records who made it")
+
+
 def decide(session, keys, *, node, subject_type, subject_id, action, user,
            at=None, subject_hash=None, comment=None, dac_confirmed=None,
            reason=None):
@@ -181,8 +205,6 @@ def undo(session, decision_id, *, user):
     The decision goes; the trail keeps its event and gains this one, so that an
     undone decision is still visible to whoever reads the trail.
     """
-    _require_a_trail()
-    if not user:
-        raise DecisionError("an undo records who made it")
+    check_undo(user=user)
     repo.delete_unposted_decision(session, decision_id)
     audit.record(EVENT_UNDONE, decision_id=decision_id, user=user)
