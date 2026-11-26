@@ -193,6 +193,26 @@ def test_the_socket_directory_keeps_other_users_out(on_a_socket, socket_dir, mod
         settings.load()
 
 
+@pytest.mark.parametrize("mode", [0o700, 0o710, 0o740])
+def test_a_socket_directory_can_be_closed_further(on_a_socket, socket_dir, mode):
+    socket_dir.chmod(mode)
+    assert settings.load().socket == str(socket_dir / "ui.sock")
+
+
+@pytest.mark.parametrize("mode", [0o770, 0o730, 0o720])
+def test_the_group_cannot_replace_the_socket(on_a_socket, socket_dir, mode):
+    socket_dir.chmod(mode)
+    with pytest.raises(SettingsError, match="the group can write"):
+        settings.load()
+
+
+def test_the_socket_directory_belongs_to_the_page(on_a_socket, monkeypatch):
+    owner = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: owner + 1)
+    with pytest.raises(SettingsError, match="belongs to another user"):
+        settings.load()
+
+
 @pytest.mark.parametrize("value, message", [
     ("ui.sock", "absolute path"),
     ("run/ui.sock", "absolute path"),

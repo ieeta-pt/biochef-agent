@@ -104,17 +104,29 @@ def _socket(value):
                             f"{MAX_SOCKET_PATH} bytes a unix socket path can have")
     directory = os.path.dirname(value)
     try:
-        mode = os.stat(directory).st_mode
+        found = os.stat(directory)
     except OSError:
-        mode = None
-    if mode is None or not stat.S_ISDIR(mode):
+        found = None
+    if found is None or not stat.S_ISDIR(found.st_mode):
         raise SettingsError(f"BIOCHEF_UI_SOCKET: {directory} is not a directory")
+    # Its owner can change the mode below whenever they like.
+    if found.st_uid != os.geteuid():
+        raise SettingsError(f"BIOCHEF_UI_SOCKET: {directory} belongs to another "
+                            f"user, who can open it to everyone. Make the user "
+                            f"the page runs as its owner")
     # uvicorn makes the socket itself writable by everyone, so the directory is
     # the only thing that decides who may connect, and whoever does is the proxy.
-    if stat.S_IMODE(mode) & 0o007:
+    mode = stat.S_IMODE(found.st_mode)
+    if mode & 0o007:
         raise SettingsError(f"BIOCHEF_UI_SOCKET: every user can enter {directory}, "
                             f"and whoever opens the socket can name any user. "
                             f"Make it 0750, with the proxy's group")
+    # Write lets the group remove ui.sock and bind its own at the same path, and
+    # then the proxy sends it every user's requests.
+    if mode & 0o020:
+        raise SettingsError(f"BIOCHEF_UI_SOCKET: the group can write in "
+                            f"{directory}, so it can put its own socket in place "
+                            f"of the page's. Make it 0750")
     return value
 
 
