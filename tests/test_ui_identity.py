@@ -54,7 +54,7 @@ def test_no_usable_address_is_no_trust(address):
     assert who(scope(address, [named(b"j.silva")]), header_settings()) is None
 
 
-@pytest.mark.parametrize("headers", [
+UNBELIEVABLE = pytest.mark.parametrize("headers", [
     [],
     [(b"x-other-user", b"j.silva")],
     [named(b"")],
@@ -69,6 +69,9 @@ def test_no_usable_address_is_no_trust(address):
     [named(b"a" * (MAX_USER_LENGTH + 1))],
 ], ids=["absent", "other", "empty", "blank", "repeated", "nul", "newline", "escape",
         "delete", "separator", "not-utf8", "too-long"])
+
+
+@UNBELIEVABLE
 def test_a_header_that_cannot_be_believed(headers):
     assert who(scope(headers=headers), header_settings()) is None
 
@@ -77,6 +80,49 @@ def test_a_name_may_be_as_long_as_the_store_allows():
     name = "a" * MAX_USER_LENGTH
     assert who(scope(headers=[named(name.encode())]), header_settings()) == name
     assert MAX_USER_LENGTH == MAX_NAME_LENGTH
+
+
+# On a unix socket: whoever can open it is the proxy
+
+SOCKET = "/run/biochef-ui/ui.sock"
+
+
+def on_the_socket(headers=(), path=SOCKET):
+    # What uvicorn reports for a unix socket: no peer, and the path as the server.
+    return {"client": None, "server": (path, None), "headers": list(headers)}
+
+
+def socket_settings(**overrides):
+    return header_settings(**{"trusted_proxies": (), "socket": SOCKET, **overrides})
+
+
+def test_on_the_socket_the_proxy_names_the_user():
+    assert who(on_the_socket([named(b"j.silva")]), socket_settings()) == "j.silva"
+
+
+@pytest.mark.parametrize("address", [PROXY, LOOPBACK, "::1"])
+def test_with_a_socket_no_address_is_trusted(address):
+    # Not even one the address list would have trusted: there is none.
+    request = {**scope(address, [named(b"j.silva")]), "server": (SOCKET, None)}
+    settings = socket_settings(trusted_proxies=header_settings().trusted_proxies)
+    assert who(request, settings) is None
+
+
+@pytest.mark.parametrize("server", [("/run/other/ui.sock", None), ("127.0.0.1", 8081),
+                                    None])
+def test_only_a_request_on_that_socket_counts(server):
+    request = {"client": None, "server": server, "headers": [named(b"j.silva")]}
+    assert who(request, socket_settings()) is None
+
+
+@UNBELIEVABLE
+def test_on_the_socket_the_header_still_has_to_be_believable(headers):
+    assert who(on_the_socket(headers), socket_settings()) is None
+
+
+def test_dev_mode_on_a_socket_is_nobody():
+    assert who(on_the_socket([named(b"j.silva")]),
+               dev_settings(socket=SOCKET)) is None
 
 
 # Dev mode
