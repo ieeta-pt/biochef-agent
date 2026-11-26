@@ -193,12 +193,10 @@ def _service(tmp_path, monkeypatch, output=b"the output"):
                 {"digest": digest(binary), "mediaType": "application/octet-stream",
                  "annotations": {"org.opencontainers.image.title": "tool"}}]}
 
-        def pull(self, target, outdir):
-            os.makedirs(outdir, exist_ok=True)
-            with open(os.path.join(outdir, "bundle.json"), "wb") as f:
-                f.write(bundle)
-            with open(os.path.join(outdir, "tool"), "wb") as f:
-                f.write(binary)
+        def download_blob(self, container, digest, outfile):
+            contents = {"bundle.json": bundle, "tool": binary}
+            with open(outfile, "wb") as f:
+                f.write(contents[os.path.basename(outfile)])
 
     monkeypatch.setattr(convert, "client", _Registry())
     convert.tools.clear()
@@ -349,7 +347,9 @@ def test_malformed_async_submission_removes_owned_spool_file(
                     break
                 time.sleep(0.01)
 
-        assert status == "SYSTEM_ERROR"
+        # A document that is not JSON is the caller's mistake, so the run
+        # settles as EXECUTOR_ERROR, not SYSTEM_ERROR (#86).
+        assert status == "EXECUTOR_ERROR"
         assert handed_over and all(not os.path.exists(path) for path in handed_over)
     finally:
         main.RETAINED.release_all()
