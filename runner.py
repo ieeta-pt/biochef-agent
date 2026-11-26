@@ -29,6 +29,11 @@ from typing import List, NamedTuple
 from steplogs import TailBuffer
 
 
+TOOL_LOCALE = "C.UTF-8"
+"""The locale every tool step runs in, so native output matches the wasm builds
+whatever locale the Agent host has."""
+
+
 def _kill_group(pgid):
     """End a process group, tolerating one that has already gone."""
     try:
@@ -73,6 +78,12 @@ class Runner:
         """What this provider is, for an operator reading a log or an error."""
         return self.name
 
+    def environment(self) -> dict:
+        """The Agent's environment, with the locale fixed to TOOL_LOCALE."""
+        env = dict(os.environ)
+        env["LC_ALL"] = TOOL_LOCALE
+        return env
+
     def run(self, ws, timeout_s: int, on_start=None, on_finish=None,
             on_line=None) -> RunResult:
         """Launch the command in its own process group and bound how long it lives.
@@ -90,7 +101,7 @@ class Runner:
         """
         process = subprocess.Popen(
             self.command(ws),
-            cwd=ws.path, start_new_session=True,
+            cwd=ws.path, start_new_session=True, env=self.environment(),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             encoding="utf-8", errors="replace",
         )
@@ -369,6 +380,13 @@ class ApptainerRunner(Runner):
 
     def snakefile_preamble(self) -> str:
         return f"container: {self._literal}\n"
+
+    def environment(self) -> dict:
+        """--cleanenv drops LC_ALL; APPTAINERENV_ variables still reach the container."""
+        env = super().environment()
+        env["APPTAINERENV_LC_ALL"] = TOOL_LOCALE
+        env["SINGULARITYENV_LC_ALL"] = TOOL_LOCALE
+        return env
 
     def command(self, ws) -> List[str]:
         argv = ["snakemake", "--cores", "4",

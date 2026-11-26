@@ -80,7 +80,8 @@ rule all:
         "where.txt",
         "neighbour.txt",
         "exec.txt",
-        "env_inheritance.txt"
+        "env_inheritance.txt",
+        "locale.txt"
 
 rule work:
     input:
@@ -117,6 +118,12 @@ rule env_inheritance:
     shell:
         "if printenv BIOCHEF_PARITY_ENV_PROBE >/dev/null; then echo inherited; "
         "else echo absent; fi > {output.o_0}"
+
+rule locale:
+    output:
+        o_0="locale.txt"
+    shell:
+        "printf '%s %s\\\\n' \\"${{LC_ALL:-unset}}\\" \\"$(echo é | wc -m)\\" > {output.o_0}"
 '''
 
 
@@ -162,6 +169,9 @@ def main():
         return 2
 
     os.environ["BIOCHEF_PARITY_ENV_PROBE"] = "test-value"
+    # A host locale other than the tools' one, which the runners must replace.
+    os.environ["LANG"] = "en_US.UTF-8"
+    os.environ.pop("LC_ALL", None)
 
     root = tempfile.mkdtemp(prefix="biochef-parity-")
     cache = os.path.join(root, "apptainer-cache")
@@ -194,15 +204,18 @@ def main():
         outcomes[label] = (_read(ws, "result.txt"), _read(ws, "where.txt"),
                            _read(ws, "neighbour.txt"), _read(ws, "exec.txt"),
                            _read(ws, "env_inheritance.txt"),
-                           _read(ws, "work.stdout"), _read(ws, "work.stderr"))
+                           _read(ws, "work.stdout"), _read(ws, "work.stderr"),
+                           _read(ws, "locale.txt"))
         print(f"    ran on: {outcomes[label][1].decode().strip()!r}   "
               f"other runs' data: {outcomes[label][2].decode().strip()!r}",
               flush=True)
 
     (plain_result, plain_where, plain_neighbour, plain_exec,
-     plain_env_result, plain_log_out, plain_log_err) = outcomes["subprocess"]
+     plain_env_result, plain_log_out, plain_log_err,
+     plain_locale) = outcomes["subprocess"]
     (boxed_result, boxed_where, boxed_neighbour, boxed_exec,
-     boxed_env_result, boxed_log_out, boxed_log_err) = outcomes["apptainer"]
+     boxed_env_result, boxed_log_out, boxed_log_err,
+     boxed_locale) = outcomes["apptainer"]
 
     failures = []
     if plain_result != boxed_result:
@@ -257,6 +270,14 @@ def main():
         failures.append("the host-side step did not receive the test variable")
     if boxed_env_result.strip() != b"absent":
         failures.append("a containerised step inherited the test environment variable")
+
+    # In C.UTF-8, "é" and a newline are two characters (three bytes in C).
+    for label, got in (("subprocess", plain_locale), ("apptainer", boxed_locale)):
+        if got.strip() != b"C.UTF-8 2":
+            failures.append(
+                f"{label}: a step ran in the wrong locale ({got.strip()!r}, "
+                f"expected b'C.UTF-8 2')"
+            )
 
     if failures:
         for f in failures:
