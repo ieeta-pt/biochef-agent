@@ -396,6 +396,7 @@ def test_a_proxy_on_the_socket_names_the_user(tmp_path, socket_dir):
                    BIOCHEF_AUDIT_LOG=str(tmp_path / "audit.jsonl"), BIOCHEF_DB_URL=url,
                    BIOCHEF_PASSPORT_REQUIRE_VISA="ControlledAccessGrants",
                    BIOCHEF_EGRESS_MODE="manual",
+                   BIOCHEF_REQUIRE_NETWORK_ISOLATION="false",
                    BIOCHEF_NODE_SIGNING_KEY=str(tmp_path / "keys" / node_keys.SIGNING_FILE),
                    BIOCHEF_NODE_ENCRYPTION_KEY=str(tmp_path / "keys" / node_keys.ENCRYPTION_FILE))
     server = subprocess.Popen([sys.executable, "-m", "ui"], cwd=REPO_ROOT, env=env,
