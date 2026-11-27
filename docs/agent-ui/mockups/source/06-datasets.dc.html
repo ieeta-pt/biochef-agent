@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Datasets</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;500&amp;family=Roboto:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#F5F5F5}
+a{color:#00796B}a:hover{color:#00574B}
+.tab{display:flex;justify-content:space-between;align-items:center;gap:8px;min-height:44px;padding:0 12px;border-radius:6px;color:#FFFFFF;text-decoration:none;font-size:15px;border-left:3px solid transparent}
+.tab:hover{background:rgba(255,255,255,.1);color:#FFFFFF}
+.on{background:rgba(255,255,255,.16);border-left-color:#FFFFFF;font-weight:500}
+.count{background:#FFFFFF;color:#00796B;border-radius:10px;padding:0 8px;font-size:12px;font-weight:700}
+.mono{font-family:'Roboto Mono',ui-monospace,monospace}
+.btn{min-height:44px;padding:0 16px;border-radius:6px;font:inherit;font-size:14px;font-weight:500;cursor:pointer}
+.card{background:#FFFFFF;border:1px solid #E0E0E0;border-radius:8px}
+.lbl{margin:0;font-size:12px;font-weight:500;color:#4A5260;letter-spacing:.06em;text-transform:uppercase}
+.pill{display:inline-block;font-size:12px;font-weight:500;border-radius:4px;padding:2px 8px}
+.p-ok{color:#1E6B3A;background:#E7F3EB}.p-warn{color:#BF360C;background:#FBE9E7}.p-info{color:#00574B;background:#E0F2F1}.p-mute{color:#4A5260;background:#EEEEEE}
+.row{display:grid;grid-template-columns:1.3fr 1fr 1.8fr 1.2fr 1.1fr;gap:12px;padding:12px 16px;border-top:1px solid #EEEEEE;align-items:center}
+.field{display:flex;flex-direction:column;gap:6px;flex:1 1 220px}
+.input{min-height:44px;box-sizing:border-box;padding:0 12px;font:inherit;font-size:14px;border:1px solid #BDBDBD;border-radius:6px;background:#FFFFFF}
+</style>
+</helmet>
+<div style="min-height: 100vh; display: flex; flex-wrap: wrap; font-family: Roboto, Helvetica, Arial, sans-serif; color: #14181F; background: #F5F5F5">
+<nav aria-label="Agent" style="flex: 1 1 232px; box-sizing: border-box; background: #00796B; color: #FFFFFF; padding: 20px 12px; display: flex; flex-direction: column; gap: 24px">
+<div style="display: flex; flex-direction: column; gap: 10px; padding: 0 12px">
+<img src="/_blob/6a838395830c80e9f97a717df03289ea" alt="BioChef" style="width: 96px; height: auto">
+<span style="align-self: flex-start; font-size: 13px; font-weight: 500; padding: 3px 10px; border: 1px solid rgba(255,255,255,.45); border-radius: 999px; background: rgba(255,255,255,.12)">Agent · IST TRE (test)</span>
+</div>
+<div style="display: flex; flex-direction: column; gap: 2px">
+<a class="tab" href="Main.dc.html">Inbox <span class="count">3</span></a>
+<a class="tab" href="Study.dc.html">Studies</a>
+<a class="tab" href="Requests.dc.html">Requests <span class="count">2 refused</span></a>
+<a class="tab on" href="Datasets.dc.html" aria-current="page">Datasets</a>
+<a class="tab" href="Node.dc.html">Node</a>
+</div>
+<div style="margin-top: auto; display: flex; flex-direction: column; gap: 6px; padding: 0 12px; font-size: 12px; color: #E0F2F1">
+<span style="display: flex; align-items: center; gap: 8px"><span aria-hidden="true" style="width: 8px; height: 8px; border-radius: 4px; background: #B9F6CA"></span>Coordinator polled 12 s ago</span>
+<a href="#" style="color: #FFFFFF">Open Policy Engine ↗</a>
+<span>Signed in through the TRE · j.silva</span>
+</div>
+</nav>
+
+<main style="flex: 999 1 560px; min-width: 0; box-sizing: border-box; padding: 32px; display: flex; flex-direction: column; gap: 24px">
+<header style="display: flex; flex-direction: column; gap: 6px">
+<h1 style="margin: 0; font-size: 26px; font-weight: 500">Datasets</h1>
+<p style="margin: 0; font-size: 14px; color: #5B6472; max-width: 760px">A study names datasets by id. A binding tells the agent where that dataset lives on this node. Bindings from the agent's config file are locked here; this node also allows bindings made on this page.</p>
+</header>
+
+<section aria-label="Bindings" class="card" style="overflow-x: auto">
+<div style="min-width: 820px; font-size: 13px">
+<div class="row" style="background: #FAFAFA; color: #4A5260; font-weight: 500; border-top: 0"><span>Dataset id</span><span>Source type</span><span>Location on this node</span><span>Used by</span><span>Bound by</span></div>
+<div class="row"><span class="mono">EGAD00001009912</span><span>localpath</span><span class="mono">cardio/2019_2024/</span><span>CARDIO-PT v2</span><span><span class="pill p-mute">config file, locked</span></span></div>
+<div class="row"><span class="mono">EGAD00001008830</span><span>localpath</span><span class="mono">sepsis/icu_v4/</span><span>Sepsis v1</span><span><span class="pill p-mute">config file, locked</span></span></div>
+<div class="row"><span class="mono">EGAD00001007115</span><span>localpath</span><span class="mono">micro/16s_2023/</span><span style="color: #5B6472">no approved study</span><span style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap"><span class="pill p-info">this page · j.silva</span><a href="#">Edit</a></span></div>
+<sc-if value="{{ added }}" hint-placeholder-val="{{ false }}">
+<div class="row" style="background: #E7F3EB"><span class="mono">EGAD00001010247</span><span>localpath</span><span class="mono">rare/pilot_v1/</span><span>Rare variants v1 (in Inbox)</span><span style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap"><span class="pill p-info">this page · j.silva</span><button onClick="{{ remove }}" style="font: inherit; background: none; border: 0; color: #00796B; text-decoration: underline; cursor: pointer; min-height: 32px">Remove</button></span></div>
+</sc-if>
+</div>
+</section>
+
+<sc-if value="{{ notAdded }}" hint-placeholder-val="{{ true }}">
+<section aria-label="Unbound" class="card" style="padding: 20px 24px; display: flex; flex-direction: column; gap: 16px">
+<div style="display: flex; flex-direction: column; gap: 4px">
+<h2 style="margin: 0; font-size: 16px; font-weight: 500">Waiting for a binding</h2>
+<span style="font-size: 13px; color: #BF360C">EGAD00001010247 is named by Rare variants pilot v1, in the Inbox. Requests that need it are refused until it is bound.</span>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end">
+<div class="field"><label for="ds" style="font-size: 13px; font-weight: 500">Dataset id</label><input id="ds" class="input mono" value="EGAD00001010247" readonly></div>
+<div class="field"><label for="type" style="font-size: 13px; font-weight: 500">Source type</label><select id="type" class="input"><option>localpath</option></select></div>
+<div class="field" style="flex: 2 1 320px"><label for="loc" style="font-size: 13px; font-weight: 500">Folder under the data root</label><input id="loc" class="input mono" value="rare/pilot_v1/"></div>
+<button class="btn" onClick="{{ add }}" style="background: #00796B; color: #FFFFFF; border: 0">Bind and sign</button>
+</div>
+<span style="font-size: 12px; color: #5B6472">Paths are resolved under the data root on the Node page. The agent refuses anything outside it.</span>
+</section>
+</sc-if>
+</main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":1200}}'>
+class Component extends DCLogic {
+  constructor(props) { super(props); this.state = { added: false }; }
+  renderVals() {
+    return {
+      added: this.state.added,
+      notAdded: !this.state.added,
+      add: () => this.setState({ added: true }),
+      remove: () => this.setState({ added: false })
+    };
+  }
+}
+</script>
+</body>
+</html>

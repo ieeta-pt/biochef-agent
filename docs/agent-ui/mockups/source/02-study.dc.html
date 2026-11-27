@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Study</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;500&amp;family=Roboto:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#F5F5F5}
+a{color:#00796B}a:hover{color:#00574B}
+.tab{display:flex;justify-content:space-between;align-items:center;gap:8px;min-height:44px;padding:0 12px;border-radius:6px;color:#FFFFFF;text-decoration:none;font-size:15px;border-left:3px solid transparent}
+.tab:hover{background:rgba(255,255,255,.1);color:#FFFFFF}
+.on{background:rgba(255,255,255,.16);border-left-color:#FFFFFF;font-weight:500}
+.count{background:#FFFFFF;color:#00796B;border-radius:10px;padding:0 8px;font-size:12px;font-weight:700}
+.mono{font-family:'Roboto Mono',ui-monospace,monospace}
+.btn{min-height:44px;padding:0 16px;border-radius:6px;font:inherit;font-size:14px;font-weight:500;cursor:pointer}
+.card{background:#FFFFFF;border:1px solid #E0E0E0;border-radius:8px}
+.lbl{margin:0;font-size:12px;font-weight:500;color:#4A5260;letter-spacing:.06em;text-transform:uppercase}
+td{padding:10px 12px;vertical-align:top;border-top:1px solid #EEEEEE}
+th{padding:10px 12px;font-weight:500;text-align:left;color:#4A5260;background:#FAFAFA}
+.pill{display:inline-block;font-size:12px;font-weight:500;border-radius:4px;padding:2px 8px}
+.p-ok{color:#1E6B3A;background:#E7F3EB}.p-warn{color:#BF360C;background:#FBE9E7}.p-bad{color:#B3261E;background:#FCE8E6}.p-info{color:#00574B;background:#E0F2F1}.p-mute{color:#4A5260;background:#EEEEEE}
+</style>
+</helmet>
+<div style="min-height: 100vh; display: flex; flex-wrap: wrap; font-family: Roboto, Helvetica, Arial, sans-serif; color: #14181F; background: #F5F5F5">
+<nav aria-label="Agent" style="flex: 1 1 232px; box-sizing: border-box; background: #00796B; color: #FFFFFF; padding: 20px 12px; display: flex; flex-direction: column; gap: 24px">
+<div style="display: flex; flex-direction: column; gap: 10px; padding: 0 12px">
+<img src="/_blob/6a838395830c80e9f97a717df03289ea" alt="BioChef" style="width: 96px; height: auto">
+<span style="align-self: flex-start; font-size: 13px; font-weight: 500; padding: 3px 10px; border: 1px solid rgba(255,255,255,.45); border-radius: 999px; background: rgba(255,255,255,.12)">Agent · IST TRE (test)</span>
+</div>
+<div style="display: flex; flex-direction: column; gap: 2px">
+<a class="tab" href="Main.dc.html">Inbox <span class="count">3</span></a>
+<a class="tab on" href="Study.dc.html" aria-current="page">Studies</a>
+<a class="tab" href="Requests.dc.html">Requests <span class="count">2 refused</span></a>
+<a class="tab" href="Datasets.dc.html">Datasets</a>
+<a class="tab" href="Node.dc.html">Node</a>
+</div>
+<div style="margin-top: auto; display: flex; flex-direction: column; gap: 6px; padding: 0 12px; font-size: 12px; color: #E0F2F1">
+<span style="display: flex; align-items: center; gap: 8px"><span aria-hidden="true" style="width: 8px; height: 8px; border-radius: 4px; background: #B9F6CA"></span>Coordinator polled 12 s ago</span>
+<a href="#" style="color: #FFFFFF">Open Policy Engine ↗</a>
+<span>Signed in through the TRE · j.silva</span>
+</div>
+</nav>
+
+<main style="flex: 999 1 560px; min-width: 0; box-sizing: border-box; padding: 32px; display: flex; flex-direction: column; gap: 24px">
+<header style="display: flex; flex-direction: column; gap: 6px">
+<h1 style="margin: 0; font-size: 26px; font-weight: 500">Studies</h1>
+<p style="margin: 0; font-size: 14px; color: #5B6472; max-width: 760px">Each approved study version holds the workflows approved for it, and each workflow the requests it ran here.</p>
+</header>
+
+<div style="display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-start">
+<section aria-label="Study list" style="flex: 1 1 260px; max-width: 320px; display: flex; flex-direction: column; gap: 8px">
+<div style="background: #FFFFFF; border: 2px solid #009688; border-radius: 8px; padding: 14px 16px; display: flex; flex-direction: column; gap: 6px">
+<span style="display: flex; justify-content: space-between; gap: 8px"><span style="font-size: 15px; font-weight: 500">CARDIO-PT cohort · v2</span><span class="pill p-ok">Approved</span></span>
+<span style="font-size: 13px; color: #5B6472">3 workflows · 14 requests</span>
+<a href="Main.dc.html" class="pill p-warn" style="align-self: flex-start; text-decoration: none">v3 in Inbox</a>
+</div>
+<div style="background: #FFFFFF; border: 1px solid #E0E0E0; border-radius: 8px; padding: 14px 16px; display: flex; flex-direction: column; gap: 6px">
+<span style="display: flex; justify-content: space-between; gap: 8px"><span style="font-size: 15px; font-weight: 500">Sepsis biomarkers · v1</span><span class="pill p-ok">Approved</span></span>
+<span style="font-size: 13px; color: #5B6472">1 workflow · 6 requests</span>
+</div>
+<div style="background: #FFFFFF; border: 1px solid #E0E0E0; border-radius: 8px; padding: 14px 16px; display: flex; flex-direction: column; gap: 6px">
+<span style="display: flex; justify-content: space-between; gap: 8px"><span style="font-size: 15px; font-weight: 500">Microbiome pilot · v1</span><span class="pill p-mute">Withdrawn</span></span>
+<span style="font-size: 13px; color: #5B6472">Withdrawn 20 Oct, kept for the audit log</span>
+</div>
+</section>
+
+<section aria-label="CARDIO-PT cohort v2" class="card" style="flex: 999 1 560px; min-width: 0; display: flex; flex-direction: column">
+<div style="padding: 20px 24px 0; display: flex; flex-direction: column; gap: 16px">
+<div style="display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; align-items: flex-start">
+<div style="display: flex; flex-direction: column; gap: 4px">
+<h2 style="margin: 0; font-size: 22px; font-weight: 500">CARDIO-PT cohort · v2</h2>
+<span style="font-size: 13px; color: #5B6472">Approved 12 Oct by j.silva</span>
+</div>
+<button class="btn" style="background: #FFFFFF; color: #B3261E; border: 1px solid #BDBDBD">Withdraw approval</button>
+</div>
+<div role="tablist" aria-label="Study sections" style="display: flex; gap: 4px; border-bottom: 1px solid #E0E0E0">
+<button class="btn" role="tab" aria-selected="{{ t0 }}" onClick="{{ show0 }}" style="{{ s0 }}">Overview</button>
+<button class="btn" role="tab" aria-selected="{{ t1 }}" onClick="{{ show1 }}" style="{{ s1 }}">Workflows 3</button>
+<button class="btn" role="tab" aria-selected="{{ t2 }}" onClick="{{ show2 }}" style="{{ s2 }}">Requests 14</button>
+</div>
+</div>
+
+<sc-if value="{{ t0 }}" hint-placeholder-val="{{ true }}">
+<div style="padding: 20px 24px; display: flex; flex-direction: column; gap: 22px">
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px">
+<div style="display: flex; flex-direction: column; gap: 8px"><h3 class="lbl">Members</h3><span style="font-size: 14px">Ana Costa (owner), Rui Matos</span><span style="font-size: 13px; color: #1E6B3A">✓ identities verified</span></div>
+<div style="display: flex; flex-direction: column; gap: 8px"><h3 class="lbl">Dataset on this node</h3><span style="font-size: 14px">EGAD00001009912</span><span style="font-size: 13px; color: #4A5260">Visa required · ControlledAccessGrants</span></div>
+<div style="display: flex; flex-direction: column; gap: 8px"><h3 class="lbl">Result recipients</h3><span style="font-size: 14px">Requester only</span></div>
+<div style="display: flex; flex-direction: column; gap: 8px"><h3 class="lbl">Output rules</h3><span style="font-size: 14px">min_cell_count 10 · tables, png</span><a href="#" style="font-size: 13px">Policy Engine ↗</a></div>
+</div>
+<div style="display: flex; flex-direction: column; gap: 10px">
+<h3 class="lbl">Versions</h3>
+<div style="overflow-x: auto; border: 1px solid #EEEEEE; border-radius: 6px">
+<table style="width: 100%; border-collapse: collapse; font-size: 13px; min-width: 560px">
+<thead><tr><th>Version</th><th>State on this node</th><th>Decided</th><th>By</th></tr></thead>
+<tbody>
+<tr><td><a href="Main.dc.html">v3</a></td><td><span class="pill p-warn">Waiting in Inbox</span></td><td>n/a</td><td>n/a</td></tr>
+<tr><td>v2</td><td><span class="pill p-ok">Approved</span></td><td>12 Oct 14:20</td><td>j.silva</td></tr>
+<tr><td>v1</td><td><span class="pill p-mute">Withdrawn</span></td><td>12 Oct 14:20</td><td>automatic, when v2 was approved</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+</div>
+</sc-if>
+
+<sc-if value="{{ t1 }}" hint-placeholder-val="{{ false }}">
+<div style="padding: 20px 24px; display: flex; flex-direction: column; gap: 12px">
+<p style="margin: 0; font-size: 13px; color: #5B6472">The hash covers the tools and the parameter values, so a change in any parameter is a new workflow to approve. Withdrawing a workflow is signed like an approval and does not need a new study version.</p>
+<div style="overflow-x: auto; border: 1px solid #EEEEEE; border-radius: 6px">
+<table style="width: 100%; border-collapse: collapse; font-size: 13px; min-width: 700px">
+<thead><tr><th>Workflow</th><th>Parameter values</th><th>Hash</th><th>State</th><th>Requests</th><th><span style="position: absolute; left: -9999px">Action</span></th></tr></thead>
+<tbody>
+<tr><td><a href="Workflow.dc.html">gwas-qc 1.4.0</a></td><td class="mono">maf 0.01 · hwe 1e-6</td><td class="mono">4be1…90c3</td><td><span class="pill p-info">New version</span></td><td>n/a</td><td><a href="Workflow.dc.html">Review</a></td></tr>
+<tr><td><a href="Workflow.dc.html">gwas-qc 1.3.2</a></td><td class="mono">maf 0.01 · hwe 1e-6</td><td class="mono">2a77…c5e8</td><td><span class="pill p-ok">Approved</span></td><td>9</td><td><button style="font: inherit; background: none; border: 0; color: #B3261E; text-decoration: underline; cursor: pointer; min-height: 32px">Withdraw</button></td></tr>
+<tr><td><a href="Workflow.dc.html">gwas-qc 1.3.2</a></td><td class="mono">maf 0.05 · hwe 1e-6</td><td class="mono">6d02…a1f3</td><td><span class="pill p-ok">Approved</span></td><td>3</td><td><button style="font: inherit; background: none; border: 0; color: #B3261E; text-decoration: underline; cursor: pointer; min-height: 32px">Withdraw</button></td></tr>
+<tr><td><a href="Workflow.dc.html">cohort-summary 0.2.0</a></td><td class="mono">group by sex, age_band</td><td class="mono">f09d…1b44</td><td><span class="pill p-ok">Approved</span></td><td>2</td><td><button style="font: inherit; background: none; border: 0; color: #B3261E; text-decoration: underline; cursor: pointer; min-height: 32px">Withdraw</button></td></tr>
+</tbody>
+</table>
+</div>
+</div>
+</sc-if>
+
+<sc-if value="{{ t2 }}" hint-placeholder-val="{{ false }}">
+<div style="padding: 20px 24px; display: flex; flex-direction: column; gap: 12px">
+<div style="overflow-x: auto; border: 1px solid #EEEEEE; border-radius: 6px">
+<table style="width: 100%; border-collapse: collapse; font-size: 13px; min-width: 700px">
+<thead><tr><th>Request</th><th>From</th><th>Workflow</th><th>Agent check</th><th>Run</th></tr></thead>
+<tbody>
+<tr><td class="mono">req_8f40</td><td>Rui Matos</td><td>gwas-qc 1.4.0</td><td><span class="pill p-bad">Refused · workflow not approved</span></td><td>n/a</td></tr>
+<tr><td class="mono">req_8f22</td><td>Rui Matos</td><td>gwas-qc 1.3.2</td><td><span class="pill p-info">Repeated · joined req_8f21</span></td><td>n/a</td></tr>
+<tr><td class="mono">req_8f21</td><td>Rui Matos</td><td>gwas-qc 1.3.2</td><td><span class="pill p-ok">Accepted</span></td><td><a href="Run.dc.html">Done · in review</a></td></tr>
+<tr><td class="mono">req_7c03</td><td>Ana Costa</td><td>gwas-qc 1.3.2</td><td><span class="pill p-ok">Accepted</span></td><td><a href="Run.dc.html">Done · sent</a></td></tr>
+<tr><td class="mono">req_7b88</td><td>Ana Costa</td><td>cohort-summary 0.2.0</td><td><span class="pill p-ok">Accepted</span></td><td><a href="Run.dc.html">Done · sent</a></td></tr>
+<tr><td class="mono">req_7a10</td><td>Rui Matos</td><td>gwas-qc 1.3.2</td><td><span class="pill p-bad">Refused · expired</span></td><td>n/a</td></tr>
+</tbody>
+</table>
+</div>
+<button class="btn" style="align-self: flex-start; background: #FFFFFF; color: #00796B; border: 1px solid #BDBDBD">Show 8 older</button>
+</div>
+</sc-if>
+</section>
+</div>
+</main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":1080}}'>
+class Component extends DCLogic {
+  constructor(props) { super(props); this.state = { tab: 0 }; }
+  renderVals() {
+    const t = this.state.tab;
+    const st = (on) => 'min-height:44px;border:0;border-bottom:2px solid ' + (on ? '#00796B;color:#00574B' : 'transparent;color:#4A5260') + ';background:transparent;border-radius:0';
+    return {
+      t0: t === 0, t1: t === 1, t2: t === 2,
+      s0: st(t === 0), s1: st(t === 1), s2: st(t === 2),
+      show0: () => this.setState({ tab: 0 }),
+      show1: () => this.setState({ tab: 1 }),
+      show2: () => this.setState({ tab: 2 })
+    };
+  }
+}
+</script>
+</body>
+</html>
